@@ -1,0 +1,23 @@
+{
+  "name": "stuart",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "dev": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/plugin-sdk build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build && pnpm --filter @stuart/web dev",
+    "dev:desktop": "concurrently -k -n web,desktop -c cyan,magenta \"pnpm dev\" \"pnpm --filter @stuart/desktop dev:electron\"",
+    "dev:harness": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/plugin-sdk build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build && pnpm --filter @stuart/harness start",
+    "build": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/plugin-sdk build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build && pnpm --filter @stuart/guest-daemon build && pnpm --filter @stuart/web build",
+    "typecheck": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/plugin-sdk build && pnpm --filter @stuart/runtime-supervisor typecheck && pnpm --filter @stuart/harness typecheck && pnpm --filter @stuart/guest-daemon typecheck && pnpm --filter @stuart/web typecheck",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/node": "^22.13.10",
+    "concurrently": "^9.2.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.8.2",
+    "vitest": "^3.2.4"
+  }
+}

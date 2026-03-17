@@ -1,0 +1,27 @@
+{
+  "name": "@stuart/runtime-supervisor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp -r src/skills dist/skills",
+    "typecheck": "tsc --noEmit -p tsconfig.json --rootDir ../.."
+  },
+  "dependencies": {
+    "@stuart/db": "workspace:*",
+    "@stuart/shared": "workspace:*",
+    "fast-xml-parser": "^5.5.1",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.11.0",
+    "pdfjs-dist": "^5.5.207",
+    "xlsx": "^0.18.5"
+  }
+}

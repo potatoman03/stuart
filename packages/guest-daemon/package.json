@@ -1,0 +1,18 @@
+{
+  "name": "@stuart/guest-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "stuartd": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json --rootDir ../.."
+  },
+  "dependencies": {
+    "@stuart/shared": "workspace:*"
+  }
+}

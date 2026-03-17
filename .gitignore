@@ -1,0 +1,47 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+dist-*
+.turbo
+.vite
+*.tsbuildinfo
+
+# Swift build
+.build
+.swiftpm
+
+# Test / coverage
+coverage
+test-results
+playwright-report
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# User / runtime data
+.stuart-data
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea
+.vscode/settings.json
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
