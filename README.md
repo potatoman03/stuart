@@ -2,7 +2,7 @@
 
 Stuart is a local-first study workspace built around staged local folders, Codex app-server turns, and persistent learning artifacts.
 
-The repo is much closer to a Copal / Cowork-style runtime than to an upload-first notebook. A student picks a folder, Stuart stages that material into an isolated run, builds local retrieval support, and lets Codex work inside that staged workspace while the UI streams the turn back live.
+ A student picks a folder, Stuart stages that material into an isolated run, builds local retrieval support, and lets Codex work inside that staged workspace while the UI streams the turn back live.
 
 ## Quick Start
 
