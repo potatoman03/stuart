@@ -6,6 +6,18 @@ The repo is much closer to a Copal / Cowork-style runtime than to an upload-firs
 
 If you only read one other doc, read [ARCHITECTURE.md](./ARCHITECTURE.md).
 
+## Quick Start
+
+Prerequisites: Node 22+, pnpm, [Codex CLI](https://github.com/openai/codex) (authenticated), Docker (optional, for sandbox document generation).
+
+```bash
+pnpm install
+pnpm bootstrap   # creates .env, checks prerequisites
+pnpm dev          # starts Vite client + Express server
+```
+
+Open `http://localhost:5173`, pick a study folder, and start chatting.
+
 ## What Stuart Is
 
 Stuart is built around a few core nouns:
@@ -71,7 +83,7 @@ Package-level docs:
 7. Larger material sets can fan out into worker threads for parallel exploration.
 8. Events stream back over SSE and the UI renders thinking state, assistant deltas, sources, workers, and artifacts.
 
-The main runtime entry point is [packages/runtime-supervisor/src/index.ts](/Users/jon/Projects/stuart/packages/runtime-supervisor/src/index.ts). The app-server transport is [packages/runtime-supervisor/src/codex-app-server.ts](/Users/jon/Projects/stuart/packages/runtime-supervisor/src/codex-app-server.ts).
+The main runtime entry point is [packages/runtime-supervisor/src/index.ts](./packages/runtime-supervisor/src/index.ts). The app-server transport is [packages/runtime-supervisor/src/codex-app-server.ts](./packages/runtime-supervisor/src/codex-app-server.ts).
 
 ## Current Product Surface
 
@@ -252,7 +264,7 @@ Retrieval:
 Artifacts:
 
 - Artifact-specific skill prompts live in [packages/runtime-supervisor/src/skills](./packages/runtime-supervisor/src/skills).
-- Renderer and persistence behavior are defined by shared schemas in [packages/shared/src/index.ts](/Users/jon/Projects/stuart/packages/shared/src/index.ts).
+- Renderer and persistence behavior are defined by shared schemas in [packages/shared/src/index.ts](./packages/shared/src/index.ts).
 - Document artifacts (PDF/DOCX/XLSX/PPTX) can be generated via two paths:
   - **JSON-to-binary**: LLM outputs structured JSON, server renders to binary via pdfkit/docx/pptxgenjs/xlsx.
   - **Sandbox-scripted**: LLM outputs a Python/JS script, executed in a Docker sandbox (reportlab, python-docx, etc.).
@@ -285,18 +297,18 @@ Dependency surfaces:
 If you are changing:
 
 - task/run lifecycle, Codex turns, workers, ingestion, or event emission:
-  - start in [packages/runtime-supervisor/src/index.ts](/Users/jon/Projects/stuart/packages/runtime-supervisor/src/index.ts)
+  - start in [packages/runtime-supervisor/src/index.ts](./packages/runtime-supervisor/src/index.ts)
 - JSON-RPC / websocket app-server behavior:
-  - start in [packages/runtime-supervisor/src/codex-app-server.ts](/Users/jon/Projects/stuart/packages/runtime-supervisor/src/codex-app-server.ts)
+  - start in [packages/runtime-supervisor/src/codex-app-server.ts](./packages/runtime-supervisor/src/codex-app-server.ts)
 - routes or SSE transport:
-  - start in [packages/harness/src/index.ts](/Users/jon/Projects/stuart/packages/harness/src/index.ts)
+  - start in [packages/harness/src/index.ts](./packages/harness/src/index.ts)
 - SQLite schema or retrieval primitives:
-  - start in [packages/db/src/index.ts](/Users/jon/Projects/stuart/packages/db/src/index.ts)
+  - start in [packages/db/src/index.ts](./packages/db/src/index.ts)
 - client UX, streaming UI, or artifact surfaces:
-  - start in [apps/web/src/client/App.tsx](/Users/jon/Projects/stuart/apps/web/src/client/App.tsx)
-  - and [apps/web/src/client/ArtifactCanvas.tsx](/Users/jon/Projects/stuart/apps/web/src/client/ArtifactCanvas.tsx)
+  - start in [apps/web/src/client/App.tsx](./apps/web/src/client/App.tsx)
+  - and [apps/web/src/client/ArtifactCanvas.tsx](./apps/web/src/client/ArtifactCanvas.tsx)
 - preview serving:
-  - start in [apps/web/src/server/index.ts](/Users/jon/Projects/stuart/apps/web/src/server/index.ts)
+  - start in [apps/web/src/server/index.ts](./apps/web/src/server/index.ts)
 
 ## Testing
 
