@@ -4,8 +4,6 @@ Stuart is a local-first study workspace built around staged local folders, Codex
 
 The repo is much closer to a Copal / Cowork-style runtime than to an upload-first notebook. A student picks a folder, Stuart stages that material into an isolated run, builds local retrieval support, and lets Codex work inside that staged workspace while the UI streams the turn back live.
 
-If you only read one other doc, read [ARCHITECTURE.md](./ARCHITECTURE.md).
-
 ## Quick Start
 
 Prerequisites: Node 22+, pnpm, [Codex CLI](https://github.com/openai/codex) (authenticated), Docker (optional, for sandbox document generation).
