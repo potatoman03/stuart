@@ -41,6 +41,9 @@ Thumbs.db
 .idea
 .vscode/settings.json
 
+# Planning
+future_plans.md
+
 # Logs
 *.log
 npm-debug.log*

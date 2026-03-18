@@ -10,13 +10,17 @@ import type {
   IngestionDocumentRecord,
   IngestionIndexStats,
   ProjectAttachment,
+  ProjectLearningSummary,
   ProjectRecord,
   StudyArtifactKind,
   StudyArtifactRecord,
+  StudyTimelineEntry,
   TaskMessageRecord,
+  TaskPerformanceBreakdown,
   TaskRunRecord,
   TaskSpec,
   TaskWorkerRecord,
+  TopicPerformanceRecord,
   UpdateTaskInput,
   WorkspaceEvent,
   WorkspaceFileRecord
@@ -33,6 +37,27 @@ type DashboardPayload = {
   };
   projects: ProjectRecord[];
   tasks: TaskSpec[];
+  diagnostics: SystemDiagnostics;
+};
+
+type SystemDiagnosticStatus = "ok" | "warn" | "error";
+
+type SystemDiagnosticCheck = {
+  id: string;
+  label: string;
+  status: SystemDiagnosticStatus;
+  required: boolean;
+  summary: string;
+  detail?: string;
+  command?: string;
+  resolution?: string;
+};
+
+type SystemDiagnostics = {
+  generatedAt: string;
+  overallStatus: SystemDiagnosticStatus;
+  requiredReady: boolean;
+  checks: SystemDiagnosticCheck[];
 };
 
 type ThinkingState = {
@@ -88,6 +113,8 @@ const DEMO_KIND_ICONS: Record<string, string> = {
   interactive: "App",
 };
 
+const DIAGNOSTICS_DISMISS_KEY = "stuart.dismissedDiagnostics.v1";
+
 /* ---- Helpers ---- */
 
 function cleanSourceName(rawPath: string): string {
@@ -112,29 +139,53 @@ function fileExtension(rawPath: string): string {
 /* ---- API Helper ---- */
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {})
+  const method = (init?.method ?? "GET").toUpperCase();
+  const maxAttempts = method === "GET" || method === "HEAD" ? 4 : 1;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch(path, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init?.headers ?? {})
+        }
+      });
+
+      if (!response.ok) {
+        const message = await response.text();
+        const error = new Error(message || `Request failed for ${path}`);
+        const shouldRetry =
+          attempt < maxAttempts &&
+          (response.status >= 500 || response.status === 408 || response.status === 429);
+        if (!shouldRetry) {
+          throw error;
+        }
+        lastError = error;
+      } else {
+        if (response.status === 204) {
+          return undefined as T;
+        }
+
+        const contentType = response.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) {
+          return undefined as T;
+        }
+
+        return response.json() as Promise<T>;
+      }
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts) {
+        throw error;
+      }
     }
-  });
 
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `Request failed for ${path}`);
+    await new Promise((resolve) => window.setTimeout(resolve, attempt * 350));
   }
 
-  if (response.status === 204) {
-    return undefined as T;
-  }
-
-  const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
-    return undefined as T;
-  }
-
-  return response.json() as Promise<T>;
+  throw lastError instanceof Error ? lastError : new Error(`Request failed for ${path}`);
 }
 
 /* ================================================================
@@ -171,12 +222,95 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [thinkingState, setThinkingState] = useState<ThinkingState | null>(null);
   const [streamingDelta, setStreamingDelta] = useState<StreamingDelta | null>(null);
+  const [diagnostics, setDiagnostics] = useState<SystemDiagnostics | null>(null);
+  const [dismissedDiagnosticsFingerprint, setDismissedDiagnosticsFingerprint] = useState<string | null>(
+    () => readDismissedDiagnosticsFingerprint()
+  );
 
   /* ---- Study Artifacts State ---- */
   const [studyArtifacts, setStudyArtifacts] = useState<Record<string, StudyArtifactRecord[]>>({});
   const [openArtifact, setOpenArtifact] = useState<StudyArtifactRecord | null>(null);
+  const [pendingDeleteArtifact, setPendingDeleteArtifact] = useState<{ id: string; title: string; taskId: string } | null>(null);
   const [openDemoArtifact, setOpenDemoArtifact] = useState<{ kind: StudyArtifactKind; title: string; payload: string } | null>(null);
   const [customPrompt, setCustomPrompt] = useState("");
+
+  /* ---- Study Session Tracking ---- */
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const sessionInactivityRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const startStudySession = useCallback(async (taskId: string, artifactId?: string) => {
+    if (activeSessionId) return; // already in a session
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/study-sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ artifactIds: artifactId ? [artifactId] : [] }),
+      });
+      if (res.ok) {
+        const session = await res.json();
+        setActiveSessionId(session.id);
+      }
+    } catch { /* non-critical */ }
+  }, [activeSessionId]);
+
+  const endStudySession = useCallback(async () => {
+    if (!activeSessionId) return;
+    try {
+      await fetch(`/api/study-sessions/${activeSessionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endedAt: new Date().toISOString() }),
+      });
+    } catch { /* non-critical */ }
+    setActiveSessionId(null);
+    if (sessionInactivityRef.current) {
+      clearTimeout(sessionInactivityRef.current);
+      sessionInactivityRef.current = null;
+    }
+  }, [activeSessionId]);
+
+  const resetInactivityTimer = useCallback(() => {
+    if (sessionInactivityRef.current) clearTimeout(sessionInactivityRef.current);
+    sessionInactivityRef.current = setTimeout(() => {
+      void endStudySession();
+    }, 30 * 60 * 1000); // 30 min inactivity
+  }, [endStudySession]);
+
+  const trackReviewEvent = useCallback(async (correct: boolean) => {
+    if (!activeSessionId) return;
+    resetInactivityTimer();
+    try {
+      const sessionRes = await fetch(`/api/study-sessions/${activeSessionId}`);
+      // We don't have a GET endpoint, so just PATCH with increments
+      // Use a simple approach: increment by 1 each time
+      await fetch(`/api/study-sessions/${activeSessionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cardsReviewed: 1, // Will be replaced with accumulated value
+          correctCount: correct ? 1 : 0,
+        }),
+      });
+    } catch { /* non-critical */ }
+  }, [activeSessionId, resetInactivityTimer]);
+
+  // Start session when artifact opens (flashcard/quiz/mock_exam)
+  useEffect(() => {
+    const artifact = openArtifact;
+    if (artifact && selectedTaskId && ["flashcards", "quiz", "mock_exam"].includes(artifact.kind)) {
+      void startStudySession(selectedTaskId, artifact.id);
+      resetInactivityTimer();
+    }
+    // End session when artifact closes
+    return () => {
+      // Handled by the onClose callback instead
+    };
+  }, [openArtifact?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // End session on task switch
+  useEffect(() => {
+    void endStudySession();
+  }, [selectedTaskId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---- Inline AI Response State ---- */
   const [inlineResponse, setInlineResponse] = useState<string | null>(null);
@@ -231,6 +365,10 @@ function App() {
     streamingDelta && selectedTask && streamingDelta.taskId === selectedTask.id
   );
   const selectedStudyArtifacts = selectedTask ? studyArtifacts[selectedTask.id] ?? [] : [];
+  const diagnosticsFingerprint = diagnostics ? buildDiagnosticsFingerprint(diagnostics) : null;
+  const diagnosticsDismissed = Boolean(
+    diagnosticsFingerprint && diagnosticsFingerprint === dismissedDiagnosticsFingerprint
+  );
 
   // Group artifacts by kind
   const groupedArtifacts = useMemo(() => {
@@ -241,6 +379,10 @@ function App() {
       diagram: [],
       mock_exam: [],
       interactive: [],
+      document_docx: [],
+      document_xlsx: [],
+      document_pptx: [],
+      document_pdf: [],
       other: [],
     };
     for (const artifact of selectedStudyArtifacts) {
@@ -251,6 +393,19 @@ function App() {
   }, [selectedStudyArtifacts]);
 
   const isArtifactOpen = !!(openArtifact || openDemoArtifact);
+
+  const dismissDiagnostics = useCallback(() => {
+    if (!diagnosticsFingerprint) {
+      return;
+    }
+    setDismissedDiagnosticsFingerprint(diagnosticsFingerprint);
+    writeDismissedDiagnosticsFingerprint(diagnosticsFingerprint);
+  }, [diagnosticsFingerprint]);
+
+  const restoreDiagnostics = useCallback(() => {
+    setDismissedDiagnosticsFingerprint(null);
+    writeDismissedDiagnosticsFingerprint(null);
+  }, []);
 
   /* ---- Data Loaders ---- */
 
@@ -283,6 +438,7 @@ function App() {
       setError(null);
       setProjects(payload.projects);
       setTasks(payload.tasks);
+      setDiagnostics(payload.diagnostics ?? null);
       setTaskRuns(runs);
       setWorkersByTask((cur) => pruneRecord(cur, payload.tasks.map((t) => t.id)));
       setAgentActivityByTask((cur) => pruneRecord(cur, payload.tasks.map((t) => t.id)));
@@ -290,7 +446,12 @@ function App() {
       setSelectedTaskId(nextTask?.id ?? null);
       setSelectedRunId(nextRunId);
     } catch (caughtError) {
-      setError(caughtError instanceof Error ? caughtError.message : "Failed to load your library");
+      const message = caughtError instanceof Error ? caughtError.message : "Failed to load workspace dashboard";
+      if (message.includes("/api/dashboard") || message === "Failed to fetch") {
+        setError("The local Stuart API is not ready yet. Wait a second and refresh, or restart with `pnpm dev`.");
+        return;
+      }
+      setError(message);
     }
   }, [selectedTaskId, selectedProjectId, selectedRunId]);
 
@@ -350,6 +511,21 @@ function App() {
       setStudyArtifacts((cur) => ({ ...cur, [taskId]: artifacts }));
     } catch {
       // study-artifacts endpoint may not exist yet; silently ignore
+    }
+  }
+
+  async function deleteStudyArtifact(artifactId: string, taskId: string) {
+    try {
+      await request(`/api/study-artifacts/${artifactId}`, { method: "DELETE" });
+      setStudyArtifacts((cur) => ({
+        ...cur,
+        [taskId]: (cur[taskId] ?? []).filter((a) => a.id !== artifactId),
+      }));
+      if (openArtifact?.id === artifactId) {
+        setOpenArtifact(null);
+      }
+    } catch (err) {
+      console.error("Failed to delete artifact:", err);
     }
   }
 
@@ -829,7 +1005,12 @@ function App() {
         {/* ======== LEFT SIDEBAR: Your Library ======== */}
         <aside className="library-panel">
           <div className="library-header">
-            <div className="brand-lockup">
+            <div
+              className="brand-lockup"
+              style={{ cursor: "pointer" }}
+              onClick={() => { setSelectedTaskId(null); setSelectedRunId(null); }}
+              title="Back to dashboard"
+            >
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
                 <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
@@ -861,6 +1042,14 @@ function App() {
               </svg>
               {busy === "add-materials" ? "Setting up..." : "Add study materials"}
             </button>
+
+            {diagnostics ? (
+              diagnosticsDismissed ? (
+                <DiagnosticsDismissedNotice compact onShow={restoreDiagnostics} />
+              ) : (
+                <DiagnosticsCard diagnostics={diagnostics} compact onDismiss={dismissDiagnostics} />
+              )
+            ) : null}
 
             {/* Projects as study folders */}
             {projects.length > 0 ? (
@@ -961,46 +1150,62 @@ function App() {
           <div className="chat-scroll" ref={threadRef}>
             <div className="chat-transcript">
               {!selectedTask ? (
-                /* ---- Onboarding: Welcome Screen ---- */
-                <div className="welcome-card">
-                  <div className="welcome-icon">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
-                      <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
-                    </svg>
+                projects.length > 0 ? (
+                  /* ---- Dashboard: shown when projects exist but no task selected ---- */
+                  <DashboardView
+                    projects={projects}
+                    tasks={tasks}
+                    onSelectTask={(taskId) => setSelectedTaskId(taskId)}
+                  />
+                ) : (
+                  /* ---- Onboarding: Welcome Screen ---- */
+                  <div className="welcome-card">
+                    <div className="welcome-icon">
+                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+                        <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+                      </svg>
+                    </div>
+                    <h1>Welcome to Stuart</h1>
+                    <p>Your personal study assistant. Drop a folder of study materials to get started.</p>
+                    <button
+                      className="accent-button welcome-cta"
+                      type="button"
+                      onClick={() => void handleAddStudyMaterials()}
+                      disabled={busy === "add-materials" || busy === "folder"}
+                    >
+                      <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5A1 1 0 0 0 5.8 3H3a1 1 0 0 0-1 1z" />
+                      </svg>
+                      {busy === "add-materials" ? "Setting up..." : "Choose folder"}
+                    </button>
+                    {diagnostics ? (
+                      diagnosticsDismissed ? (
+                        <DiagnosticsDismissedNotice onShow={restoreDiagnostics} />
+                      ) : (
+                        <DiagnosticsCard diagnostics={diagnostics} onDismiss={dismissDiagnostics} />
+                      )
+                    ) : null}
+                    <div className="welcome-features">
+                      <div className="welcome-feature">
+                        <strong>Flashcards</strong>
+                        <span>Auto-generated from your notes</span>
+                      </div>
+                      <div className="welcome-feature">
+                        <strong>Quizzes</strong>
+                        <span>Test your understanding</span>
+                      </div>
+                      <div className="welcome-feature">
+                        <strong>Mind Maps</strong>
+                        <span>Visualize connections</span>
+                      </div>
+                      <div className="welcome-feature">
+                        <strong>Diagrams</strong>
+                        <span>See the big picture</span>
+                      </div>
+                    </div>
                   </div>
-                  <h1>Welcome to Stuart</h1>
-                  <p>Your personal study assistant. Drop a folder of study materials to get started.</p>
-                  <button
-                    className="accent-button welcome-cta"
-                    type="button"
-                    onClick={() => void handleAddStudyMaterials()}
-                    disabled={busy === "add-materials" || busy === "folder"}
-                  >
-                    <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5A1 1 0 0 0 5.8 3H3a1 1 0 0 0-1 1z" />
-                    </svg>
-                    {busy === "add-materials" ? "Setting up..." : "Choose folder"}
-                  </button>
-                  <div className="welcome-features">
-                    <div className="welcome-feature">
-                      <strong>Flashcards</strong>
-                      <span>Auto-generated from your notes</span>
-                    </div>
-                    <div className="welcome-feature">
-                      <strong>Quizzes</strong>
-                      <span>Test your understanding</span>
-                    </div>
-                    <div className="welcome-feature">
-                      <strong>Mind Maps</strong>
-                      <span>Visualize connections</span>
-                    </div>
-                    <div className="welcome-feature">
-                      <strong>Diagrams</strong>
-                      <span>See the big picture</span>
-                    </div>
-                  </div>
-                </div>
+                )
               ) : (
                 <>
                   {/* Messages */}
@@ -1294,6 +1499,10 @@ function App() {
                       diagram: "Diagrams",
                       mock_exam: "Mock Exams",
                       interactive: "Interactive",
+                      document_docx: "Documents",
+                      document_xlsx: "Spreadsheets",
+                      document_pptx: "Presentations",
+                      document_pdf: "PDFs",
                       custom: "Custom",
                       other: "Other",
                     };
@@ -1305,14 +1514,26 @@ function App() {
                         </div>
                         <div className="artifact-folder-items">
                           {artifacts.map((artifact) => (
-                            <button
-                              key={artifact.id}
-                              className={`artifact-card-compact${openArtifact?.id === artifact.id ? " active" : ""}`}
-                              onClick={() => setOpenArtifact(artifact)}
-                            >
-                              <span className="artifact-card-title">{artifact.title || `Untitled ${artifact.kind}`}</span>
-                              <span className="artifact-card-date">{formatDate(artifact.createdAt)}</span>
-                            </button>
+                            <div key={artifact.id} className="artifact-card-row">
+                              <button
+                                className={`artifact-card-compact${openArtifact?.id === artifact.id ? " active" : ""}`}
+                                onClick={() => setOpenArtifact(artifact)}
+                              >
+                                <span className="artifact-card-title">{artifact.title || `Untitled ${artifact.kind}`}</span>
+                                <span className="artifact-card-date">{formatDate(artifact.createdAt)}</span>
+                              </button>
+                              <ArtifactMenu
+                                onDelete={() => {
+                                  if (selectedTask) {
+                                    setPendingDeleteArtifact({
+                                      id: artifact.id,
+                                      title: artifact.title || `Untitled ${artifact.kind}`,
+                                      taskId: selectedTask.id,
+                                    });
+                                  }
+                                }}
+                              />
+                            </div>
                           ))}
                         </div>
                       </div>
@@ -1371,7 +1592,14 @@ function App() {
               title={openArtifact?.title ?? openDemoArtifact?.title ?? ""}
               kind={openArtifact?.kind ?? openDemoArtifact?.kind ?? "flashcards"}
               payload={openArtifact?.payload ?? openDemoArtifact?.payload ?? "{}"}
-              onClose={() => { setOpenArtifact(null); setOpenDemoArtifact(null); setInlineResponse(null); setIsInlineLoading(false); }}
+              onClose={() => { setOpenArtifact(null); setOpenDemoArtifact(null); setInlineResponse(null); setIsInlineLoading(false); void endStudySession(); }}
+              onDelete={openArtifact && selectedTask ? () => {
+                setPendingDeleteArtifact({
+                  id: openArtifact.id,
+                  title: openArtifact.title || `Untitled ${openArtifact.kind}`,
+                  taskId: selectedTask.id,
+                });
+              } : undefined}
               onExplain={(message) => {
                 if (selectedTaskId) void sendTaskMessage(selectedTaskId, message);
               }}
@@ -1394,6 +1622,37 @@ function App() {
           </>
         )}
       </div>
+
+      {/* ---- Delete Confirmation Modal ---- */}
+      {pendingDeleteArtifact && (
+        <div className="modal-overlay" onClick={() => setPendingDeleteArtifact(null)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">Delete artifact?</h3>
+            <p className="modal-body">
+              Are you sure you want to delete <strong>{pendingDeleteArtifact.title}</strong>? This cannot be undone.
+            </p>
+            <div className="modal-actions">
+              <button
+                className="ghost-button compact"
+                type="button"
+                onClick={() => setPendingDeleteArtifact(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="ghost-button compact destructive-text"
+                type="button"
+                onClick={() => {
+                  void deleteStudyArtifact(pendingDeleteArtifact.id, pendingDeleteArtifact.taskId);
+                  setPendingDeleteArtifact(null);
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1451,9 +1710,394 @@ function formatDate(value: string): string {
   });
 }
 
+function summarizeDiagnostics(checks: SystemDiagnosticCheck[]) {
+  const requiredErrors = checks.filter((check) => check.required && check.status === "error").length;
+  const optionalWarnings = checks.filter((check) => !check.required && check.status === "warn").length;
+  return { requiredErrors, optionalWarnings };
+}
+
+function buildDiagnosticsFingerprint(diagnostics: SystemDiagnostics): string {
+  const checks = [...diagnostics.checks]
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .map((check) => ({
+      id: check.id,
+      status: check.status,
+      required: check.required,
+      summary: check.summary,
+      detail: check.detail ?? "",
+      resolution: check.resolution ?? "",
+      command: check.command ?? "",
+    }));
+  return JSON.stringify({
+    overallStatus: diagnostics.overallStatus,
+    requiredReady: diagnostics.requiredReady,
+    checks,
+  });
+}
+
+function readDismissedDiagnosticsFingerprint() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    return window.localStorage.getItem(DIAGNOSTICS_DISMISS_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeDismissedDiagnosticsFingerprint(fingerprint: string | null) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    if (fingerprint) {
+      window.localStorage.setItem(DIAGNOSTICS_DISMISS_KEY, fingerprint);
+    } else {
+      window.localStorage.removeItem(DIAGNOSTICS_DISMISS_KEY);
+    }
+  } catch {
+    // Ignore storage failures; dismissal just won't persist.
+  }
+}
+
+function DiagnosticsCard({
+  diagnostics,
+  compact = false,
+  onDismiss,
+}: {
+  diagnostics: SystemDiagnostics;
+  compact?: boolean;
+  onDismiss?: () => void;
+}) {
+  const { requiredErrors, optionalWarnings } = summarizeDiagnostics(diagnostics.checks);
+  const visibleChecks = compact ? diagnostics.checks.filter((check) => check.status !== "ok").slice(0, 4) : diagnostics.checks;
+
+  return (
+    <section className={`diagnostics-card diagnostics-${diagnostics.overallStatus}${compact ? " compact" : ""}`}>
+      <div className="diagnostics-header">
+        <div>
+          <span className="diagnostics-kicker">System Check</span>
+          <strong>
+            {requiredErrors > 0
+              ? `${requiredErrors} required issue${requiredErrors === 1 ? "" : "s"}`
+              : optionalWarnings > 0
+                ? `${optionalWarnings} optional gap${optionalWarnings === 1 ? "" : "s"}`
+                : "Ready to study"}
+          </strong>
+        </div>
+        <span className={`diagnostics-pill ${diagnostics.overallStatus}`}>
+          {diagnostics.overallStatus === "error" ? "Action needed" : diagnostics.overallStatus === "warn" ? "Partial" : "Ready"}
+        </span>
+      </div>
+      {onDismiss ? (
+        <div className="diagnostics-actions">
+          <button className="ghost-button compact" type="button" onClick={onDismiss} aria-label="Dismiss system check">
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+      <p className="diagnostics-summary">
+        {requiredErrors > 0
+          ? "Fix the required checks below before expecting Stuart to boot cleanly."
+          : optionalWarnings > 0
+            ? "Stuart can start, but some optional capabilities are unavailable."
+            : "Core prerequisites look good."}
+      </p>
+      <div className="diagnostics-list">
+        {visibleChecks.map((check) => (
+          <div key={check.id} className={`diagnostic-row status-${check.status}`}>
+            <div className="diagnostic-main">
+              <div className="diagnostic-title-row">
+                <span className="diagnostic-dot" />
+                <strong>{check.label}</strong>
+                {check.required ? <span className="diagnostic-required">required</span> : null}
+              </div>
+              <p>{check.summary}</p>
+              {check.detail ? <span className="diagnostic-detail">{check.detail}</span> : null}
+              {check.resolution ? <span className="diagnostic-resolution">{check.resolution}</span> : null}
+              {check.command ? <code className="diagnostic-command">{check.command}</code> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+      {(requiredErrors > 0 || optionalWarnings > 0) ? (
+        <div className="diagnostics-footer">
+          <code>pnpm preflight</code>
+          <span>Run this in the repo root for a full terminal report.</span>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function DiagnosticsDismissedNotice({
+  onShow,
+  compact = false,
+}: {
+  onShow: () => void;
+  compact?: boolean;
+}) {
+  return (
+    <section className={`diagnostics-dismissed${compact ? " compact" : ""}`}>
+      <div>
+        <span className="diagnostics-kicker">System Check</span>
+        <strong>Hidden</strong>
+      </div>
+      <button className="ghost-button compact" type="button" onClick={onShow}>
+        Show
+      </button>
+    </section>
+  );
+}
+
+/* ================================================================
+   Dashboard View
+   ================================================================ */
+
+function DashboardView({
+  projects,
+  tasks,
+  onSelectTask,
+}: {
+  projects: ProjectRecord[];
+  tasks: TaskSpec[];
+  onSelectTask: (taskId: string) => void;
+}) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [summaries, setSummaries] = useState<Record<string, ProjectLearningSummary>>({});
+  const [timelines, setTimelines] = useState<Record<string, StudyTimelineEntry[]>>({});
+  const [taskBreakdowns, setTaskBreakdowns] = useState<Record<string, TaskPerformanceBreakdown>>({});
+
+  // Fetch summaries for all projects
+  useEffect(() => {
+    for (const project of projects) {
+      fetch(`/api/projects/${project.id}/learning-summary`)
+        .then((r) => r.json())
+        .then((data: ProjectLearningSummary) => {
+          setSummaries((prev) => ({ ...prev, [project.id]: data }));
+        })
+        .catch(() => {});
+    }
+  }, [projects]);
+
+  // Fetch timeline + task breakdowns when a project is expanded
+  useEffect(() => {
+    if (!expanded) return;
+    fetch(`/api/projects/${expanded}/study-timeline?days=14`)
+      .then((r) => r.json())
+      .then((data: StudyTimelineEntry[]) => {
+        setTimelines((prev) => ({ ...prev, [expanded]: data }));
+      })
+      .catch(() => {});
+
+    const projectTasks = tasks.filter((t) => t.projectId === expanded);
+    for (const task of projectTasks) {
+      fetch(`/api/tasks/${task.id}/performance`)
+        .then((r) => r.json())
+        .then((data: TaskPerformanceBreakdown) => {
+          setTaskBreakdowns((prev) => ({ ...prev, [task.id]: data }));
+        })
+        .catch(() => {});
+    }
+  }, [expanded, tasks]);
+
+  return (
+    <div className="dashboard-view">
+      <h1>Your Study Dashboard</h1>
+      <p>Click a project to see details, weak topics, and study options.</p>
+      {projects.map((project) => {
+        const summary = summaries[project.id];
+        const isExpanded = expanded === project.id;
+        const projectTasks = tasks.filter((t) => t.projectId === project.id);
+        const timeline = timelines[project.id];
+
+        return (
+          <div
+            key={project.id}
+            className={`dashboard-project-card${isExpanded ? " expanded" : ""}`}
+            onClick={() => setExpanded(isExpanded ? null : project.id)}
+          >
+            <div className="dashboard-project-header">
+              <h2>{project.name}</h2>
+              {summary && summary.cardsDue > 0 && (
+                <span className="dashboard-due-badge">{summary.cardsDue} due</span>
+              )}
+            </div>
+            {summary && (
+              <div className="dashboard-stats-row">
+                <span>{summary.totalArtifacts} artifacts</span>
+                <span>{(summary.overallAccuracy * 100).toFixed(0)}% accuracy</span>
+                {summary.streakDays > 0 && <span>{summary.streakDays}-day streak</span>}
+                {summary.lastStudiedAt && (
+                  <span>{formatTimeAgo(summary.lastStudiedAt)}</span>
+                )}
+              </div>
+            )}
+
+            {isExpanded && (
+              <div className="dashboard-expanded-body" onClick={(e) => e.stopPropagation()}>
+                {/* Timeline sparkline */}
+                {timeline && timeline.length > 0 && (
+                  <div>
+                    <div className="dashboard-timeline">
+                      {timeline.map((entry) => {
+                        const maxReviews = Math.max(...timeline.map((e) => e.reviews), 1);
+                        const height = entry.reviews > 0 ? Math.max(8, (entry.reviews / maxReviews) * 48) : 2;
+                        const color =
+                          entry.reviews === 0
+                            ? "var(--line)"
+                            : entry.accuracy >= 0.7
+                              ? "var(--success)"
+                              : entry.accuracy >= 0.4
+                                ? "var(--warning)"
+                                : "var(--danger)";
+                        return (
+                          <div
+                            key={entry.date}
+                            className="dashboard-timeline-bar"
+                            style={{ height: `${height}px`, background: color }}
+                            data-tip={`${entry.date}: ${entry.reviews} reviews, ${(entry.accuracy * 100).toFixed(0)}%`}
+                          />
+                        );
+                      })}
+                    </div>
+                    <div className="dashboard-timeline-label">
+                      <span>{timeline[0]?.date.slice(5)}</span>
+                      <span>{timeline[timeline.length - 1]?.date.slice(5)}</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Weak topics */}
+                {summary && summary.weakTopics.length > 0 && (
+                  <div className="dashboard-weak-topics">
+                    <h3>Weak Topics</h3>
+                    {summary.weakTopics.map((topic) => {
+                      const pct =
+                        topic.totalAttempts > 0
+                          ? (topic.correctCount / topic.totalAttempts) * 100
+                          : 0;
+                      const color =
+                        pct >= 70
+                          ? "var(--success)"
+                          : pct >= 40
+                            ? "var(--warning)"
+                            : "var(--danger)";
+                      return (
+                        <div key={topic.id} className="dashboard-topic-row">
+                          <span className="dashboard-topic-name">{topic.topic}</span>
+                          <div className="dashboard-topic-bar-track">
+                            <div
+                              className="dashboard-topic-bar-fill"
+                              style={{ width: `${pct}%`, background: color }}
+                            />
+                          </div>
+                          <span className="dashboard-topic-pct">{pct.toFixed(0)}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Per-task breakdown */}
+                {projectTasks.length > 0 && (
+                  <div>
+                    {projectTasks.map((task) => {
+                      const bd = taskBreakdowns[task.id];
+                      return (
+                        <div key={task.id} className="dashboard-task-card">
+                          <span className="task-title">{task.title}</span>
+                          {bd && (
+                            <span className="task-stats">
+                              {bd.artifactCount} artifacts
+                              {bd.totalCards > 0 && ` | ${bd.cardsDue} due`}
+                              {bd.totalQuizQuestions > 0 &&
+                                ` | ${(bd.quizAccuracy * 100).toFixed(0)}% quiz`}
+                            </span>
+                          )}
+                          <button
+                            className="study-btn"
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSelectTask(task.id);
+                            }}
+                          >
+                            Study
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function formatTimeAgo(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 /* ================================================================
    Sub-components
    ================================================================ */
+
+function ArtifactMenu({ onDelete }: { onDelete: () => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [open]);
+
+  return (
+    <div className="artifact-menu" ref={ref}>
+      <button
+        className="artifact-menu-trigger"
+        title="More options"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+      >
+        &#x22EE;
+      </button>
+      {open && (
+        <div className="artifact-menu-dropdown">
+          <button
+            className="artifact-menu-item destructive-text"
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(false);
+              onDelete();
+            }}
+          >
+            Delete
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ChatBubble({ message }: { message: TaskMessageRecord }) {
   // Detect if assistant message is a JSON artifact — show a clean card instead of raw JSON
@@ -1470,9 +2114,24 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
     } catch { return false; }
   })();
 
+  // Detect if assistant message is a scripted document artifact — hide the code
+  const isScriptArtifact = !isJsonArtifact && message.role === "assistant" && (() => {
+    const content = message.content;
+    if (!content.includes("stuart-output:")) return false;
+    const match = content.match(/```(?:python|py|javascript|js)\s*\n[\s\S]*?#\s*stuart-output:\s*(.+)/);
+    return !!match;
+  })();
+
   // For JSON artifacts, extract the preamble text (before the JSON block) and show a rich summary
   let displayContent = message.content;
-  if (isJsonArtifact) {
+
+  if (isScriptArtifact) {
+    // Extract the output filename for a clean message
+    const filenameMatch = message.content.match(/stuart-output:\s*(\S+)/);
+    const filename = filenameMatch?.[1] ?? "document";
+    const ext = filename.split(".").pop()?.toUpperCase() ?? "document";
+    displayContent = `**Generating ${ext} document:** ${filename.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ")}\n\nOpen it from the Study Tools panel.`;
+  } else if (isJsonArtifact) {
     let beforeJson = message.content.split(/\n\s*\{/)[0]?.trim() ?? "";
     // Strip any unclosed code fences that would cause ReactMarkdown to render summary as code
     beforeJson = beforeJson.replace(/```(?:json)?\s*$/m, "").trim();

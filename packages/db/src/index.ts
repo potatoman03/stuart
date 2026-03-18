@@ -14,13 +14,18 @@ import type {
   IngestionSearchResult,
   MindMapNodeNote,
   MockExamAttempt,
+  ProjectLearningSummary,
   ProjectRecord,
   QuizPerformanceRecord,
   StudyArtifactRecord,
+  StudySessionRecord,
+  StudyTimelineEntry,
   TaskMessageRecord,
+  TaskPerformanceBreakdown,
   TaskRunRecord,
   TaskSpec,
   TaskWorkerRecord,
+  TopicPerformanceRecord,
   UpdateTaskInput
 } from "@stuart/shared";
 import {
@@ -233,7 +238,44 @@ export class LocalDatabase {
         started_at TEXT NOT NULL,
         completed_at TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS study_sessions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        cards_reviewed INTEGER NOT NULL DEFAULT 0,
+        questions_answered INTEGER NOT NULL DEFAULT 0,
+        correct_count INTEGER NOT NULL DEFAULT 0,
+        artifact_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+
+      CREATE INDEX IF NOT EXISTS study_sessions_project_id_idx
+      ON study_sessions (project_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS topic_performance (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        total_attempts INTEGER NOT NULL DEFAULT 0,
+        correct_count INTEGER NOT NULL DEFAULT 0,
+        last_attempted_at TEXT,
+        source_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE(project_id, topic)
+      );
+
+      CREATE INDEX IF NOT EXISTS topic_performance_project_id_idx
+      ON topic_performance (project_id, total_attempts DESC);
     `);
+
+    // Add file_path column to study_artifacts (idempotent)
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN file_path TEXT`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
   }
 
   listProjects(): ProjectRecord[] {
@@ -944,6 +986,12 @@ export class LocalDatabase {
       }));
   }
 
+  clearTaskThreadId(taskId: string): void {
+    this.db
+      .prepare(`DELETE FROM task_threads WHERE task_id = ?`)
+      .run(taskId);
+  }
+
   setTaskWorkerThreadId(workerId: string, threadId: string): void {
     this.db
       .prepare(
@@ -1419,7 +1467,7 @@ export class LocalDatabase {
     return [...merged.values()].slice(0, limit);
   }
 
-  createStudyArtifact(input: { taskId: string; kind: string; title: string; payload: string }): StudyArtifactRecord {
+  createStudyArtifact(input: { taskId: string; kind: string; title: string; payload: string; filePath?: string }): StudyArtifactRecord {
     const now = new Date().toISOString();
     const record: StudyArtifactRecord = {
       id: randomUUID(),
@@ -1427,13 +1475,14 @@ export class LocalDatabase {
       kind: input.kind as StudyArtifactRecord["kind"],
       title: input.title,
       payload: input.payload,
+      filePath: input.filePath ?? undefined,
       createdAt: now
     };
 
     this.db
       .prepare(
-        `INSERT INTO study_artifacts (id, task_id, kind, title, payload, created_at)
-         VALUES (@id, @taskId, @kind, @title, @payload, @createdAt)`
+        `INSERT INTO study_artifacts (id, task_id, kind, title, payload, file_path, created_at)
+         VALUES (@id, @taskId, @kind, @title, @payload, @filePath, @createdAt)`
       )
       .run(
         asSqlParams({
@@ -1442,6 +1491,7 @@ export class LocalDatabase {
           kind: record.kind,
           title: record.title,
           payload: record.payload,
+          filePath: record.filePath ?? null,
           createdAt: record.createdAt
         })
       );
@@ -1459,6 +1509,7 @@ export class LocalDatabase {
             kind,
             title,
             payload,
+            file_path as filePath,
             created_at as createdAt
            FROM study_artifacts
            WHERE task_id = ?
@@ -1477,6 +1528,7 @@ export class LocalDatabase {
           kind,
           title,
           payload,
+          file_path as filePath,
           created_at as createdAt
          FROM study_artifacts
          WHERE id = ?`
@@ -1491,6 +1543,32 @@ export class LocalDatabase {
       )
       .run(payload, id);
     return this.getStudyArtifact(id);
+  }
+
+  updateStudyArtifactFilePath(id: string, filePath: string): void {
+    this.db
+      .prepare(`UPDATE study_artifacts SET file_path = ? WHERE id = ?`)
+      .run(filePath, id);
+  }
+
+  deleteStudyArtifact(id: string): { deleted: boolean; filePath?: string } {
+    const artifact = this.getStudyArtifact(id);
+    if (!artifact) return { deleted: false };
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare(`DELETE FROM card_performance WHERE artifact_id = ?`).run(id);
+      this.db.prepare(`DELETE FROM quiz_performance WHERE artifact_id = ?`).run(id);
+      this.db.prepare(`DELETE FROM mindmap_node_notes WHERE artifact_id = ?`).run(id);
+      this.db.prepare(`DELETE FROM mock_exam_attempts WHERE artifact_id = ?`).run(id);
+      this.db.prepare(`DELETE FROM study_artifacts WHERE id = ?`).run(id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    return { deleted: true, filePath: artifact.filePath ?? undefined };
   }
 
   upsertCardPerformance(input: {
@@ -1800,6 +1878,337 @@ export class LocalDatabase {
     );
   }
 
+  /* ---- Study Sessions ---- */
+
+  createStudySession(input: {
+    taskId: string;
+    projectId: string;
+    artifactIds?: string[];
+  }): StudySessionRecord {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO study_sessions (id, task_id, project_id, started_at, artifact_ids_json)
+         VALUES (@id, @taskId, @projectId, @startedAt, @artifactIdsJson)`
+      )
+      .run(
+        asSqlParams({
+          id,
+          taskId: input.taskId,
+          projectId: input.projectId,
+          startedAt: now,
+          artifactIdsJson: JSON.stringify(input.artifactIds ?? []),
+        })
+      );
+
+    return {
+      id,
+      taskId: input.taskId,
+      projectId: input.projectId,
+      startedAt: now,
+      endedAt: null,
+      cardsReviewed: 0,
+      questionsAnswered: 0,
+      correctCount: 0,
+      artifactIdsJson: JSON.stringify(input.artifactIds ?? []),
+    };
+  }
+
+  updateStudySession(id: string, update: {
+    endedAt?: string;
+    cardsReviewed?: number;
+    questionsAnswered?: number;
+    correctCount?: number;
+    artifactIdsJson?: string;
+  }): StudySessionRecord | undefined {
+    const sets: string[] = [];
+    const values: SQLInputValue[] = [];
+
+    if (update.endedAt !== undefined) {
+      sets.push("ended_at = ?");
+      values.push(update.endedAt);
+    }
+    if (update.cardsReviewed !== undefined) {
+      sets.push("cards_reviewed = ?");
+      values.push(update.cardsReviewed);
+    }
+    if (update.questionsAnswered !== undefined) {
+      sets.push("questions_answered = ?");
+      values.push(update.questionsAnswered);
+    }
+    if (update.correctCount !== undefined) {
+      sets.push("correct_count = ?");
+      values.push(update.correctCount);
+    }
+    if (update.artifactIdsJson !== undefined) {
+      sets.push("artifact_ids_json = ?");
+      values.push(update.artifactIdsJson);
+    }
+
+    if (sets.length === 0) return this.getStudySession(id);
+
+    values.push(id);
+    this.db
+      .prepare(`UPDATE study_sessions SET ${sets.join(", ")} WHERE id = ?`)
+      .run(...values);
+
+    return this.getStudySession(id);
+  }
+
+  getStudySession(id: string): StudySessionRecord | undefined {
+    return this.db
+      .prepare(
+        `SELECT id, task_id as taskId, project_id as projectId, started_at as startedAt,
+                ended_at as endedAt, cards_reviewed as cardsReviewed,
+                questions_answered as questionsAnswered, correct_count as correctCount,
+                artifact_ids_json as artifactIdsJson
+         FROM study_sessions WHERE id = ?`
+      )
+      .get(id) as StudySessionRecord | undefined;
+  }
+
+  getActiveStudySession(taskId: string): StudySessionRecord | undefined {
+    return this.db
+      .prepare(
+        `SELECT id, task_id as taskId, project_id as projectId, started_at as startedAt,
+                ended_at as endedAt, cards_reviewed as cardsReviewed,
+                questions_answered as questionsAnswered, correct_count as correctCount,
+                artifact_ids_json as artifactIdsJson
+         FROM study_sessions
+         WHERE task_id = ? AND ended_at IS NULL
+         ORDER BY started_at DESC LIMIT 1`
+      )
+      .get(taskId) as StudySessionRecord | undefined;
+  }
+
+  listStudySessions(projectId: string, limit = 50): StudySessionRecord[] {
+    return asRows<StudySessionRecord>(
+      this.db
+        .prepare(
+          `SELECT id, task_id as taskId, project_id as projectId, started_at as startedAt,
+                  ended_at as endedAt, cards_reviewed as cardsReviewed,
+                  questions_answered as questionsAnswered, correct_count as correctCount,
+                  artifact_ids_json as artifactIdsJson
+           FROM study_sessions
+           WHERE project_id = ?
+           ORDER BY started_at DESC
+           LIMIT ?`
+        )
+        .all(projectId, limit)
+    );
+  }
+
+  /* ---- Topic Performance ---- */
+
+  upsertTopicPerformance(input: {
+    projectId: string;
+    taskId: string;
+    topic: string;
+    correct: boolean;
+    artifactId?: string;
+  }): void {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    const existing = this.db
+      .prepare(
+        `SELECT id, source_artifact_ids_json as sourceArtifactIdsJson
+         FROM topic_performance
+         WHERE project_id = ? AND topic = ?`
+      )
+      .get(input.projectId, input.topic) as
+      | { id: string; sourceArtifactIdsJson: string }
+      | undefined;
+
+    if (existing) {
+      const artifactIds: string[] = JSON.parse(existing.sourceArtifactIdsJson);
+      if (input.artifactId && !artifactIds.includes(input.artifactId)) {
+        artifactIds.push(input.artifactId);
+      }
+      this.db
+        .prepare(
+          `UPDATE topic_performance
+           SET total_attempts = total_attempts + 1,
+               correct_count = correct_count + ?,
+               last_attempted_at = ?,
+               source_artifact_ids_json = ?
+           WHERE id = ?`
+        )
+        .run(input.correct ? 1 : 0, now, JSON.stringify(artifactIds), existing.id);
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO topic_performance (id, project_id, task_id, topic, total_attempts, correct_count, last_attempted_at, source_artifact_ids_json)
+           VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
+        )
+        .run(
+          id,
+          input.projectId,
+          input.taskId,
+          input.topic,
+          input.correct ? 1 : 0,
+          now,
+          JSON.stringify(input.artifactId ? [input.artifactId] : [])
+        );
+    }
+  }
+
+  listWeakTopics(projectId: string, limit = 10): TopicPerformanceRecord[] {
+    return asRows<TopicPerformanceRecord>(
+      this.db
+        .prepare(
+          `SELECT id, project_id as projectId, task_id as taskId, topic,
+                  total_attempts as totalAttempts, correct_count as correctCount,
+                  last_attempted_at as lastAttemptedAt,
+                  source_artifact_ids_json as sourceArtifactIdsJson
+           FROM topic_performance
+           WHERE project_id = ? AND total_attempts > 0
+           ORDER BY (CAST(correct_count AS REAL) / total_attempts) ASC,
+                    total_attempts DESC
+           LIMIT ?`
+        )
+        .all(projectId, limit)
+    );
+  }
+
+  listTopicPerformance(projectId: string): TopicPerformanceRecord[] {
+    return asRows<TopicPerformanceRecord>(
+      this.db
+        .prepare(
+          `SELECT id, project_id as projectId, task_id as taskId, topic,
+                  total_attempts as totalAttempts, correct_count as correctCount,
+                  last_attempted_at as lastAttemptedAt,
+                  source_artifact_ids_json as sourceArtifactIdsJson
+           FROM topic_performance
+           WHERE project_id = ?
+           ORDER BY total_attempts DESC`
+        )
+        .all(projectId)
+    );
+  }
+
+  /* ---- Aggregated Analytics ---- */
+
+  getProjectLearningSummary(projectId: string): ProjectLearningSummary {
+    // Total reviews and accuracy from card + quiz performance across all tasks in project
+    const tasks = this.listTasksByProject(projectId);
+    const taskIds = tasks.map((t) => t.id);
+
+    let totalReviews = 0;
+    let totalCorrect = 0;
+    let cardsDue = 0;
+    let totalArtifacts = 0;
+    let lastStudiedAt: string | null = null;
+
+    const now = new Date().toISOString();
+
+    for (const taskId of taskIds) {
+      const artifacts = this.listStudyArtifacts(taskId);
+      totalArtifacts += artifacts.length;
+
+      for (const artifact of artifacts) {
+        if (artifact.kind === "flashcards") {
+          const cards = this.listCardPerformance(artifact.id);
+          for (const card of cards) {
+            totalReviews += card.totalReviews;
+            totalCorrect += card.correctCount;
+            if (card.nextReviewDate <= now) cardsDue++;
+          }
+        }
+        if (artifact.kind === "quiz") {
+          const quizzes = this.listQuizPerformance(artifact.id);
+          totalReviews += quizzes.length;
+          totalCorrect += quizzes.filter((q) => q.isCorrect).length;
+        }
+      }
+    }
+
+    // Streak from study sessions
+    const sessions = this.listStudySessions(projectId, 365);
+    const streakDays = computeStreak(sessions);
+    if (sessions.length > 0) {
+      lastStudiedAt = sessions[0]!.startedAt;
+    }
+
+    const weakTopics = this.listWeakTopics(projectId, 5);
+    const overallAccuracy = totalReviews > 0 ? totalCorrect / totalReviews : 0;
+
+    return {
+      projectId,
+      totalReviews,
+      overallAccuracy,
+      streakDays,
+      weakTopics,
+      cardsDue,
+      lastStudiedAt,
+      totalArtifacts,
+    };
+  }
+
+  getTaskPerformanceBreakdown(taskId: string): TaskPerformanceBreakdown {
+    const artifacts = this.listStudyArtifacts(taskId);
+    let cardsDue = 0;
+    let totalCards = 0;
+    let quizCorrect = 0;
+    let totalQuizQuestions = 0;
+    const now = new Date().toISOString();
+
+    for (const artifact of artifacts) {
+      if (artifact.kind === "flashcards") {
+        const cards = this.listCardPerformance(artifact.id);
+        totalCards += cards.length;
+        for (const card of cards) {
+          if (card.nextReviewDate <= now) cardsDue++;
+        }
+      }
+      if (artifact.kind === "quiz") {
+        const quizzes = this.listQuizPerformance(artifact.id);
+        totalQuizQuestions += quizzes.length;
+        quizCorrect += quizzes.filter((q) => q.isCorrect).length;
+      }
+    }
+
+    return {
+      taskId,
+      cardsDue,
+      quizAccuracy: totalQuizQuestions > 0 ? quizCorrect / totalQuizQuestions : 0,
+      totalCards,
+      totalQuizQuestions,
+      artifactCount: artifacts.length,
+    };
+  }
+
+  getStudyTimeline(projectId: string, days = 30): StudyTimelineEntry[] {
+    const sessions = this.listStudySessions(projectId, 1000);
+    const now = new Date();
+    const entries: StudyTimelineEntry[] = [];
+
+    for (let i = days - 1; i >= 0; i--) {
+      const date = new Date(now);
+      date.setDate(date.getDate() - i);
+      const dateStr = date.toISOString().slice(0, 10);
+
+      const daySessions = sessions.filter(
+        (s) => s.startedAt.slice(0, 10) === dateStr
+      );
+
+      const reviews = daySessions.reduce(
+        (sum, s) => sum + s.cardsReviewed + s.questionsAnswered,
+        0
+      );
+      const correct = daySessions.reduce((sum, s) => sum + s.correctCount, 0);
+
+      entries.push({
+        date: dateStr,
+        sessions: daySessions.length,
+        reviews,
+        accuracy: reviews > 0 ? correct / reviews : 0,
+      });
+    }
+
+    return entries;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -1907,6 +2316,33 @@ function tokenizeFtsQuery(value: string): string[] {
     .filter((token) => token.length >= 2 && !FTS_STOP_WORDS.has(token))
     .slice(0, 20)
   )];
+}
+
+function computeStreak(sessions: StudySessionRecord[]): number {
+  if (sessions.length === 0) return 0;
+
+  const uniqueDays = new Set(sessions.map((s) => s.startedAt.slice(0, 10)));
+  const sorted = [...uniqueDays].sort().reverse();
+
+  const today = new Date().toISOString().slice(0, 10);
+  // Streak must include today or yesterday
+  if (sorted[0] !== today) {
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    if (sorted[0] !== yesterday) return 0;
+  }
+
+  let streak = 1;
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = new Date(sorted[i - 1]!);
+    const curr = new Date(sorted[i]!);
+    const diffMs = prev.getTime() - curr.getTime();
+    if (diffMs <= 86400000 * 1.5) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+  return streak;
 }
 
 function buildFtsQueries(value: string): { strict: string; broad: string } | null {

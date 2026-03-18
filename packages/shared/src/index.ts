@@ -487,12 +487,28 @@ export type WorkspaceEvent =
       taskId: string;
       active: boolean;
       message: string;
+    }
+  | {
+      type: "sandbox.execution.started";
+      taskId: string;
+      language: "python" | "javascript";
+      outputFilename: string;
+    }
+  | {
+      type: "sandbox.execution.completed";
+      taskId: string;
+      success: boolean;
+      outputFilename: string;
+      durationMs: number;
+      error?: string;
     };
 
 export const DEFAULT_GLOBAL_INSTRUCTION_PROFILE = "default";
 export const DEFAULT_NETWORK_POLICY = "ask";
 
-export type StudyArtifactKind = "mindmap" | "flashcards" | "quiz" | "diagram" | "custom" | "mock_exam" | "interactive";
+export type StudyArtifactKind =
+  | "mindmap" | "flashcards" | "quiz" | "diagram" | "custom" | "mock_exam" | "interactive"
+  | "document_docx" | "document_xlsx" | "document_pptx" | "document_pdf";
 
 export type MindMapNode = { id: string; label: string; detail: string; citations: CitationRef[]; children?: MindMapNode[] };
 export type Flashcard = { id: string; front: string; back: string; cue: string; citations: CitationRef[] };
@@ -501,6 +517,80 @@ export type DiagramScene = { title: string; mermaid: string; notes: Array<{ id: 
 
 export type CustomSection = { heading: string; body: string; citations: CitationRef[] };
 
+export type DocxParagraph =
+  | { type: "text"; content: string }
+  | { type: "bullet"; content: string }
+  | { type: "numbered"; content: string }
+  | { type: "table"; headers: string[]; rows: string[][] }
+  | { type: "callout"; content: string }
+  | { type: "citation_note"; content: string };
+
+export type DocxSection = {
+  heading: string;
+  level: 1 | 2 | 3;
+  paragraphs: DocxParagraph[];
+};
+
+export type DocxDocumentPayload = {
+  metadata?: { author?: string; subject?: string; description?: string };
+  citations: CitationRef[];
+  sections: DocxSection[];
+};
+
+export type XlsxColumn = { header: string; width?: number };
+export type XlsxSheet = {
+  name: string;
+  columns: XlsxColumn[];
+  rows: (string | number | boolean | null)[][];
+};
+
+export type XlsxWorkbookPayload = {
+  sheets: XlsxSheet[];
+  sourceNotes?: string[];
+};
+
+export type PptxSlide =
+  | { layout: "title"; title: string; subtitle?: string }
+  | { layout: "content"; title: string; bullets: string[] }
+  | { layout: "two_column"; title: string; left: string[]; right: string[] }
+  | { layout: "table"; title: string; headers: string[]; rows: string[][] }
+  | { layout: "section"; title: string }
+  | { layout: "sources"; entries: string[] };
+
+export type PptxPresentationPayload = {
+  theme?: { primaryColor?: string; fontFamily?: string };
+  citations: CitationRef[];
+  slides: PptxSlide[];
+};
+
+export type PdfParagraph =
+  | { type: "text"; content: string }
+  | { type: "bullet"; content: string }
+  | { type: "numbered"; content: string }
+  | { type: "table"; headers: string[]; rows: string[][] }
+  | { type: "callout"; content: string; style?: "info" | "warning" | "tip" | "important" }
+  | { type: "quote"; content: string }
+  | { type: "citation_note"; content: string }
+  | { type: "math"; content: string; display?: boolean }
+  | { type: "code"; content: string; language?: string }
+  | { type: "divider" }
+  | { type: "definition"; term: string; definition: string }
+  | { type: "kv"; entries: Array<{ key: string; value: string }> };
+
+export type PdfSection = {
+  heading: string;
+  level: 1 | 2 | 3;
+  paragraphs: PdfParagraph[];
+};
+
+export type PdfDocumentPayload = {
+  pageSize?: "A4" | "letter";
+  columns?: 1 | 2;
+  metadata?: { author?: string; subject?: string; description?: string };
+  citations: CitationRef[];
+  sections: PdfSection[];
+};
+
 export type ArtifactDraft =
   | { kind: "mindmap"; title: string; nodes: MindMapNode[] }
   | { kind: "flashcards"; title: string; cards: Flashcard[] }
@@ -508,7 +598,11 @@ export type ArtifactDraft =
   | { kind: "diagram"; title: string; scene: DiagramScene }
   | { kind: "custom"; title: string; content: string; sections: CustomSection[] }
   | { kind: "mock_exam"; title: string; timeLimitMinutes: number; sections: MockExamSection[] }
-  | { kind: "interactive"; title: string; html: string };
+  | { kind: "interactive"; title: string; html: string }
+  | { kind: "document_docx"; title: string; document: DocxDocumentPayload }
+  | { kind: "document_xlsx"; title: string; workbook: XlsxWorkbookPayload }
+  | { kind: "document_pptx"; title: string; presentation: PptxPresentationPayload }
+  | { kind: "document_pdf"; title: string; document: PdfDocumentPayload };
 
 export type CitationRef = {
   sourceId: string;
@@ -525,6 +619,7 @@ export type StudyArtifactRecord = {
   kind: StudyArtifactKind;
   title: string;
   payload: string;
+  filePath?: string;
   createdAt: string;
 };
 
@@ -592,3 +687,63 @@ export type MockExamAttempt = {
   startedAt: string;
   completedAt: string | null;
 };
+
+/* ---- Learning Analytics ---- */
+
+export type StudySessionRecord = {
+  id: string;
+  taskId: string;
+  projectId: string;
+  startedAt: string;
+  endedAt: string | null;
+  cardsReviewed: number;
+  questionsAnswered: number;
+  correctCount: number;
+  artifactIdsJson: string;
+};
+
+export type TopicPerformanceRecord = {
+  id: string;
+  projectId: string;
+  taskId: string;
+  topic: string;
+  totalAttempts: number;
+  correctCount: number;
+  lastAttemptedAt: string | null;
+  sourceArtifactIdsJson: string;
+};
+
+export type ProjectLearningSummary = {
+  projectId: string;
+  totalReviews: number;
+  overallAccuracy: number;
+  streakDays: number;
+  weakTopics: TopicPerformanceRecord[];
+  cardsDue: number;
+  lastStudiedAt: string | null;
+  totalArtifacts: number;
+};
+
+export type TaskPerformanceBreakdown = {
+  taskId: string;
+  cardsDue: number;
+  quizAccuracy: number;
+  totalCards: number;
+  totalQuizQuestions: number;
+  artifactCount: number;
+};
+
+export type StudyTimelineEntry = {
+  date: string;
+  sessions: number;
+  reviews: number;
+  accuracy: number;
+};
+
+export function extractTopic(title: string, cue?: string): string {
+  const segment = title.split(/\s*[—:\-]\s*/)[0] ?? title;
+  const topic = segment.trim().toLowerCase();
+  if (topic.length > 2) return topic;
+  if (cue) return cue.trim().toLowerCase();
+  return topic || "general";
+}

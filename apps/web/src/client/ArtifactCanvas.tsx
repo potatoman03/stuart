@@ -208,12 +208,13 @@ type ArtifactCanvasProps = {
   onClose: () => void;
   onExplain?: (message: string) => void;
   artifactDbId?: string;
+  onDelete?: () => void;
   onInlineAsk?: (message: string) => void;
   inlineResponse?: string | null;
   isInlineLoading?: boolean;
 };
 
-export default function ArtifactCanvas({ title, kind, payload, onClose, onExplain, artifactDbId, onInlineAsk, inlineResponse, isInlineLoading }: ArtifactCanvasProps) {
+export default function ArtifactCanvas({ title, kind, payload, onClose, onExplain, artifactDbId, onDelete, onInlineAsk, inlineResponse, isInlineLoading }: ArtifactCanvasProps) {
   let parsed: ArtifactDraft | null = null;
   try {
     parsed = JSON.parse(payload) as ArtifactDraft;
@@ -240,22 +241,48 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
             <h2>{title}</h2>
           </div>
           <div style={{ display: "flex", gap: 6 }}>
-            <button
-              className="ghost-button compact"
-              type="button"
-              onClick={() => {
-                const blob = new Blob([payload], { type: "application/json" });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = `${title.replace(/[^a-zA-Z0-9-_ ]/g, "").replace(/\s+/g, "-")}.json`;
-                a.click();
-                URL.revokeObjectURL(url);
-              }}
-              title="Download artifact as JSON"
-            >
-              Download
-            </button>
+            {onDelete && (
+              <button
+                className="ghost-button compact destructive-text"
+                type="button"
+                onClick={onDelete}
+                title="Delete artifact"
+              >
+                Delete
+              </button>
+            )}
+            {kind.startsWith("document_") && artifactDbId ? (
+              <button
+                className="ghost-button compact"
+                type="button"
+                onClick={() => {
+                  const a = document.createElement("a");
+                  a.href = `/api/study-artifacts/${artifactDbId}/download`;
+                  a.download = "";
+                  a.click();
+                }}
+                title="Download document"
+              >
+                Download
+              </button>
+            ) : (
+              <button
+                className="ghost-button compact"
+                type="button"
+                onClick={() => {
+                  const blob = new Blob([payload], { type: "application/json" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `${title.replace(/[^a-zA-Z0-9-_ ]/g, "").replace(/\s+/g, "-")}.json`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                title="Download artifact as JSON"
+              >
+                Download
+              </button>
+            )}
             <button className="secondary-button compact" type="button" onClick={onClose}>
               &larr; Back to chat
             </button>
@@ -290,6 +317,8 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
             />
           ) : kind === "interactive" && parsed.kind === "interactive" ? (
             <InteractiveCanvas html={parsed.html} title={parsed.title} />
+          ) : kind.startsWith("document_") ? (
+            <DocumentCanvas artifactDbId={artifactDbId} kind={kind} />
           ) : (
             <div className="empty-state">
               <strong>Unknown artifact type</strong>
@@ -1928,7 +1957,7 @@ function MockExamCanvas({
   const [timeRemaining, setTimeRemaining] = useState(timeLimitMinutes * 60);
   const [scores, setScores] = useState<Record<string, number>>({});
   const startTimeRef = useRef<number>(0);
-  const timerRef = useRef<ReturnType<typeof setInterval>>();
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const totalMarks = sections.reduce((sum, s) => sum + s.totalMarks, 0);
 
@@ -2190,6 +2219,52 @@ function MockExamCanvas({
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+/* ==================================================================
+   DOCUMENT CANVAS — Preview for generated document artifacts
+   ================================================================== */
+
+function DocumentCanvas({ artifactDbId, kind }: { artifactDbId?: string; kind: string }) {
+  if (!artifactDbId) {
+    return (
+      <div className="empty-state">
+        <strong>Document preview unavailable</strong>
+        <span>This document has not been saved yet.</span>
+      </div>
+    );
+  }
+
+  const ext = kind.replace("document_", "").toUpperCase();
+  const previewUrl = `/api/study-artifacts/${artifactDbId}/preview`;
+
+  return (
+    <div className="document-canvas">
+      <div className="document-toolbar">
+        <span className="document-type-badge">{ext}</span>
+        <a
+          href={`/api/study-artifacts/${artifactDbId}/download`}
+          className="ghost-button compact"
+          download
+        >
+          Download {ext}
+        </a>
+        <a
+          href={previewUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="ghost-button compact"
+        >
+          Open in New Tab
+        </a>
+      </div>
+      <iframe
+        className="document-preview-frame"
+        src={previewUrl}
+        title={`${ext} document preview`}
+      />
     </div>
   );
 }

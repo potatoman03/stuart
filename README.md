@@ -15,7 +15,7 @@ Stuart is built around a few core nouns:
 - `Task run`: one staged execution snapshot of the task scope.
 - `Worker`: a subordinate agent with a narrower objective.
 - `Ingestion index`: local retrieval, OCR, and preview support. Important, but not the product front door.
-- `Study artifact`: a persisted flashcard deck, quiz, mind map, diagram, interactive draft, or mock exam.
+- `Study artifact`: a persisted flashcard deck, quiz, mind map, diagram, interactive draft, mock exam, or generated document (PDF, DOCX, XLSX, PPTX).
 
 The important architectural stance is:
 
@@ -36,6 +36,7 @@ packages/
   harness/            HTTP + SSE transport around the runtime
   db/                 SQLite persistence and FTS-backed ingestion search
   shared/             Shared records, events, artifact schemas
+  sandbox-executor/   Optional Docker-backed script sandbox for generated outputs
   plugin-sdk/         Plugin manifest and extension contracts
   guest-daemon/       Reserved runtime support package
   visuals/            Shared visual helpers
@@ -81,7 +82,11 @@ What works today:
 - persistent tasks, runs, messages, workers, and artifacts in SQLite
 - retrieval support over indexed local content
 - previews for PDF, DOCX, XLSX, JSX, HTML, images, and text
-- artifact generation for flashcards, quiz, mind map, diagram, interactive, and mock exam flows
+- artifact generation for flashcards, quiz, mind map, diagram, interactive, mock exam, and document (PDF/DOCX/XLSX/PPTX) flows
+- document generation via sandbox-executed scripts (reportlab, python-docx) or JSON-to-binary renderers (pdfkit, docx, pptxgenjs)
+- research and curriculum builder: web search, repo cloning, article fetching, curated source files saved to workspace, phased learning plans
+- auto-reindex after research turns so new materials are immediately available for study artifacts
+- generated files (documents, research sources) sync to the project root folder
 - web UI and Electron desktop shell
 
 What Stuart is not trying to be:
@@ -131,11 +136,15 @@ Helpful native tools:
   - used for OCR on images and OCR recovery paths
 - `soffice`
   - used for DOCX to PDF conversion when richer visual extraction is needed
+- Docker
+  - used by `@stuart/sandbox-executor` for script-based document and artifact generation
+  - Stuart will still boot without it, but sandboxed generation paths are disabled
 
 macOS-specific behavior:
 
 - the web server uses `osascript` for the native folder chooser route
 - the desktop shell uses Electron’s native dialog flow
+- the native VM helper is a Swift package that targets macOS `14+` and links Apple’s `Virtualization` framework
 
 ## Setup
 
@@ -144,6 +153,22 @@ Install dependencies:
 ```bash
 pnpm install
 ```
+
+Create and verify your local setup:
+
+```bash
+pnpm bootstrap
+pnpm preflight
+```
+
+What those do:
+
+- `pnpm bootstrap`
+  - creates a local `.env` from [`.env.example`](./.env.example) if needed
+  - runs a full prerequisite check
+- `pnpm preflight`
+  - validates Node, `pnpm`, Codex CLI, Codex auth, local data-dir access, and optional native tools
+  - prints a terminal report before you launch the app
 
 Reference environment values live in [`.env.example`](./.env.example):
 
@@ -160,19 +185,18 @@ STUART_INGESTION_OVERLAP_TOKENS=80
 
 Important nuance:
 
-- `apps/desktop` auto-loads `../../.env`
-- the normal web dev path does not auto-load `.env` for the Node server
+- root `pnpm dev`, `pnpm dev:desktop`, `pnpm dev:harness`, `pnpm bootstrap`, and `pnpm preflight` all load `.env` automatically if it exists
 - Codex authentication is separate from `.env`; Stuart expects the local Codex CLI to already be signed in
+- `pnpm dev` skips the native VM helper build by default through `STUART_SKIP_VM_HELPER=1`
+- the Docker sandbox is warmed non-blockingly; if Docker is unavailable, Stuart logs that sandboxed script generation is disabled
+- the web UI shows an in-app system check card sourced from the same diagnostics layer as `pnpm preflight`
 
-So for `pnpm dev`, either export env vars in your shell first or prefix the command inline.
-
-Example:
+In practice, the normal technical-user path is:
 
 ```bash
-export PORT=8787
-export STUART_UI_PORT=5173
-export STUART_DATA_DIR=.stuart-data
-export CODEX_BINARY_PATH=codex
+pnpm install
+pnpm bootstrap
+pnpm dev
 ```
 
 ## Running Stuart
@@ -188,17 +212,12 @@ That starts:
 - Vite client on `http://127.0.0.1:5173`
 - local server on `http://127.0.0.1:8787`
 
-Desktop shell:
-
-```bash
-pnpm dev:desktop
-```
-
-That starts the web stack and opens the Electron shell on top of it.
 
 Other useful entry points:
 
 ```bash
+pnpm bootstrap
+pnpm preflight
 pnpm dev:harness
 pnpm build
 pnpm typecheck
@@ -212,22 +231,54 @@ Codex integration:
 
 - Stuart launches `codex app-server` over WebSockets.
 - Each study session persists a main thread id.
-- Each turn is started with a dynamic `effort` level:
-  - `low` for simple short questions
-  - `medium` for normal work
-  - `high` for broader large-material turns
-- Worker agents currently run at `medium` effort.
+- Model routing: Stuart selects the model and effort per turn based on what's needed:
+  - **Main teaching thread**: `gpt-5.4-mini` (thread default)
+  - **Research / curriculum turns**: `gpt-5.4` at `high` effort (flagship for deep reasoning + web search)
+  - **Scripted document generation**: `gpt-5.4` at `high` effort (code gen needs flagship quality)
+  - **Interactive artifact generation**: `gpt-5.4` at `high` effort (HTML/JS code gen)
+  - **Simple Q&A** ("what is X"): `gpt-5.4-mini` at `low` effort
+  - **Normal study turns**: `gpt-5.4-mini` at `medium` effort
+  - **Explorer workers** (parallel file scanning): `gpt-5.4-mini` at `medium` effort
+- Skill matching is regex-based as a boost: when matched, detailed skill prompts are injected as turn context. The system prompt also describes all capabilities so the LLM can self-select when regex misses.
+- On shutdown, Stuart cleans up child `codex app-server` processes (SIGINT/SIGTERM handlers).
 
 Retrieval:
 
 - Stuart builds a local SQLite FTS index over ingested chunks.
 - Retrieval is support context for Codex, not the final authority.
 - Recent work tightened query cleaning, prefix matching, broad-vs-strict fallback, deduplication, and workspace junk filtering.
+- After research turns, the workspace is auto-reindexed so new source files are immediately available.
 
 Artifacts:
 
-- artifact-specific skill prompts live in [packages/runtime-supervisor/src/skills](./packages/runtime-supervisor/src/skills)
-- renderer and persistence behavior are defined by shared schemas in [packages/shared/src/index.ts](/Users/jon/Projects/stuart/packages/shared/src/index.ts)
+- Artifact-specific skill prompts live in [packages/runtime-supervisor/src/skills](./packages/runtime-supervisor/src/skills).
+- Renderer and persistence behavior are defined by shared schemas in [packages/shared/src/index.ts](/Users/jon/Projects/stuart/packages/shared/src/index.ts).
+- Document artifacts (PDF/DOCX/XLSX/PPTX) can be generated via two paths:
+  - **JSON-to-binary**: LLM outputs structured JSON, server renders to binary via pdfkit/docx/pptxgenjs/xlsx.
+  - **Sandbox-scripted**: LLM outputs a Python/JS script, executed in a Docker sandbox (reportlab, python-docx, etc.).
+- Generated documents are written to the project's workspace root so the user can access them directly.
+- Download and preview endpoints serve the binary files with correct MIME types; previews render natively (PDF in iframe, DOCX via mammoth, XLSX via sheet_to_html, PPTX as HTML cards).
+
+Research:
+
+- The `research` skill instructs the LLM to search the web, clone repos, fetch articles, and save curated markdown files to `sources/` in the workspace.
+- A `curriculum.md` with phased learning path is generated alongside.
+- After a research turn completes, files are synced from staging to the project root and the ingestion index is rebuilt.
+
+Dependency surfaces:
+
+- Root tooling:
+  - `typescript`, `tsx`, `vitest`, `@playwright/test`, `concurrently`
+- Web app:
+  - `react`, `react-dom`, `vite`, `express`, `cors`, `mermaid`, `react-markdown`, `remark-gfm`
+- Document and preview stack:
+  - `mammoth`, `xlsx`, `pdfjs-dist`, `fast-xml-parser`, `jszip`, `docx`, `pdfkit`, `pptxgenjs`
+- Desktop shell:
+  - `electron`
+- Optional sandbox runtime:
+  - `dockerode`
+- UI helpers:
+  - `clsx`, `tailwind-merge`
 
 ## Development Guide
 
@@ -272,7 +323,6 @@ Current dedicated test areas include:
 
 - The runtime is still mid-pivot toward a cleaner workspace-first model.
 - Retrieval is much better than the earlier snippet-only path, but it is still FTS-backed support rather than full semantic search.
-- The web dev path still expects env vars from the shell instead of auto-loading `.env`.
 - Native document fidelity depends on the optional local tools listed above.
 
 ## Philosophy

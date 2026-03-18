@@ -12,18 +12,25 @@ import type {
   IngestionSearchResult,
   MindMapNodeNote,
   MockExamAttempt,
+  ProjectLearningSummary,
   QuizPerformanceRecord,
   StudyArtifactRecord,
+  StudySessionRecord,
+  StudyTimelineEntry,
   TaskMessageRecord,
+  TaskPerformanceBreakdown,
   TaskWorkerRecord,
+  TopicPerformanceRecord,
   UpdateTaskInput,
   VmStatus,
   WorkspaceEvent
 } from "@stuart/shared";
+import { extractTopic } from "@stuart/shared";
 
 export interface StuartHarnessOptions {
   dataDir: string;
   vmHelperBinaryPath?: string;
+  workspaceRoot?: string;
   runtime?: StuartRuntime;
 }
 
@@ -51,6 +58,7 @@ type DashboardPayload = {
   vmStatus: VmStatus;
   projects: ReturnType<StuartRuntime["listProjects"]>;
   tasks: ReturnType<StuartRuntime["listTasks"]>;
+  diagnostics: Awaited<ReturnType<StuartRuntime["getSystemDiagnostics"]>>;
 };
 
 export class StuartHarness {
@@ -62,7 +70,8 @@ export class StuartHarness {
       options.runtime ??
       new StuartRuntime({
         dataDir: options.dataDir,
-        vmHelperBinaryPath: options.vmHelperBinaryPath
+        vmHelperBinaryPath: options.vmHelperBinaryPath,
+        workspaceRoot: options.workspaceRoot
       });
     this.vm = this.runtime.vm;
   }
@@ -172,12 +181,27 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     });
   });
 
+  router.get("/health", (_request, response) => {
+    response.json({ ok: true });
+  });
+
   router.get("/dashboard", asyncRoute(async (_request, response) => {
+    const [vmStatus, projects, tasks, diagnostics] = await Promise.all([
+      safeVmStatus(runtime),
+      safeProjects(runtime),
+      safeTasks(runtime),
+      safeSystemDiagnostics(runtime)
+    ]);
     response.json({
-      vmStatus: await runtime.getVmStatus(),
-      projects: runtime.listProjects(),
-      tasks: runtime.listTasks()
+      vmStatus,
+      projects,
+      tasks,
+      diagnostics
     } satisfies DashboardPayload);
+  }));
+
+  router.get("/system/diagnostics", asyncRoute(async (_request, response) => {
+    response.json(await safeSystemDiagnostics(runtime));
   }));
 
   router.get("/projects", (_request, response) => {
@@ -473,6 +497,31 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       totalReviews: totalReviews ?? 0,
       correctCount: correctCount ?? 0,
     });
+
+    // Auto-track topic performance
+    try {
+      const artifact = runtime.db.getStudyArtifact(artifactId);
+      if (artifact) {
+        const task = runtime.db.getTask(artifact.taskId);
+        if (task) {
+          let cue: string | undefined;
+          try {
+            const payload = JSON.parse(artifact.payload) as { cards?: Array<{ id: string; cue?: string }> };
+            cue = payload.cards?.find((c) => c.id === cardId)?.cue;
+          } catch { /* ignore */ }
+          const topic = extractTopic(artifact.title, cue);
+          const isCorrect = lastRating === "good" || lastRating === "easy";
+          runtime.db.upsertTopicPerformance({
+            projectId: task.projectId,
+            taskId: task.id,
+            topic,
+            correct: isCorrect,
+            artifactId,
+          });
+        }
+      }
+    } catch { /* non-critical */ }
+
     response.json(record satisfies CardPerformanceRecord);
   });
 
@@ -541,6 +590,25 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       isCorrect: Boolean(isCorrect),
       difficultyFlag: difficultyFlag ?? null,
     });
+
+    // Auto-track topic performance
+    try {
+      const artifact = runtime.db.getStudyArtifact(artifactId);
+      if (artifact) {
+        const task = runtime.db.getTask(artifact.taskId);
+        if (task) {
+          const topic = extractTopic(artifact.title);
+          runtime.db.upsertTopicPerformance({
+            projectId: task.projectId,
+            taskId: task.id,
+            topic,
+            correct: Boolean(isCorrect),
+            artifactId,
+          });
+        }
+      }
+    } catch { /* non-critical */ }
+
     response.status(201).json(record satisfies QuizPerformanceRecord);
   });
 
@@ -560,6 +628,175 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     }
     response.json(updated satisfies StudyArtifactRecord);
   });
+
+  // ---- Study Artifact Delete ----
+
+  router.delete("/study-artifacts/:id", asyncRoute(async (request, response) => {
+    const artifactId = firstParam(request.params.id);
+    const result = runtime.db.deleteStudyArtifact(artifactId);
+    if (!result.deleted) {
+      response.status(404).send("Study artifact not found.");
+      return;
+    }
+    // Clean up the file on disk if it exists
+    if (result.filePath) {
+      const { rm } = await import("node:fs/promises");
+      await rm(result.filePath, { force: true }).catch(() => {});
+    }
+    response.json({ deleted: true });
+  }));
+
+  // ---- Document Download + Preview ----
+
+  router.get("/study-artifacts/:id/download", asyncRoute(async (request, response) => {
+    const artifact = runtime.db.getStudyArtifact(firstParam(request.params.id));
+    if (!artifact) {
+      response.status(404).send("Study artifact not found.");
+      return;
+    }
+
+    const filePath = await runtime.ensureDocumentFile(artifact.id);
+    if (!filePath) {
+      response.status(500).send("Failed to generate document. Check server logs.");
+      return;
+    }
+
+    const mimeTypes: Record<string, string> = {
+      document_docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      document_xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      document_pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      document_pdf: "application/pdf",
+    };
+
+    const ext = artifact.kind.replace("document_", "");
+    const safeName = (artifact.title || "document").replace(/[^a-zA-Z0-9_\- ]/g, "").replace(/\s+/g, "_");
+    const mime = mimeTypes[artifact.kind] ?? "application/octet-stream";
+
+    response.setHeader("Content-Type", mime);
+    response.setHeader("Content-Disposition", `attachment; filename="${safeName}.${ext}"`);
+    const { createReadStream } = await import("node:fs");
+    createReadStream(filePath).pipe(response);
+  }));
+
+  router.get("/study-artifacts/:id/preview", asyncRoute(async (request, response) => {
+    const artifact = runtime.db.getStudyArtifact(firstParam(request.params.id));
+    if (!artifact) {
+      response.status(404).send("Study artifact not found.");
+      return;
+    }
+
+    const kind = artifact.kind;
+
+    // For document kinds, always try to render the binary first
+    if (kind.startsWith("document_")) {
+      const filePath = await runtime.ensureDocumentFile(artifact.id);
+
+      // PDF — serve the binary (browser renders natively in iframe)
+      if (kind === "document_pdf" && filePath) {
+        response.setHeader("Content-Type", "application/pdf");
+        const { createReadStream } = await import("node:fs");
+        createReadStream(filePath).pipe(response);
+        return;
+      }
+
+      // DOCX — convert binary to HTML via mammoth
+      if (kind === "document_docx" && filePath) {
+        try {
+          const mammoth = await import("mammoth");
+          const { readFile } = await import("node:fs/promises");
+          const buffer = await readFile(filePath);
+          const result = await mammoth.convertToHtml({ buffer });
+          response.setHeader("Content-Type", "text/html; charset=utf-8");
+          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.6;color:#333}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f5f5f5}</style></head><body>${result.value}</body></html>`);
+          return;
+        } catch { /* fall through to HTML preview */ }
+      }
+
+      // XLSX — convert binary to HTML via xlsx
+      if (kind === "document_xlsx" && filePath) {
+        try {
+          const XLSX = await import("xlsx");
+          const workbook = XLSX.readFile(filePath);
+          const sheets = workbook.SheetNames.map((name) => {
+            const html = XLSX.utils.sheet_to_html(workbook.Sheets[name]!);
+            return `<h2>${name}</h2>${html}`;
+          }).join("");
+          response.setHeader("Content-Type", "text/html; charset=utf-8");
+          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#333}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f5f5f5;font-weight:600}</style></head><body>${sheets}</body></html>`);
+          return;
+        } catch { /* fall through */ }
+      }
+
+      // PPTX — render HTML cards from JSON payload
+      if (kind === "document_pptx") {
+        try {
+          const data = JSON.parse(artifact.payload) as { presentation?: { slides?: Array<Record<string, unknown>> } };
+          const slides = data.presentation?.slides ?? (data as unknown as { slides?: Array<Record<string, unknown>> }).slides ?? [];
+          const slideHtml = slides.map((slide, i) => {
+            const layout = slide.layout as string;
+            const title = (slide.title as string) ?? "";
+            let body = "";
+            if (layout === "content") {
+              const bullets = (slide.bullets as string[]) ?? [];
+              body = `<ul>${bullets.map((b) => `<li>${b}</li>`).join("")}</ul>`;
+            } else if (layout === "two_column") {
+              const left = (slide.left as string[]) ?? [];
+              const right = (slide.right as string[]) ?? [];
+              body = `<div style="display:flex;gap:2rem"><div style="flex:1"><ul>${left.map((b) => `<li>${b}</li>`).join("")}</ul></div><div style="flex:1"><ul>${right.map((b) => `<li>${b}</li>`).join("")}</ul></div></div>`;
+            } else if (layout === "table") {
+              const headers = (slide.headers as string[]) ?? [];
+              const rows = (slide.rows as string[][]) ?? [];
+              body = `<table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${headers.map((_, ci) => `<td>${r[ci] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+            } else if (layout === "title") {
+              body = slide.subtitle ? `<p style="color:#666;font-size:1.1rem">${slide.subtitle}</p>` : "";
+            } else if (layout === "sources") {
+              const entries = (slide.entries as string[]) ?? [];
+              body = `<ul style="font-size:0.9rem;color:#555">${entries.map((e) => `<li>${e}</li>`).join("")}</ul>`;
+            }
+            return `<div class="slide"><div class="slide-num">Slide ${i + 1}</div><h3>${title}</h3>${body}</div>`;
+          }).join("");
+          response.setHeader("Content-Type", "text/html; charset=utf-8");
+          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#333}.slide{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:1.5rem;margin:1rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.slide-num{font-size:0.75rem;color:#999;margin-bottom:0.5rem}table{border-collapse:collapse;width:100%;margin:0.5rem 0}th,td{border:1px solid #ddd;padding:6px 10px;text-align:left}th{background:#f5f5f5}</style></head><body>${slideHtml}</body></html>`);
+          return;
+        } catch { /* fall through */ }
+      }
+
+      // Fallback: render an HTML preview from JSON payload (only for JSON-schema artifacts)
+      try {
+        const data = JSON.parse(artifact.payload) as Record<string, unknown>;
+
+        // Script-based artifact with no rendered file
+        if (data.script) {
+          const ext = kind.replace("document_", "").toUpperCase();
+          const retryCount = Number(request.query.retry) || 0;
+
+          // Allow up to 3 auto-retries (9 seconds total), then show error
+          if (retryCount < 3) {
+            response.setHeader("Content-Type", "text/html; charset=utf-8");
+            response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;color:#333;text-align:center}.box{max-width:400px}h2{margin:0 0 8px;font-size:1.2rem}p{color:#666;font-size:14px;line-height:1.5}.spin{display:inline-block;width:24px;height:24px;border:3px solid #e5e7eb;border-top-color:#2962FF;border-radius:50%;animation:s 0.8s linear infinite;margin-bottom:12px}@keyframes s{to{transform:rotate(360deg)}}</style></head><body><div class="box"><div class="spin"></div><h2>Generating ${ext}...</h2><p>The document is being rendered. This page will refresh automatically.</p></div><script>setTimeout(()=>{const u=new URL(location.href);u.searchParams.set("retry",${retryCount + 1});location.replace(u)},3000)</script></body></html>`);
+            return;
+          }
+
+          // Retries exhausted — show error with manual retry
+          response.setHeader("Content-Type", "text/html; charset=utf-8");
+          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;color:#333;text-align:center}.box{max-width:440px}h2{margin:0 0 8px;font-size:1.2rem;color:#B91C1C}p{color:#666;font-size:14px;line-height:1.5}a,button{color:#2962FF;text-decoration:none;font-weight:600;cursor:pointer;background:none;border:none;font-size:14px}a:hover,button:hover{text-decoration:underline}.sep{margin:12px 0;border:none;border-top:1px solid #e5e7eb}</style></head><body><div class="box"><h2>${ext} generation failed</h2><p>The sandbox couldn't produce the document. This usually means the generated script had an error. Try asking Stuart to regenerate it.</p><hr class="sep"/><button onclick="location.href=location.pathname">Retry</button> · <a href="/api/study-artifacts/${artifact.id}/download">Try download</a></div></body></html>`);
+          return;
+        }
+
+        // JSON-schema artifact fallback
+        const sections = (data.document as Record<string, unknown>)?.sections ?? data.sections;
+        if (Array.isArray(sections) && sections.length > 0) {
+          response.setHeader("Content-Type", "text/html; charset=utf-8");
+          response.send(renderPdfPayloadAsHtml(artifact.title, sections as Array<Record<string, unknown>>));
+          return;
+        }
+      } catch { /* fall through */ }
+    }
+
+    // Final fallback
+    response.setHeader("Content-Type", "application/json");
+    response.send(artifact.payload);
+  }));
 
   // ---- Mindmap Node Notes ----
 
@@ -627,6 +864,71 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     response.json(updated satisfies MockExamAttempt);
   });
 
+  // ---- Learning Analytics ----
+
+  router.get("/projects/:projectId/learning-summary", (request, response) => {
+    const projectId = firstParam(request.params.projectId);
+    response.json(
+      runtime.db.getProjectLearningSummary(projectId) satisfies ProjectLearningSummary
+    );
+  });
+
+  router.get("/projects/:projectId/weak-topics", (request, response) => {
+    const projectId = firstParam(request.params.projectId);
+    const limit = typeof request.query.limit === "string" ? Number(request.query.limit) : 10;
+    response.json(
+      runtime.db.listWeakTopics(projectId, Number.isFinite(limit) && limit > 0 ? limit : 10) satisfies TopicPerformanceRecord[]
+    );
+  });
+
+  router.get("/projects/:projectId/study-timeline", (request, response) => {
+    const projectId = firstParam(request.params.projectId);
+    const days = typeof request.query.days === "string" ? Number(request.query.days) : 30;
+    response.json(
+      runtime.db.getStudyTimeline(projectId, Number.isFinite(days) && days > 0 ? days : 30) satisfies StudyTimelineEntry[]
+    );
+  });
+
+  router.get("/tasks/:taskId/performance", (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    response.json(
+      runtime.db.getTaskPerformanceBreakdown(taskId) satisfies TaskPerformanceBreakdown
+    );
+  });
+
+  router.post("/tasks/:taskId/study-sessions", (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const task = runtime.db.getTask(taskId);
+    if (!task) {
+      response.status(404).send("Task not found.");
+      return;
+    }
+    const { artifactIds } = request.body ?? {};
+    const session = runtime.db.createStudySession({
+      taskId,
+      projectId: task.projectId,
+      artifactIds: Array.isArray(artifactIds) ? artifactIds : undefined,
+    });
+    response.status(201).json(session satisfies StudySessionRecord);
+  });
+
+  router.patch("/study-sessions/:sessionId", (request, response) => {
+    const sessionId = firstParam(request.params.sessionId);
+    const { endedAt, cardsReviewed, questionsAnswered, correctCount, artifactIdsJson } = request.body ?? {};
+    const updated = runtime.db.updateStudySession(sessionId, {
+      endedAt: endedAt ?? undefined,
+      cardsReviewed: cardsReviewed !== undefined ? Number(cardsReviewed) : undefined,
+      questionsAnswered: questionsAnswered !== undefined ? Number(questionsAnswered) : undefined,
+      correctCount: correctCount !== undefined ? Number(correctCount) : undefined,
+      artifactIdsJson: artifactIdsJson ?? undefined,
+    });
+    if (!updated) {
+      response.status(404).send("Study session not found.");
+      return;
+    }
+    response.json(updated satisfies StudySessionRecord);
+  });
+
   return router;
 }
 
@@ -651,4 +953,159 @@ function asyncRoute(
 
 function firstParam(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? "" : value ?? "";
+}
+
+async function safeSystemDiagnostics(runtime: StuartRuntime) {
+  try {
+    return await runtime.getSystemDiagnostics();
+  } catch (error) {
+    return {
+      generatedAt: new Date().toISOString(),
+      overallStatus: "warn" as const,
+      requiredReady: true,
+      checks: [
+        {
+          id: "diagnostics-runtime",
+          label: "System diagnostics",
+          status: "warn" as const,
+          required: false,
+          summary: "Diagnostics could not be collected.",
+          detail: error instanceof Error ? error.message : String(error),
+          resolution: "Run `pnpm preflight` in the repo root for a direct terminal check.",
+        }
+      ]
+    };
+  }
+}
+
+async function safeVmStatus(runtime: StuartRuntime) {
+  try {
+    return await runtime.getVmStatus();
+  } catch (error) {
+    return {
+      state: "stopped" as const,
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function safeProjects(runtime: StuartRuntime) {
+  try {
+    return runtime.listProjects();
+  } catch {
+    return [];
+  }
+}
+
+function safeTasks(runtime: StuartRuntime) {
+  try {
+    return runtime.listTasks();
+  } catch {
+    return [];
+  }
+}
+
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function renderPdfPayloadAsHtml(title: string, sections: Array<Record<string, unknown>>): string {
+  const headingTag: Record<number, string> = { 1: "h2", 2: "h3", 3: "h4" };
+
+  function renderPara(para: Record<string, unknown>): string {
+    const type = para.type as string;
+    const content = escHtml((para.content as string) ?? "");
+
+    switch (type) {
+      case "text":
+        return `<p>${content}</p>`;
+      case "bullet":
+        return `<li>${content}</li>`;
+      case "numbered":
+        return `<li>${content}</li>`;
+      case "definition":
+        return `<div class="def"><strong>${escHtml((para.term as string) ?? "")}</strong> ${escHtml((para.definition as string) ?? "")}</div>`;
+      case "kv": {
+        const entries = (para.entries as Array<{ key: string; value: string }>) ?? [];
+        return `<div class="kv">${entries.map((e) => `<div class="kv-row"><span class="kv-key">${escHtml(e.key)}</span><span class="kv-val">${escHtml(e.value)}</span></div>`).join("")}</div>`;
+      }
+      case "table": {
+        const headers = (para.headers as string[]) ?? [];
+        const rows = (para.rows as string[][]) ?? [];
+        return `<table><thead><tr>${headers.map((h) => `<th>${escHtml(h)}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${headers.map((_, ci) => `<td>${escHtml(String(r[ci] ?? ""))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      }
+      case "math":
+        return `<div class="math${(para.display as boolean) ? " display" : ""}">${content}</div>`;
+      case "code":
+        return `<pre class="code">${content}</pre>`;
+      case "callout":
+        return `<div class="callout callout-${(para.style as string) ?? "info"}">${content}</div>`;
+      case "quote":
+        return `<blockquote>${content}</blockquote>`;
+      case "divider":
+        return `<hr/>`;
+      case "citation_note":
+        return `<div class="cite">${content}</div>`;
+      default:
+        return `<p>${content}</p>`;
+    }
+  }
+
+  let body = "";
+  for (const section of sections) {
+    const tag = headingTag[(section.level as number) ?? 1] ?? "h2";
+    body += `<${tag}>${escHtml((section.heading as string) ?? "")}</${tag}>`;
+    const paragraphs = (section.paragraphs as Array<Record<string, unknown>>) ?? [];
+    // Wrap consecutive bullets/numbered in ul/ol
+    let inList: string | null = null;
+    for (const para of paragraphs) {
+      const type = para.type as string;
+      if (type === "bullet" && inList !== "ul") {
+        if (inList) body += `</${inList}>`;
+        body += "<ul>";
+        inList = "ul";
+      } else if (type === "numbered" && inList !== "ol") {
+        if (inList) body += `</${inList}>`;
+        body += "<ol>";
+        inList = "ol";
+      } else if (type !== "bullet" && type !== "numbered" && inList) {
+        body += `</${inList}>`;
+        inList = null;
+      }
+      body += renderPara(para);
+    }
+    if (inList) body += `</${inList}>`;
+  }
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body{font-family:system-ui,sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1.5rem;color:#1a1a2e;font-size:14px;line-height:1.5}
+h1{font-size:1.4rem;border-bottom:2px solid #2962FF;padding-bottom:4px;margin:1.2rem 0 0.6rem}
+h2{font-size:1.15rem;color:#16213e;border-left:3px solid #2962FF;padding-left:8px;margin:1rem 0 0.4rem}
+h3{font-size:1rem;color:#0f3460;margin:0.8rem 0 0.3rem}
+h4{font-size:0.9rem;color:#333;margin:0.6rem 0 0.2rem}
+p{margin:0.3rem 0}
+ul,ol{margin:0.2rem 0 0.4rem 1.2rem;padding:0}
+li{margin:0.15rem 0}
+table{border-collapse:collapse;width:100%;margin:0.5rem 0;font-size:13px}
+th{background:#2962FF;color:#fff;font-weight:600;padding:5px 8px;text-align:left}
+td{border:1px solid #dee2e6;padding:4px 8px}
+tr:nth-child(even){background:#f8f9fa}
+blockquote{border-left:3px solid #6b7280;margin:0.4rem 0;padding:4px 12px;color:#4b5563;font-style:italic}
+.math{font-family:monospace;color:#5b21b6;background:#f5f3ff;border:1px solid #c4b5fd;border-radius:4px;padding:4px 8px;margin:0.3rem 0}
+.math.display{text-align:center;font-size:1.05em}
+.code{font-family:monospace;background:#1e293b;color:#e2e8f0;border-radius:4px;padding:6px 10px;margin:0.3rem 0;font-size:12px;overflow-x:auto}
+.callout{border-radius:4px;padding:6px 10px;margin:0.3rem 0;font-weight:600;font-size:13px}
+.callout-info{background:#ebf5ff;border-left:3px solid #3b82f6;color:#1e40af}
+.callout-tip{background:#ecfdf5;border-left:3px solid #10b981;color:#065f46}
+.callout-warning{background:#fffbeb;border-left:3px solid #f59e0b;color:#92400e}
+.callout-important{background:#fef2f2;border-left:3px solid #ef4444;color:#991b1b}
+.def{margin:0.2rem 0}
+.def strong{color:#1e40af;margin-right:6px}
+.kv{margin:0.3rem 0}
+.kv-row{display:flex;gap:8px;margin:1px 0;font-size:13px}
+.kv-key{font-weight:600;color:#374151;min-width:100px;flex-shrink:0}
+.kv-val{color:#555}
+.cite{font-size:11px;color:#9ca3af;font-style:italic;margin:0.2rem 0}
+hr{border:none;border-top:1px dashed #e5e7eb;margin:0.6rem 0}
+</style></head><body><h1>${escHtml(title)}</h1>${body}</body></html>`;
 }

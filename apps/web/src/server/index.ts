@@ -48,7 +48,8 @@ const reactJsxRuntimeEntry = require.resolve("react/jsx-runtime");
 
 const harness = new StuartHarness({
   dataDir,
-  vmHelperBinaryPath: helperCandidate
+  vmHelperBinaryPath: helperCandidate,
+  workspaceRoot
 });
 
 const server = new StuartHarnessServer({
@@ -461,5 +462,15 @@ function escapeHtml(value: string): string {
 function escapeHtmlAttribute(value: string): string {
   return escapeHtml(value).replace(/\s+/g, "-").toLowerCase();
 }
+
+// Ensure child processes (codex app-server, sandbox) are cleaned up on exit
+async function shutdown() {
+  process.stdout.write("\n[stuart] shutting down...\n");
+  try { await server.close(); } catch { /* best effort */ }
+  process.exit(0);
+}
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
+process.on("beforeExit", () => void shutdown());
 
 void main();

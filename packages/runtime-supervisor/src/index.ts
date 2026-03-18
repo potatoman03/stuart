@@ -33,6 +33,7 @@ import type {
   TaskRunRecord,
   TaskSpec,
   TaskWorkerRecord,
+  TopicPerformanceRecord,
   UpdateTaskInput,
   VmStatus
 } from "@stuart/shared";
@@ -43,7 +44,22 @@ import {
   isIngestiblePath,
   parseDocumentForIngestion
 } from "./ingestion.js";
+import { renderDocument } from "./document-renderer.js";
 import { matchSkill } from "./skills.js";
+import { SandboxExecutor } from "@stuart/sandbox-executor";
+import {
+  collectSystemDiagnostics,
+  type SystemDiagnostics
+} from "./diagnostics.js";
+
+export { renderDocument } from "./document-renderer.js";
+export {
+  collectSystemDiagnostics,
+  ensureLocalEnvFile,
+  type SystemDiagnosticCheck,
+  type SystemDiagnostics,
+  type SystemDiagnosticStatus
+} from "./diagnostics.js";
 
 interface InventoryEntry extends FileFingerprint {
   absolutePath: string;
@@ -52,6 +68,7 @@ interface InventoryEntry extends FileFingerprint {
 interface RuntimeOptions {
   dataDir: string;
   vmHelperBinaryPath?: string;
+  workspaceRoot?: string;
 }
 
 export interface DemoCleanupResult {
@@ -87,6 +104,10 @@ interface ActiveTurnState {
   assistantText: string;
   thinkingLabel: string;
   startedEmitted: boolean;
+  /** The working directory for this turn (staging path) */
+  cwd?: string;
+  /** Whether this turn should trigger workspace re-indexing on completion */
+  triggersReindex?: boolean;
 }
 
 interface ResolvedWorkspaceFile extends WorkspaceFileRecord {
@@ -124,18 +145,28 @@ export class VmHelperClient {
 export class StuartRuntime {
   readonly db: LocalDatabase;
   readonly vm: VmHelperClient;
-  private readonly dataDir: string;
+  readonly dataDir: string;
+  readonly sandbox: SandboxExecutor;
+  private sandboxAvailable = false;
   private readonly stagingRoot: string;
+  private readonly workspaceRoot: string;
   private readonly events = new EventEmitter();
   private readonly loadedThreadIds = new Set<string>();
   private readonly turns = new Map<string, ActiveTurnState>();
   private readonly codex: CodexAppServerClient;
+  private readonly vmHelperBinaryPath?: string;
+  private diagnosticsCache?: { expiresAt: number; value: SystemDiagnostics };
 
   constructor(options: RuntimeOptions) {
     this.dataDir = resolve(options.dataDir);
+    this.workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
     this.stagingRoot = join(this.dataDir, "staging");
     this.db = new LocalDatabase(join(this.dataDir, "stuart.sqlite"));
+    this.vmHelperBinaryPath = options.vmHelperBinaryPath;
     this.vm = new VmHelperClient(options.vmHelperBinaryPath);
+    this.sandbox = new SandboxExecutor({
+      outputRoot: join(this.dataDir, "generated-documents"),
+    });
     this.codex = new CodexAppServerClient({
       onNotification: (notification) => {
         void this.handleCodexNotification(notification);
@@ -166,6 +197,22 @@ export class StuartRuntime {
         `[stuart] failed to warm codex app-server: ${String(error)}\n`
       );
     }
+
+    // Warm Docker sandbox (non-blocking — log warning if unavailable)
+    try {
+      this.sandboxAvailable = await this.sandbox.isAvailable();
+      if (this.sandboxAvailable) {
+        await this.sandbox.ensureImageReady();
+        process.stdout.write("[stuart] sandbox executor ready (Docker available).\n");
+      } else {
+        process.stdout.write("[stuart] sandbox executor unavailable — Docker not running. Script-based document generation disabled.\n");
+      }
+    } catch (error) {
+      this.sandboxAvailable = false;
+      process.stderr.write(
+        `[stuart] sandbox executor setup failed: ${String(error)}\n`
+      );
+    }
   }
 
   onEvent(listener: (event: WorkspaceEvent) => void): () => void {
@@ -177,6 +224,25 @@ export class StuartRuntime {
 
   async getVmStatus(): Promise<VmStatus> {
     return this.vm.status();
+  }
+
+  async getSystemDiagnostics(): Promise<SystemDiagnostics> {
+    if (this.diagnosticsCache && this.diagnosticsCache.expiresAt > Date.now()) {
+      return this.diagnosticsCache.value;
+    }
+
+    const diagnostics = await collectSystemDiagnostics({
+      workspaceRoot: this.workspaceRoot,
+      dataDir: this.dataDir,
+      codexBinaryPath: process.env.CODEX_BINARY_PATH,
+      vmHelperBinaryPath: this.vmHelperBinaryPath,
+      sandboxAvailable: this.sandboxAvailable,
+    });
+    this.diagnosticsCache = {
+      expiresAt: Date.now() + 30_000,
+      value: diagnostics,
+    };
+    return diagnostics;
   }
 
   listProjects() {
@@ -290,6 +356,77 @@ export class StuartRuntime {
     return runningWorker;
   }
 
+  /** Resolve the project's root path from a taskId, or null if not found. */
+  private resolveProjectRoot(taskId: string): string | null {
+    try {
+      const task = this.db.getTask(taskId);
+      if (task) {
+        const project = this.db.getProject(task.projectId);
+        if (project?.rootPath && existsSync(project.rootPath)) {
+          return project.rootPath;
+        }
+      }
+    } catch { /* ignore */ }
+    return null;
+  }
+
+  /**
+   * Resolve the output directory for generated documents.
+   * Writes into the project's workspace root so the user can see the files.
+   * Falls back to the internal data dir if the project root can't be resolved.
+   */
+  private resolveDocumentOutputDir(taskId: string): string {
+    return this.resolveProjectRoot(taskId) ?? join(this.dataDir, "generated-documents", taskId);
+  }
+
+  /**
+   * Ensure a document artifact has its binary file rendered on disk.
+   * Renders on-demand if the file is missing. Returns the file path or null.
+   */
+  async ensureDocumentFile(artifactId: string): Promise<string | null> {
+    const artifact = this.db.getStudyArtifact(artifactId);
+    if (!artifact || !artifact.kind.startsWith("document_")) return null;
+
+    if (artifact.filePath && existsSync(artifact.filePath)) {
+      return artifact.filePath;
+    }
+
+    try {
+      const data = JSON.parse(artifact.payload);
+      const outputDir = this.resolveDocumentOutputDir(artifact.taskId);
+
+      // Script-based artifact: re-execute through sandbox
+      if (data.script && data.language && data.outputFilename && this.sandboxAvailable) {
+        const result = await this.sandbox.executeScript({
+          language: data.language,
+          script: data.script,
+          outputFilename: data.outputFilename,
+          taskId: artifact.taskId,
+          outputDir,
+          sourcesDir: outputDir,
+        });
+        if (result.success && result.outputPath) {
+          this.db.updateStudyArtifactFilePath(artifact.id, result.outputPath);
+          return result.outputPath;
+        }
+        console.error(`[stuart] sandbox re-execution failed for artifact ${artifactId}: exit=${result.exitCode}`);
+        return null;
+      }
+
+      // JSON-render path
+      const safeFilename = (artifact.title || "document")
+        .replace(/[^a-zA-Z0-9_\- ]/g, "")
+        .replace(/\s+/g, "_")
+        .slice(0, 80);
+      const filePath = await renderDocument(artifact.kind, data, outputDir, safeFilename);
+      this.db.updateStudyArtifactFilePath(artifact.id, filePath);
+      return filePath;
+    } catch (err) {
+      console.error(`[stuart] document render failed for artifact ${artifactId}:`, err);
+      return null;
+    }
+  }
+
   async deleteTask(taskId: string): Promise<boolean> {
     const threadId = this.db.getTaskThreadId(taskId);
     if (threadId) {
@@ -312,11 +449,12 @@ export class StuartRuntime {
       return false;
     }
 
-    await Promise.all(
-      deletion.stagingPaths.map((stagingPath) =>
+    await Promise.all([
+      ...deletion.stagingPaths.map((stagingPath) =>
         rm(stagingPath, { recursive: true, force: true }).catch(() => undefined)
-      )
-    );
+      ),
+      rm(join(this.dataDir, "generated-documents", taskId), { recursive: true, force: true }).catch(() => undefined),
+    ]);
     return true;
   }
 
@@ -437,12 +575,33 @@ export class StuartRuntime {
     const stats = context.taskRun ? this.db.getIngestionStats(task.id, context.taskRun.id) : null;
     const isLargeMaterialSet = stats && stats.documentsIndexed > 8;
 
-    // Set effort based on query complexity — simple explains should be fast
-    const isSimpleQuery = /^explain|^what is|^define|^describe|^tell me about/i.test(trimmed) && trimmed.length < 200;
-    const effort = isSimpleQuery ? "low" : isLargeMaterialSet && !targetedFiles.length ? "high" : "medium";
+    // Match a skill to inject detailed formatting/workflow instructions.
+    const skill = matchSkill(trimmed, this.sandboxAvailable);
+    if (skill) {
+      this.recordRuntimeMessage(task.id, `Loaded skill: ${skill.id}`);
+    }
 
-    // Match a skill based on the user's message to inject focused artifact instructions
-    const skill = matchSkill(trimmed);
+    // Determine model + effort per turn based on what's needed.
+    // Skills that generate code or do deep research → flagship gpt-5.4 + high effort.
+    // Everything else → gpt-5.4-mini (set on thread) with dynamic effort.
+    const needsFlagship = skill && (
+      skill.requiresSandbox       // scripted document generation (code output)
+      || skill.id === "research"  // research + curriculum building
+      || skill.id === "interactive" // interactive HTML/JS apps
+    );
+    const isSimpleQuery = /^explain|^what is|^define|^describe|^tell me about/i.test(trimmed) && trimmed.length < 200;
+    const turnModel = needsFlagship ? "gpt-5.4" : undefined; // undefined = use thread default (mini)
+    const effort = needsFlagship ? "high"
+      : isSimpleQuery ? "low"
+      : isLargeMaterialSet && !targetedFiles.length ? "high"
+      : "medium";
+
+    // Detect weak-topic intent and inject performance context
+    const isWeakTopicRequest = /\bweak\s*(topic|area)s?\b|\bstruggl|\bfocus.*weak|\bworst\b/i.test(trimmed);
+    let performanceContext = "";
+    if (isWeakTopicRequest) {
+      performanceContext = buildPerformanceContext(this.db, task);
+    }
 
     const input = [
       ...(retrievedContext
@@ -462,6 +621,15 @@ export class StuartRuntime {
               }
             ]
           : []),
+      ...(performanceContext
+        ? [
+            {
+              type: "text" as const,
+              text: performanceContext,
+              text_elements: []
+            }
+          ]
+        : []),
       ...(skill
         ? [
             {
@@ -481,6 +649,7 @@ export class StuartRuntime {
       threadId,
       cwd: context.cwd,
       approvalPolicy: "never",
+      ...(turnModel ? { model: turnModel } : {}),
       effort,
       input
     });
@@ -499,7 +668,9 @@ export class StuartRuntime {
       kind: "task",
       assistantText: "",
       thinkingLabel: inferThinkingLabel(task, trimmed),
-      startedEmitted: true
+      startedEmitted: true,
+      cwd: context.cwd,
+      triggersReindex: skill?.triggersReindex,
     });
 
     this.emitEvent({
@@ -1024,11 +1195,14 @@ export class StuartRuntime {
             approvalPolicy: "never",
             sandbox: "danger-full-access",
             personality: "pragmatic",
-            developerInstructions: buildTeachingInstructions(project ?? { id: "", name: "Study", rootPath: cwd, createdAt: "", updatedAt: "" }, task),
+            developerInstructions: buildTeachingInstructions(project ?? { id: "", name: "Study", rootPath: cwd, createdAt: "", updatedAt: "" }, task, this.db),
             persistExtendedHistory: true
           });
-        } catch {
+        } catch (err) {
+          // Thread no longer exists in Codex (e.g. after server restart) — clear and start fresh
+          process.stderr.write(`[stuart] thread/resume failed for ${persistedThreadId}, starting fresh: ${String(err)}\n`);
           this.loadedThreadIds.delete(persistedThreadId);
+          this.db.clearTaskThreadId(task.id);
           return this.startTaskThread(task, cwd);
         }
         this.loadedThreadIds.add(persistedThreadId);
@@ -1049,7 +1223,8 @@ export class StuartRuntime {
       approvalPolicy: "never",
       sandbox: "danger-full-access",
       personality: "pragmatic",
-      developerInstructions: buildTeachingInstructions(project ?? { id: "", name: "Study", rootPath: cwd, createdAt: "", updatedAt: "" }, task),
+      model: "gpt-5.4-mini",
+      developerInstructions: buildTeachingInstructions(project ?? { id: "", name: "Study", rootPath: cwd, createdAt: "", updatedAt: "" }, task, this.db),
       serviceName: "Stuart",
       persistExtendedHistory: true,
       config: {
@@ -1103,6 +1278,7 @@ export class StuartRuntime {
       approvalPolicy: "never",
       sandbox: "danger-full-access",
       personality: "pragmatic",
+      model: "gpt-5.4-mini",
       developerInstructions: buildWorkerDeveloperInstructions(task, worker),
       serviceName: `Stuart Worker:${worker.role}`,
       persistExtendedHistory: true
@@ -1417,7 +1593,9 @@ export class StuartRuntime {
                   workerId: owner.worker?.id,
                   assistantText: "",
                   thinkingLabel: "",
-                  startedEmitted: true
+                  startedEmitted: true,
+                  cwd: undefined,
+                  triggersReindex: undefined,
                 }
               : null;
           })();
@@ -1490,13 +1668,13 @@ export class StuartRuntime {
             status: "completed"
           });
 
-          // Artifact detection: try to parse any assistant response that contains JSON artifacts
+          // Artifact detection: try to parse any assistant response that contains JSON or script artifacts
           try {
             const assistantText = state.assistantText.trim();
             if (assistantText) {
               const parsed = tryParseArtifactJson(assistantText);
               if (parsed) {
-                this.db.createStudyArtifact({
+                const artifact = this.db.createStudyArtifact({
                   taskId: state.taskId,
                   kind: parsed.kind,
                   title: parsed.title,
@@ -1506,10 +1684,164 @@ export class StuartRuntime {
                   state.taskId,
                   `Detected and stored a ${parsed.kind} study artifact: "${parsed.title}".`
                 );
+
+                // Render document kinds to binary files
+                if (parsed.kind.startsWith("document_")) {
+                  try {
+                    const safeFilename = (parsed.title || "document")
+                      .replace(/[^a-zA-Z0-9_\- ]/g, "")
+                      .replace(/\s+/g, "_")
+                      .slice(0, 80);
+                    const outputDir = this.resolveDocumentOutputDir(state.taskId);
+                    const filePath = await renderDocument(
+                      parsed.kind,
+                      parsed.data,
+                      outputDir,
+                      safeFilename
+                    );
+                    this.db.updateStudyArtifactFilePath(artifact.id, filePath);
+                    const ext = parsed.kind.replace("document_", "").toUpperCase();
+                    this.recordRuntimeMessage(
+                      state.taskId,
+                      `Generated ${ext} document: "${parsed.title}".`
+                    );
+                  } catch (renderErr) {
+                    // Rendering is non-fatal — artifact JSON is still stored
+                    this.recordRuntimeMessage(
+                      state.taskId,
+                      `Note: document rendering failed but the artifact data was saved. Error: ${String(renderErr)}`
+                    );
+                  }
+                }
+              } else if (this.sandboxAvailable) {
+                // No JSON artifact found — try script-based execution path
+                const script = tryExtractScript(assistantText);
+                if (script) {
+                  const ext = script.outputFilename.split(".").pop() ?? "";
+                  const kindMap: Record<string, string> = {
+                    pdf: "document_pdf",
+                    docx: "document_docx",
+                    xlsx: "document_xlsx",
+                    pptx: "document_pptx",
+                  };
+                  const kind = kindMap[ext] ?? `document_${ext}`;
+
+                  // Store the artifact with script payload
+                  const artifact = this.db.createStudyArtifact({
+                    taskId: state.taskId,
+                    kind,
+                    title: script.title,
+                    payload: JSON.stringify({
+                      script: script.script,
+                      language: script.language,
+                      outputFilename: script.outputFilename,
+                    })
+                  });
+                  this.recordRuntimeMessage(
+                    state.taskId,
+                    `Detected scripted ${ext.toUpperCase()} artifact: "${script.title}". Executing in sandbox...`
+                  );
+
+                  this.emitEvent({
+                    type: "sandbox.execution.started",
+                    taskId: state.taskId,
+                    language: script.language,
+                    outputFilename: script.outputFilename,
+                  });
+
+                  try {
+                    const docOutputDir = this.resolveDocumentOutputDir(state.taskId);
+                    const result = await this.sandbox.executeScript({
+                      language: script.language,
+                      script: script.script,
+                      outputFilename: script.outputFilename,
+                      taskId: state.taskId,
+                      outputDir: docOutputDir,
+                      sourcesDir: state.cwd,
+                    });
+
+                    this.emitEvent({
+                      type: "sandbox.execution.completed",
+                      taskId: state.taskId,
+                      success: result.success,
+                      outputFilename: script.outputFilename,
+                      durationMs: result.durationMs,
+                      error: result.success ? undefined : result.stderr,
+                    });
+
+                    if (result.success && result.outputPath) {
+                      this.db.updateStudyArtifactFilePath(artifact.id, result.outputPath);
+                      this.recordRuntimeMessage(
+                        state.taskId,
+                        `Generated ${ext.toUpperCase()} document via sandbox: "${script.title}" (${result.durationMs}ms).`
+                      );
+                    } else {
+                      this.recordRuntimeMessage(
+                        state.taskId,
+                        `Sandbox execution failed (exit ${result.exitCode}): ${truncateForLog(result.stderr || result.stdout, 300)}`
+                      );
+                    }
+                  } catch (sandboxErr) {
+                    this.emitEvent({
+                      type: "sandbox.execution.completed",
+                      taskId: state.taskId,
+                      success: false,
+                      outputFilename: script.outputFilename,
+                      durationMs: 0,
+                      error: String(sandboxErr),
+                    });
+                    this.recordRuntimeMessage(
+                      state.taskId,
+                      `Sandbox execution error: ${String(sandboxErr)}`
+                    );
+                  }
+                }
               }
             }
           } catch {
             // Artifact detection is best-effort; don't block the turn.
+          }
+
+          // If this turn wrote new research files (sources/, curriculum.md),
+          // copy them from staging to the project root so the user can see them.
+          const shouldSyncFiles = state.triggersReindex
+            || /\bsources\//i.test(state.assistantText)
+            || /\bcurriculum\.md\b/i.test(state.assistantText)
+            || /(?:created|wrote|saved)\s+\d+\s+(?:files?|documents?|sources?)/i.test(state.assistantText);
+          if (shouldSyncFiles && state.cwd) {
+            try {
+              const projectRoot = this.resolveProjectRoot(state.taskId);
+              if (projectRoot && projectRoot !== state.cwd) {
+                // Copy sources/ directory
+                const stagingSources = join(state.cwd, "sources");
+                if (existsSync(stagingSources)) {
+                  const destSources = join(projectRoot, "sources");
+                  await cp(stagingSources, destSources, { recursive: true, force: true });
+                }
+                // Copy curriculum.md
+                const stagingCurriculum = join(state.cwd, "curriculum.md");
+                if (existsSync(stagingCurriculum)) {
+                  await cp(stagingCurriculum, join(projectRoot, "curriculum.md"), { force: true });
+                }
+                this.recordRuntimeMessage(
+                  state.taskId,
+                  `Synced research files to your project folder.`
+                );
+              }
+            } catch {
+              // Non-critical — files still available in staging
+            }
+
+            // Re-index workspace with new files
+            try {
+              await this.buildTaskIngestionIndex(state.taskId, { force: true });
+              this.recordRuntimeMessage(
+                state.taskId,
+                "Re-indexed workspace — new materials are now available for study."
+              );
+            } catch {
+              // Non-critical — indexing will happen lazily on next retrieval
+            }
           }
         }
 
@@ -1866,6 +2198,7 @@ export class StuartRuntime {
   }
 
   async close(): Promise<void> {
+    await this.sandbox.close();
     await this.codex.close();
     this.db.close();
   }
@@ -2081,7 +2414,51 @@ function buildDeveloperInstructions(task: TaskSpec): string {
   ].join(" ");
 }
 
-function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec): string {
+function buildPerformanceContext(db: LocalDatabase, task: TaskSpec): string {
+  try {
+    const summary = db.getProjectLearningSummary(task.projectId);
+    const weakTopics = db.listWeakTopics(task.projectId, 8);
+
+    const lines: string[] = [
+      "## Student Performance Context",
+      `Overall accuracy: ${(summary.overallAccuracy * 100).toFixed(0)}% across ${summary.totalReviews} reviews`,
+      `Study streak: ${summary.streakDays} day(s) | Cards due: ${summary.cardsDue}`,
+    ];
+
+    if (weakTopics.length > 0) {
+      lines.push("", "### Weak topics (lowest accuracy first):");
+      for (const t of weakTopics) {
+        const acc = t.totalAttempts > 0 ? ((t.correctCount / t.totalAttempts) * 100).toFixed(0) : "0";
+        lines.push(`- **${t.topic}**: ${acc}% (${t.correctCount}/${t.totalAttempts})`);
+      }
+      lines.push("", "Focus generated content on these weak areas. Prioritise the lowest-accuracy topics.");
+    }
+
+    return lines.join("\n");
+  } catch {
+    return "";
+  }
+}
+
+function buildPerformanceSnapshot(db: LocalDatabase, task: TaskSpec): string {
+  try {
+    const summary = db.getProjectLearningSummary(task.projectId);
+    if (summary.totalReviews === 0) return "";
+
+    const acc = (summary.overallAccuracy * 100).toFixed(0);
+    const weakNames = summary.weakTopics.slice(0, 3).map((t) => t.topic).join(", ");
+    const lines = [
+      `\n\n## Student snapshot`,
+      `Accuracy: ${acc}% | Reviews: ${summary.totalReviews} | Streak: ${summary.streakDays}d | Due: ${summary.cardsDue}`,
+    ];
+    if (weakNames) lines.push(`Weak areas: ${weakNames}`);
+    return lines.join("\n");
+  } catch {
+    return "";
+  }
+}
+
+function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: LocalDatabase): string {
   // Load cross-session memory if it exists
   const memoryPath = join(project.rootPath, ".stuart-memory.md");
   let memoryContext = "";
@@ -2093,6 +2470,9 @@ function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec): stri
       }
     }
   } catch { /* ignore */ }
+
+  // Lightweight performance snapshot
+  const perfSnapshot = db ? buildPerformanceSnapshot(db, task) : "";
 
   return `You are Stuart, an interactive study tutor inside a local workspace.
 
@@ -2118,11 +2498,10 @@ You can remember things across study sessions by writing to the file \`.stuart-m
 - Keep the file concise and organized — use headings and bullet points.
 - Read this file at the start of each session to recall the student's context.
 
-## Study artifacts
-You can generate study artifacts: flashcards, quizzes, mind maps, diagrams, mock exams, and interactive visualisations.
-When asked to create one, you will receive detailed formatting instructions in the context.
-Always output artifacts as a single JSON code block with a "kind" and "title" field.
-Give every artifact a clear, descriptive title.${memoryContext}`;
+## Capabilities
+You can generate study artifacts (flashcards, quizzes, mind maps, diagrams, mock exams, interactive apps, PDF/DOCX/XLSX/PPTX documents). When asked to create one, you will receive detailed formatting instructions in the context. Always output artifacts as a single JSON code block with a "kind" and "title" field.
+
+You can also research new topics, fetch content from URLs and repos, and build structured curricula with saved source files — detailed instructions will be provided when the student asks for this.${memoryContext}${perfSnapshot}`;
 }
 
 function buildWorkerDeveloperInstructions(task: TaskSpec, worker: TaskWorkerRecord): string {
@@ -2636,6 +3015,18 @@ function tryParseArtifactJson(
       interactive: "interactive",
       "interactive app": "interactive",
       "interactive artifact": "interactive",
+      document_docx: "document_docx",
+      docx: "document_docx",
+      "word document": "document_docx",
+      "study guide": "document_docx",
+      document_xlsx: "document_xlsx",
+      xlsx: "document_xlsx",
+      spreadsheet: "document_xlsx",
+      document_pptx: "document_pptx",
+      pptx: "document_pptx",
+      presentation: "document_pptx",
+      document_pdf: "document_pdf",
+      pdf_document: "document_pdf",
     };
 
     const kind = kindMap[rawKind.toLowerCase()] ?? null;
@@ -2662,6 +3053,48 @@ function tryParseArtifactJson(
   } catch {
     return null;
   }
+}
+
+/**
+ * Try to extract a sandboxed script from the assistant response.
+ * Looks for Python or JS code blocks with a `# stuart-output: filename.ext`
+ * (Python) or `// stuart-output: filename.ext` (JS) header comment.
+ */
+function tryExtractScript(
+  text: string
+): { language: "python" | "javascript"; script: string; outputFilename: string; title: string } | null {
+  // Match a fenced code block (python/py or javascript/js/node)
+  const codeBlockPattern = /```(?:python|py|javascript|js|node)\s*\n([\s\S]*?)\n```/;
+  const blockMatch = text.match(codeBlockPattern);
+  if (!blockMatch) return null;
+
+  const script = blockMatch[1]!.trim();
+  if (!script) return null;
+
+  // Detect language from the fence info string
+  const fenceInfo = text.match(/```(python|py|javascript|js|node)\s*\n/)?.[1] ?? "";
+  const language: "python" | "javascript" =
+    fenceInfo === "javascript" || fenceInfo === "js" || fenceInfo === "node"
+      ? "javascript"
+      : "python";
+
+  // Extract the stuart-output directive from the first line
+  const firstLine = script.split("\n")[0] ?? "";
+  const pythonDirective = firstLine.match(/^#\s*stuart-output:\s*(.+)/);
+  const jsDirective = firstLine.match(/^\/\/\s*stuart-output:\s*(.+)/);
+  const directive = pythonDirective ?? jsDirective;
+  if (!directive) return null;
+
+  const outputFilename = directive[1]!.trim();
+  if (!outputFilename) return null;
+
+  // Derive a title from the filename
+  const title = outputFilename
+    .replace(/\.[^.]+$/, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+
+  return { language, script, outputFilename, title };
 }
 
 function filterCodexStderr(chunk: string): string {

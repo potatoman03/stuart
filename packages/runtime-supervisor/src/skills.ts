@@ -36,9 +36,19 @@ export interface Skill {
   pattern: RegExp;
   /** The full skill prompt injected as context before the user message */
   prompt: string;
+  /** Whether this skill requires the Docker sandbox to execute */
+  requiresSandbox?: boolean;
+  /** Whether this skill writes new files that need re-indexing after the turn */
+  triggersReindex?: boolean;
 }
 
 export const STUDY_SKILLS: Skill[] = [
+  {
+    id: "research",
+    pattern: /\b(research|curriculum|get\s+me\s+up\s+to\s+speed|from\s+the\s+ground\s+up|from\s+scratch|find\s+materials?|gather\s+(?:resources|materials?|sources)|build\s+(?:me\s+)?a\s+(?:learning|study)\s*(?:plan|path)|learn\s+(?:about|everything)|teach\s+me\s+(?:about|everything)|deep\s*dive|explore\s+the\s+topic|i\s+don'?t\s+know\s+anything|crash\s*course|comprehensive\s+guide|study\s+(?:plan|guide|roadmap))\b/i,
+    prompt: loadSkillFile("research.md"),
+    triggersReindex: true,
+  },
   {
     id: "flashcards",
     pattern: /\b(flashcard|flash card|study card|review card|cloze|fill.in.the.blank|anki)s?\b/i,
@@ -69,14 +79,41 @@ export const STUDY_SKILLS: Skill[] = [
     pattern: /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|app|widget)\b/i,
     prompt: loadSkillFile("interactive.md"),
   },
+  {
+    id: "document-pdf-scripted",
+    pattern: /\b(pdf|cheat\s*sheet|reference\s*card|formula\s*sheet|printable)\b/i,
+    prompt: loadSkillFile("document-pdf-scripted.md"),
+    requiresSandbox: true,
+  },
+  {
+    id: "document-docx-scripted",
+    pattern: /\b(word\s*doc|\.docx|study\s*guide|revision\s*notes|summary\s*document|handout|write\s+\w*\s*document)\b/i,
+    prompt: loadSkillFile("document-docx-scripted.md"),
+    requiresSandbox: true,
+  },
+  {
+    id: "document-xlsx-scripted",
+    pattern: /\b(spreadsheet|\.xlsx|excel|comparison\s*table|data\s*table|tabulate)\b/i,
+    prompt: loadSkillFile("document-xlsx-scripted.md"),
+    requiresSandbox: true,
+  },
+  {
+    id: "document-pptx-scripted",
+    pattern: /\b(presentation|\.pptx|powerpoint|slide\s*deck|lecture\s*slides)\b/i,
+    prompt: loadSkillFile("document-pptx-scripted.md"),
+    requiresSandbox: true,
+  },
 ];
 
 /**
  * Match a user message against skills and return the best matching skill,
  * or null if no skill matches.
  */
-export function matchSkill(message: string): Skill | null {
+export function matchSkill(message: string, sandboxAvailable = false): Skill | null {
   for (const skill of STUDY_SKILLS) {
+    if (skill.requiresSandbox && !sandboxAvailable) {
+      continue;
+    }
     if (skill.pattern.test(message)) {
       return skill;
     }

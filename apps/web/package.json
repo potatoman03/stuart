@@ -4,15 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "predev": "STUART_SKIP_VM_HELPER=1 node ../../scripts/ensure-vm-helper.mjs && node ../../scripts/cleanup-dev-ports.mjs && pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build",
+    "predev": "STUART_SKIP_VM_HELPER=1 node ../../scripts/ensure-vm-helper.mjs && node ../../scripts/cleanup-dev-ports.mjs && pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/sandbox-executor build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build",
     "dev": "concurrently -k -n server,client -c cyan,magenta \"pnpm run dev:server\" \"pnpm run dev:client\"",
     "predev:server": "tsc -p tsconfig.server.json",
     "dev:server": "concurrently -k -n build,serve -c blue,green \"tsc -w -p tsconfig.server.json --preserveWatchOutput\" \"node --watch dist-server/index.js\"",
     "dev:client": "vite",
     "start": "node dist-server/index.js",
-    "prebuild": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build",
+    "prebuild": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/sandbox-executor build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build",
     "build": "vite build && tsc -p tsconfig.server.json",
-    "pretypecheck": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build",
+    "pretypecheck": "pnpm --filter @stuart/shared build && pnpm --filter @stuart/db build && pnpm --filter @stuart/sandbox-executor build && pnpm --filter @stuart/runtime-supervisor build && pnpm --filter @stuart/harness build",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json"
   },
   "dependencies": {
