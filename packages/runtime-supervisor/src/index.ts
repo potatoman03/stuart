@@ -45,7 +45,7 @@ import {
   parseDocumentForIngestion
 } from "./ingestion.js";
 import { renderDocument } from "./document-renderer.js";
-import { matchSkills } from "./skills.js";
+import { matchSkills, type Skill } from "./skills.js";
 import { SandboxExecutor } from "@stuart/sandbox-executor";
 import {
   collectSystemDiagnostics,
@@ -98,6 +98,7 @@ interface ActiveTurnState {
   taskId: string;
   threadId: string;
   turnId: string;
+  startedAt?: string;
   kind: "task" | "worker";
   workerId?: string;
   assistantItemId?: string;
@@ -112,6 +113,8 @@ interface ActiveTurnState {
   userMessage?: string;
   /** Whether this is a memory extraction turn (ephemeral, parse result as memories) */
   memoryExtraction?: boolean;
+  /** Quiz validation context — if set, this turn is checking quiz accuracy */
+  quizValidation?: { artifactId: string; originalPayload: string };
 }
 
 interface ResolvedWorkspaceFile extends WorkspaceFileRecord {
@@ -228,7 +231,7 @@ export class StuartRuntime {
 
   /**
    * Check for stalled turns and reconnect if needed.
-   * A turn is stale if no activity has been received for 120 seconds
+   * A turn is stale if no activity has been received for 300 seconds (5 minutes)
    * while turns are in-flight.
    */
   private async checkStaleTurns(): Promise<void> {
@@ -242,7 +245,7 @@ export class StuartRuntime {
     if (taskTurns.length === 0) return;
 
     const staleSecs = this.codex.idleSeconds;
-    if (staleSecs < 120) return;
+    if (staleSecs < 300) return;
 
     process.stderr.write(
       `[stuart] detected stale turn (${staleSecs}s idle, ${taskTurns.length} task turn(s) in-flight). Reconnecting...\n`
@@ -424,6 +427,7 @@ export class StuartRuntime {
       taskId,
       threadId,
       turnId: turn.turn.id,
+      startedAt: new Date().toISOString(),
       kind: "worker",
       workerId: worker.id,
       assistantText: "",
@@ -522,6 +526,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
         taskId,
         threadId: extractionThreadId,
         turnId: turn.turn.id,
+        startedAt: new Date().toISOString(),
         kind: "worker" as const,
         assistantText: "",
         thinkingLabel: "Extracting memories",
@@ -744,18 +749,18 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     }
 
     // Determine model + effort per turn based on what's needed.
-    // Code generation and interactive apps → flagship gpt-5.4 + high effort.
-    // Research → gpt-5.4-mini at high effort (fetching + writing doesn't need flagship).
+    // Sandbox scripts (Python/JS doc gen) → flagship gpt-5.4 + high effort.
+    // Research, interactive, artifacts → gpt-5.4-mini at high effort.
     // Everything else → gpt-5.4-mini (set on thread) with dynamic effort.
     const needsFlagship = skills.some((skill) =>
       skill.requiresSandbox
-      || skill.id === "interactive"
     );
     const isResearch = skills.some((skill) => skill.id === "research");
+    const isCodeGen = skills.some((skill) => skill.id === "interactive");
     const isSimpleQuery = /^explain|^what is|^define|^describe|^tell me about/i.test(trimmed) && trimmed.length < 200;
     const turnModel = needsFlagship ? "gpt-5.4" : undefined; // undefined = use thread default (mini)
     const effort = needsFlagship ? "high"
-      : isResearch ? "high"
+      : (isResearch || isCodeGen) ? "high"
       : isSimpleQuery ? "low"
       : isLargeMaterialSet && !targetedFiles.length ? "high"
       : "medium";
@@ -766,6 +771,8 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     if (isWeakTopicRequest) {
       performanceContext = buildPerformanceContext(this.db, task);
     }
+
+    const artifactTurnContract = buildArtifactTurnContract(skills);
 
     const input = [
       ...(retrievedContext
@@ -801,6 +808,15 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
             text_elements: []
           }))
         : []),
+      ...(artifactTurnContract
+        ? [
+            {
+              type: "text" as const,
+              text: artifactTurnContract,
+              text_elements: []
+            }
+          ]
+        : []),
       {
         type: "text" as const,
         text: trimmed,
@@ -834,6 +850,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       taskId,
       threadId,
       turnId: turn.turn.id,
+      startedAt: new Date().toISOString(),
       kind: "task",
       assistantText: "",
       thinkingLabel: inferThinkingLabel(task, trimmed),
@@ -1334,6 +1351,82 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
   }
 
   /**
+   * Validate a quiz artifact by running a checking agent.
+   * Fixes incorrect answers, ambiguous questions, and MRQ completeness.
+   * Updates the artifact in-place if corrections are needed.
+   */
+  private async validateQuizArtifact(artifactId: string, taskId: string): Promise<void> {
+    const artifact = this.db.getStudyArtifact(artifactId);
+    if (!artifact) return;
+
+    let data: { questions?: Array<Record<string, unknown>> };
+    try {
+      data = JSON.parse(artifact.payload);
+    } catch { return; }
+
+    if (!data.questions || data.questions.length === 0) return;
+
+    // Build a compact representation for the checker
+    const questionsForReview = data.questions.map((q, i) => ({
+      index: i,
+      id: q.id,
+      prompt: q.prompt,
+      options: q.options,
+      answer: q.answer,
+    }));
+
+    const checkPrompt = `You are a quiz quality checker. Review these quiz questions and identify any problems.
+
+For each question, check:
+1. Is the stated answer actually correct? If not, what should it be?
+2. Is there ambiguity where multiple options could be correct (for MCQ)?
+3. For MRQ (comma-separated answers), are all correct options included?
+4. Is any question misleading or poorly worded?
+
+Return a JSON array of corrections needed. If a question is fine, don't include it.
+Return [] if all questions are correct.
+
+Format:
+[{ "index": 0, "issue": "description of the problem", "correctedAnswer": "Option B" }]
+
+Questions to review:
+${JSON.stringify(questionsForReview, null, 2)}`;
+
+    try {
+      const thread = await this.codex.request<{ thread: { id: string } }>("thread/start", {
+        cwd: this.dataDir,
+        approvalPolicy: "never",
+        model: "gpt-5.4-mini",
+        personality: "pragmatic",
+        ephemeral: true,
+      });
+
+      const turn = await this.codex.request<{ turn: { id: string } }>("turn/start", {
+        threadId: thread.thread.id,
+        cwd: this.dataDir,
+        approvalPolicy: "never",
+        effort: "medium",
+        input: [{ type: "text" as const, text: checkPrompt, text_elements: [] }]
+      });
+
+      // Track the validation turn
+      this.turns.set(turn.turn.id, {
+        taskId,
+        threadId: thread.thread.id,
+        turnId: turn.turn.id,
+        startedAt: new Date().toISOString(),
+        kind: "worker" as const,
+        assistantText: "",
+        thinkingLabel: "Checking quiz accuracy",
+        startedEmitted: false,
+        quizValidation: { artifactId, originalPayload: artifact.payload },
+      });
+    } catch {
+      // Validation is best-effort
+    }
+  }
+
+  /**
    * Spawn parallel research workers to fetch content from the web.
    * Each worker handles a specific research subtask (Tier 1 sources, repo analysis, etc.)
    * so the main thread can focus on synthesis and writing.
@@ -1567,6 +1660,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
             taskId: owner.taskId,
             threadId: params.threadId,
             turnId: params.turn.id,
+            startedAt: new Date().toISOString(),
             kind: owner.worker ? "worker" : "task",
             workerId: owner.worker?.id,
             assistantText: "",
@@ -1862,6 +1956,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
                   triggersReindex: undefined,
                   userMessage: undefined,
                   memoryExtraction: undefined,
+                  quizValidation: undefined,
                 }
               : null;
           })();
@@ -1906,6 +2001,48 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
             }
           } catch {
             // Extraction parsing failed — non-critical
+          }
+          this.turns.delete(params.turn.id);
+          return;
+        }
+
+        // Quiz validation turn completed — apply corrections if any
+        if (state.quizValidation) {
+          try {
+            const text = state.assistantText.trim();
+            const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/) ?? text.match(/(\[[\s\S]*\])/);
+            if (jsonMatch?.[1]) {
+              const corrections = JSON.parse(jsonMatch[1]) as Array<{
+                index: number;
+                issue: string;
+                correctedAnswer?: string;
+              }>;
+              if (corrections.length > 0) {
+                const payload = JSON.parse(state.quizValidation.originalPayload) as { questions: Array<Record<string, unknown>> };
+                let fixed = 0;
+                for (const correction of corrections) {
+                  const q = payload.questions[correction.index];
+                  if (q && correction.correctedAnswer) {
+                    q.answer = correction.correctedAnswer;
+                    fixed++;
+                  }
+                }
+                if (fixed > 0) {
+                  this.db.updateStudyArtifact(state.quizValidation.artifactId, JSON.stringify(payload));
+                  this.recordRuntimeMessage(
+                    state.taskId,
+                    `Quiz checker fixed ${fixed} question${fixed === 1 ? "" : "s"} with incorrect answers.`
+                  );
+                  process.stdout.write(`[stuart] quiz validation: fixed ${fixed} question(s) in artifact ${state.quizValidation.artifactId}.\n`);
+                } else {
+                  process.stdout.write(`[stuart] quiz validation: ${corrections.length} issue(s) noted but no answer corrections needed.\n`);
+                }
+              } else {
+                process.stdout.write("[stuart] quiz validation: all questions passed.\n");
+              }
+            }
+          } catch {
+            // Validation parsing failed — non-critical
           }
           this.turns.delete(params.turn.id);
           return;
@@ -1975,11 +2112,19 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
             status: "completed"
           });
 
+          // Resolve cwd if missing (can happen on resumed threads)
+          if (!state.cwd) {
+            const latestRun = this.db.listTaskRuns(state.taskId)[0];
+            if (latestRun) {
+              state.cwd = latestRun.stagingPath;
+            }
+          }
+
           // Artifact detection: try to parse any assistant response that contains JSON or script artifacts
           try {
             const assistantText = state.assistantText.trim();
             if (assistantText) {
-              const parsed = tryParseArtifactJson(assistantText);
+              const parsed = tryParseArtifactJson(assistantText, state.cwd);
               if (parsed) {
                 const artifact = this.db.createStudyArtifact({
                   taskId: state.taskId,
@@ -1991,6 +2136,11 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
                   state.taskId,
                   `Detected and stored a ${parsed.kind} study artifact: "${parsed.title}".`
                 );
+
+                // Validate quiz questions with a checking agent
+                if (parsed.kind === "quiz") {
+                  void this.validateQuizArtifact(artifact.id, state.taskId).catch(() => {});
+                }
 
                 // Render document kinds to binary files
                 if (parsed.kind.startsWith("document_")) {
@@ -2107,6 +2257,52 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
             }
           } catch {
             // Artifact detection is best-effort; don't block the turn.
+          }
+
+          // Fallback: if no artifact was detected but Codex wrote HTML files to the workspace,
+          // create interactive artifacts from them automatically.
+          if (state.cwd) {
+            try {
+              const turnStartedAt = state.startedAt ? new Date(state.startedAt) : new Date(0);
+              const htmlArtifacts = discoverInteractiveHtmlFiles(state.cwd, turnStartedAt);
+              const referencedArtifacts = state.assistantText
+                ? discoverReferencedInteractiveHtmlFiles(state.cwd, state.assistantText)
+                : [];
+              const candidates = new Map<string, (typeof htmlArtifacts)[number]>();
+              for (const file of [...referencedArtifacts, ...htmlArtifacts]) {
+                candidates.set(file.relativePath, file);
+              }
+              process.stdout.write(
+                `[stuart] HTML file scan in ${state.cwd}: found ${htmlArtifacts.length} recent interactive HTML artifact candidate(s) and ${referencedArtifacts.length} assistant-referenced candidate(s): ${[...candidates.values()].map((file) => file.relativePath).join(", ") || "(none)"}\n`
+              );
+              for (const file of candidates.values()) {
+                const existing = this.db.listStudyArtifacts(state.taskId).some(
+                  (artifact) =>
+                    artifact.kind === "interactive" &&
+                    (artifact.payload.includes(file.relativePath) || artifact.payload.includes(file.title))
+                );
+                if (existing) {
+                  process.stdout.write(`[stuart] HTML scan: skipping ${file.relativePath} — already has artifact\n`);
+                  continue;
+                }
+
+                this.db.createStudyArtifact({
+                  taskId: state.taskId,
+                  kind: "interactive",
+                  title: file.title,
+                  payload: JSON.stringify({
+                    kind: "interactive",
+                    title: file.title,
+                    html: file.html,
+                    sourcePath: file.relativePath
+                  })
+                });
+                this.recordRuntimeMessage(
+                  state.taskId,
+                  `Detected interactive artifact from workspace file: "${file.title}".`
+                );
+              }
+            } catch { /* workspace scan is best-effort */ }
           }
 
           // If this turn wrote new research files (sources/, curriculum.md),
@@ -2366,10 +2562,16 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
           ...recentMessages.map((msg) => `[${msg.role}]: ${truncateForLog(msg.content, 300)}`)
         ].join("\n")
       : "";
+    const isArtifactTurn =
+      ARTIFACT_PATTERN.test(message) ||
+      /\b(visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i.test(message);
+    const contextPreamble = isArtifactTurn
+      ? "Local retrieved context from the staged workspace. Use these excerpts to determine the exact concepts, labels, rules, examples, and terminology that should appear in the artifact you build. Ground the artifact in this material, and if you need more detail on a specific section, use grep/cat to read the full file. Do not just summarize these excerpts back to the student."
+      : "Local retrieved context from the staged workspace. Use these excerpts as your primary source material. Cite source names when relying on them. If you need more detail on a specific section, use grep/cat to read the full file.";
 
     // Use full chunk text (not snippets) for richer context — truncate only very long chunks
     return [
-      "Local retrieved context from the staged workspace. Use these excerpts as your primary source material. Cite source names when relying on them. If you need more detail on a specific section, use grep/cat to read the full file.",
+      contextPreamble,
       ...results.map((result, index) =>
         [
           `--- [${index + 1}] ${cleanSourceName(result.relativePath)}${result.heading ? ` — ${result.heading}` : ""}${result.locator ? ` (${result.locator})` : ""} ---`,
@@ -2728,6 +2930,8 @@ function buildDeveloperInstructions(task: TaskSpec): string {
     "You are Stuart, a local task assistant built on Codex.",
     "Work from the approved local workspace, stay concise, and keep outputs directly useful.",
     "When local retrieved context is supplied, use it first and cite relative workspace paths in your answer when helpful.",
+    "When the student asks you to build an artifact, the artifact itself is the main deliverable. Do not stop at prose alone.",
+    "If you create an HTML interactive or generated file, save it inside the staged workspace and end with exactly one JSON code block describing the artifact handoff.",
     "Use `.stuart/workspace-map.json` to understand the staged workspace layout and attachment mapping before touching files.",
     "Use `.stuart/workspace-memory.md` as the durable task memory file for important discovered facts, plans, and handoff notes when the task spans multiple turns.",
     "Read and write files only inside the staged workspace. Editable and output changes stay staged until the host apply step reviews them.",
@@ -2833,6 +3037,41 @@ function buildStudentMemoryContext(db: LocalDatabase | undefined, projectId: str
   }
 }
 
+function buildArtifactTurnContract(skills: Skill[]): string {
+  const artifactSkills = skills.filter((skill) => skill.id !== "research");
+  if (artifactSkills.length === 0) {
+    return "";
+  }
+
+  const hasInteractive = artifactSkills.some((skill) => skill.id === "interactive");
+  const hasDocument = artifactSkills.some((skill) => skill.id.startsWith("document-"));
+
+  const lines = [
+    "## Artifact turn contract",
+    "- This is an artifact-generation turn. The artifact is the primary deliverable, not a prose explanation.",
+    "- Keep any prose before the artifact to at most 2 short sentences.",
+    "- End the final answer with exactly one JSON code block and nothing after it.",
+    "- The JSON must include a valid `kind` and `title` field."
+  ];
+
+  if (hasInteractive) {
+    lines.push(
+      "- If you build an interactive HTML artifact, save it inside the staged workspace and return JSON like `{ \"kind\": \"interactive\", \"title\": \"...\", \"path\": \"relative/path.html\" }`.",
+      "- Do not merely mention or link the HTML filename in prose. The JSON handoff is required."
+    );
+  } else if (hasDocument) {
+    lines.push(
+      "- If you generate a file-based document artifact, end with JSON that hands off the artifact payload or generated file path in the expected format."
+    );
+  } else {
+    lines.push(
+      "- Return the artifact payload directly inside the final JSON block in the schema requested by the active skill."
+    );
+  }
+
+  return lines.join("\n");
+}
+
 export function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: LocalDatabase): string {
   // Build structured student memory context from SQLite
   const memoryContext = buildStudentMemoryContext(db, task.projectId);
@@ -2894,7 +3133,7 @@ Always clearly indicate when information comes from the web vs. their local stud
 Stuart automatically remembers important facts about you across sessions — your preferences, goals, exam dates, and progress. You don't need to ask it to remember. If you want Stuart to note something specific, just say it naturally in conversation.
 
 ## Capabilities
-You can generate study artifacts (flashcards, quizzes, mind maps, diagrams, mock exams, interactive apps, PDF/DOCX/XLSX/PPTX documents). When asked to create one, you will receive detailed formatting instructions in the context. Always output artifacts as a single JSON code block with a "kind" and "title" field.
+You can generate study artifacts (flashcards, quizzes, mind maps, diagrams, mock exams, interactive apps, PDF/DOCX/XLSX/PPTX documents). When asked to create one, you will receive detailed formatting instructions in the context. The artifact itself is the primary deliverable. Always output artifacts as a single JSON code block with a "kind" and "title" field, and never stop at a prose description plus a filename mention.
 
 You can also research new topics, fetch content from URLs and repos, and build structured curricula with saved source files — detailed instructions will be provided when the student asks for this.${memoryContext}${legacyMemoryContext}${buildCurriculumContext(project.rootPath)}${perfSnapshot}`;
 }
@@ -3030,9 +3269,10 @@ function extractTargetedFiles(message: string): string[] {
 
 export function sanitizeRetrievalQuery(message: string): string {
   return message
+    .replace(/\b(i\s+would\s+like|i\s+wouldlike|wouldlike|i\s+want)\b/gi, "")
     .replace(/\b(create|generate|make|give me|can you|please|build|produce)\b/gi, "")
     .replace(/\b\d+\s*(flashcards?|cards?|questions?|quizzes?|quiz)\b/gi, "")
-    .replace(/\b(flashcards?|flash\s*cards?|cloze|anki|quiz|quizzes?|mind\s*map|mindmap|diagram|mock\s*exam|test me)\b/gi, "")
+    .replace(/\b(flashcards?|flash\s*cards?|cloze|anki|quiz|quizzes?|mind\s*map|mindmap|diagram|mock\s*exam|test me|interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/gi, "")
     .replace(/\b(basic|advanced|simple|comprehensive|detailed|short|quick)\b/gi, "")
     .replace(/\b(a|an|on|about|for|from|based on|regarding|covering)\b/gi, "")
     .replace(/\s{2,}/g, " ")
@@ -3058,7 +3298,7 @@ function shouldUseLocalRetrieval(task: TaskSpec, message: string): boolean {
   }
 
   const scope = `${task.objective} ${message}`.toLowerCase();
-  return /\b(read|open|scan|search|find|summari[sz]e|review|inspect|analy[sz]e|compare|extract|cite|from the files|from the docs|workspace|directory|folder|document|documents|packet|pdf|docx|xlsx|pptx|slides|notes|study|report|memo|brief|question|answer)\b/i.test(
+  return /\b(read|open|scan|search|find|summari[sz]e|review|inspect|analy[sz]e|compare|extract|cite|from the files|from the docs|workspace|directory|folder|document|documents|packet|pdf|docx|xlsx|pptx|slides|notes|study|report|memo|brief|question|answer|flashcards?|quiz|mind\s*map|mindmap|diagram|mock\s*exam|interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i.test(
     scope
   );
 }
@@ -3391,8 +3631,9 @@ function summarizeThinkingDelta(value: string): string {
 
 const ARTIFACT_PATTERN = /\b(flashcards?|quiz|mind\s*map|mindmap|diagram|mock[\s_-]*exam|interactive)\b/i;
 
-function tryParseArtifactJson(
-  text: string
+export function tryParseArtifactJson(
+  text: string,
+  baseDir?: string
 ): { kind: string; title: string; data: unknown } | null {
   // Try to extract a JSON block from the assistant response
   const jsonBlockMatch = text.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
@@ -3442,6 +3683,11 @@ function tryParseArtifactJson(
       interactive: "interactive",
       "interactive app": "interactive",
       "interactive artifact": "interactive",
+      html: "interactive",
+      "html app": "interactive",
+      webpage: "interactive",
+      visualizer: "interactive",
+      visualiser: "interactive",
       document_docx: "document_docx",
       docx: "document_docx",
       "word document": "document_docx",
@@ -3476,10 +3722,110 @@ function tryParseArtifactJson(
       normalized.nodes = [parsed.root];
     }
 
+    // If interactive/html artifact referenced a file path instead of inline html, read it
+    if (kind === "interactive" && !normalized.html && typeof parsed.path === "string") {
+      try {
+        const { readFileSync, existsSync: existsSyncLocal } = require("node:fs") as typeof import("node:fs");
+        const requestedPath = parsed.path as string;
+        const resolvedPath =
+          baseDir && !requestedPath.startsWith("/")
+            ? resolve(baseDir, requestedPath)
+            : requestedPath;
+        if (existsSyncLocal(resolvedPath)) {
+          normalized.html = readFileSync(resolvedPath, "utf8");
+          normalized.sourcePath = baseDir ? relative(baseDir, resolvedPath) : requestedPath;
+        }
+      } catch { /* ignore — artifact will have empty html */ }
+    }
+
     return { kind, title, data: normalized };
   } catch {
     return null;
   }
+}
+
+export function discoverInteractiveHtmlFiles(rootPath: string, turnStart: Date) {
+  const { readdirSync, readFileSync, statSync } = require("node:fs") as typeof import("node:fs");
+  const results: Array<{ filePath: string; relativePath: string; title: string; html: string }> = [];
+
+  function visit(directory: string) {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolutePath = join(directory, entry.name);
+      const relativePath = relative(rootPath, absolutePath);
+
+      if (entry.isDirectory()) {
+        if (shouldHideWorkspacePath(relativePath)) {
+          continue;
+        }
+        visit(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+      if (!/\.(html?|xhtml)$/i.test(entry.name)) {
+        continue;
+      }
+      if (shouldHideWorkspacePath(relativePath)) {
+        continue;
+      }
+
+      const fileStat = statSync(absolutePath);
+      if (fileStat.mtimeMs < turnStart.getTime()) {
+        continue;
+      }
+      if (fileStat.size < 150 || fileStat.size > 200_000) {
+        continue;
+      }
+
+      const html = readFileSync(absolutePath, "utf8");
+      if (!html.includes("<script") && !html.includes("onclick")) {
+        continue;
+      }
+
+      const title =
+        html.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim()
+        ?? entry.name.replace(/\.(html?|xhtml)$/i, "").replace(/[-_]/g, " ");
+
+      results.push({
+        filePath: absolutePath,
+        relativePath,
+        title,
+        html,
+      });
+    }
+  }
+
+  visit(rootPath);
+  return results;
+}
+
+export function discoverReferencedInteractiveHtmlFiles(rootPath: string, text: string) {
+  const mentioned = new Set<string>();
+  const normalizedText = text.normalize("NFKC");
+
+  for (const match of normalizedText.matchAll(/\[([^\]]+)\]\(([^)]+)\)/g)) {
+    const label = normalizeWorkspaceReference(match[1] ?? "");
+    const href = normalizeWorkspaceReference(match[2] ?? "");
+    if (/\.(html?|xhtml)$/i.test(label)) {
+      mentioned.add(basename(label));
+    }
+    if (/\.(html?|xhtml)$/i.test(href)) {
+      mentioned.add(basename(href));
+    }
+  }
+
+  for (const match of normalizedText.matchAll(/\b([A-Za-z0-9._/-]+\.(?:html?|xhtml))\b/gi)) {
+    mentioned.add(basename(normalizeWorkspaceReference(match[1] ?? "")));
+  }
+
+  if (mentioned.size === 0) {
+    return [];
+  }
+
+  return discoverInteractiveHtmlFiles(rootPath, new Date(0)).filter((file) =>
+    mentioned.has(basename(file.relativePath))
+  );
 }
 
 /**

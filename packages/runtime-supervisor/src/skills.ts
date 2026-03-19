@@ -51,16 +51,46 @@ const EDIT_INTENT =
 const RESEARCH_INTENT =
   /\b(research|find\s+materials?|gather\s+(?:resources|materials?|sources)|build\s+(?:me\s+)?a\s+(?:learning|study)\s*(?:plan|path|roadmap|curriculum)|get\s+me\s+up\s+to\s+speed|from\s+scratch|deep\s*dive|crash\s*course|comprehensive\s+guide|curriculum)\b/i;
 
+function normalizeSkillMessage(message: string) {
+  return message
+    .normalize("NFKC")
+    .replace(/[’‘]/g, "'")
+    .replace(/\bwouldlike\b/gi, "would like")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function hasCreateLikeIntent(message: string) {
-  return CREATE_INTENT.test(message) || EDIT_INTENT.test(message);
+  const normalized = normalizeSkillMessage(message);
+  return CREATE_INTENT.test(normalized) || EDIT_INTENT.test(normalized);
 }
 
 function mentionsAny(message: string, pattern: RegExp) {
-  return pattern.test(message);
+  return pattern.test(normalizeSkillMessage(message));
 }
 
 function artifactRequest(message: string, pattern: RegExp) {
   return mentionsAny(message, pattern) && hasCreateLikeIntent(message);
+}
+
+function politeArtifactRequest(message: string, pattern: RegExp) {
+  const normalized = normalizeSkillMessage(message);
+  return /\b(i\s+(?:would|'d)?\s+like|i\s+want|can\s+you|could\s+you|please)\b/i.test(normalized)
+    && pattern.test(normalized);
+}
+
+function terseArtifactRequest(message: string, pattern: RegExp) {
+  const normalized = normalizeSkillMessage(message);
+  if (!pattern.test(normalized)) {
+    return false;
+  }
+  if (/\b(what|why|how|when|where|which|who|does|do|did|is|are|was|were|can|could|should)\b/i.test(normalized)) {
+    return false;
+  }
+  if (normalized.split(/\s+/).length > 12) {
+    return false;
+  }
+  return true;
 }
 
 function directStudyQuizRequest(message: string) {
@@ -93,7 +123,9 @@ export const STUDY_SKILLS: Skill[] = [
   {
     id: "flashcards",
     match: (message) =>
-      artifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|fill[- ]in[- ]the[- ]blank|anki)s?\b/i),
+      artifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|fill[- ]in[- ]the[- ]blank|anki)s?\b/i)
+      || politeArtifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|anki)s?\b/i)
+      || terseArtifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|anki)s?\b/i),
     prompt: loadSkillFile("flashcards.md"),
     priority: 80,
   },
@@ -101,7 +133,9 @@ export const STUDY_SKILLS: Skill[] = [
     id: "quiz",
     match: (message) =>
       directStudyQuizRequest(message) ||
-      artifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i),
+      artifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i)
+      || politeArtifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i)
+      || terseArtifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i),
     prompt: loadSkillFile("quiz.md"),
     priority: 82,
   },
@@ -109,7 +143,9 @@ export const STUDY_SKILLS: Skill[] = [
     id: "mindmap",
     match: (message) =>
       directMindmapRequest(message) ||
-      artifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i),
+      artifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i)
+      || politeArtifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i)
+      || terseArtifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i),
     prompt: loadSkillFile("mindmap.md"),
     priority: 79,
   },
@@ -117,14 +153,18 @@ export const STUDY_SKILLS: Skill[] = [
     id: "diagram",
     match: (message) =>
       directDiagramRequest(message) ||
-      artifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram|visuali[sz]e)\b/i),
+      artifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram|visuali[sz]e)\b/i)
+      || politeArtifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram)\b/i)
+      || terseArtifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram)\b/i),
     prompt: loadSkillFile("diagram.md"),
     priority: 78,
   },
   {
     id: "mock-exam",
     match: (message) =>
-      artifactRequest(message, /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i),
+      artifactRequest(message, /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i)
+      || politeArtifactRequest(message, /\b(mock\s*exam|practice\s*exam|sample\s*exam|mock\s*test)\b/i)
+      || terseArtifactRequest(message, /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i),
     prompt: loadSkillFile("mock-exam.md"),
     priority: 85,
   },
@@ -132,6 +172,8 @@ export const STUDY_SKILLS: Skill[] = [
     id: "interactive",
     match: (message) =>
       artifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
+      politeArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
+      terseArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
       /\b(build|make|create)\b.*\b(interactive|simulator?|simulation|visuali[sz]er?|playground)\b/i.test(message),
     prompt: loadSkillFile("interactive.md"),
     priority: 90,

@@ -35,5 +35,7 @@ describe("buildTeachingInstructions", () => {
     expect(prompt).toContain("Start with the direct answer or core takeaway");
     expect(prompt).toContain("Avoid walls of text");
     expect(prompt).toContain("clean mental model first");
+    expect(prompt).toContain("The artifact itself is the primary deliverable");
+    expect(prompt).toContain("never stop at a prose description plus a filename mention");
   });
 });

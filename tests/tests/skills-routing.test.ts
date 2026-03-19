@@ -28,4 +28,19 @@ describe("skill routing", () => {
   it("prefers the interactive skill for explicit simulator requests", () => {
     expect(matchSkill("Build an interactive simulator for page replacement.", true)?.id).toBe("interactive");
   });
+
+  it("matches polite interactive requests without explicit build verbs", () => {
+    expect(
+      matchSkill("I would like an interactive DFS and BFS visualiser.", true)?.id
+    ).toBe("interactive");
+  });
+
+  it("matches typo-tolerant and terse interactive requests", () => {
+    expect(
+      matchSkill("i wouldlike a interactive DFS and BFS visualiser", true)?.id
+    ).toBe("interactive");
+    expect(
+      matchSkill("interactive a* search visualiser", true)?.id
+    ).toBe("interactive");
+  });
 });

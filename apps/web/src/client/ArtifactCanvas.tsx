@@ -316,7 +316,11 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
               isInlineLoading={isInlineLoading}
             />
           ) : kind === "interactive" && parsed.kind === "interactive" ? (
-            <InteractiveCanvas html={parsed.html} title={parsed.title} />
+            <InteractiveCanvas
+              html={typeof parsed.html === "string" ? parsed.html : ""}
+              title={parsed.title}
+              previewUrl={artifactDbId ? `/api/study-artifacts/${artifactDbId}/preview` : undefined}
+            />
           ) : kind.startsWith("document_") ? (
             <DocumentCanvas artifactDbId={artifactDbId} kind={kind} />
           ) : (
@@ -2273,18 +2277,30 @@ function DocumentCanvas({ artifactDbId, kind }: { artifactDbId?: string; kind: s
    INTERACTIVE CANVAS — Sandboxed HTML/JS interactive
    ================================================================== */
 
-function InteractiveCanvas({ html, title }: { html: string; title: string }) {
+function InteractiveCanvas({
+  html,
+  title,
+  previewUrl,
+}: {
+  html: string;
+  title: string;
+  previewUrl?: string;
+}) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const hasInlineHtml = html.trim().length > 0;
 
   // Write HTML to iframe using srcdoc for full sandboxing
   const sanitizedHtml = useMemo(() => {
+    if (!hasInlineHtml) {
+      return "";
+    }
     // Ensure it's a complete document
     if (!html.includes("<!DOCTYPE") && !html.includes("<html")) {
       return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;color:#111;background:#f7f7f5;}</style></head><body>${html}</body></html>`;
     }
     return html;
-  }, [html]);
+  }, [hasInlineHtml, html]);
 
   return (
     <div className={`interactive-canvas${isFullscreen ? " fullscreen" : ""}`}>
@@ -2302,16 +2318,30 @@ function InteractiveCanvas({ html, title }: { html: string; title: string }) {
           className="ghost-button compact"
           onClick={() => {
             if (iframeRef.current) {
-              iframeRef.current.srcdoc = sanitizedHtml;
+              if (hasInlineHtml) {
+                iframeRef.current.srcdoc = sanitizedHtml;
+              } else if (previewUrl) {
+                iframeRef.current.src = previewUrl;
+              }
             }
           }}
         >
           Reset
         </button>
+        {previewUrl && (
+          <a
+            href={previewUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="ghost-button compact"
+          >
+            Open in New Tab
+          </a>
+        )}
       </div>
       <iframe
         ref={iframeRef}
-        srcDoc={sanitizedHtml}
+        {...(hasInlineHtml ? { srcDoc: sanitizedHtml } : previewUrl ? { src: previewUrl } : {})}
         sandbox="allow-scripts"
         className="interactive-iframe"
         title={title}

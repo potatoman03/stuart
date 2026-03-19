@@ -63,6 +63,9 @@ describe("retrieval helpers", () => {
     expect(sanitizeRetrievalQuery("please generate a mind map about week 4 cardiac output")).toBe(
       "week 4 cardiac output"
     );
+    expect(sanitizeRetrievalQuery("i wouldlike a interactive DFS and BFS visualiser for lecture 2")).toBe(
+      "DFS and BFS lecture 2"
+    );
   });
 
   it("hides environment and build directories from the workspace surface", () => {

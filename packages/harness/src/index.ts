@@ -687,6 +687,56 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
 
     const kind = artifact.kind;
 
+    if (kind === "interactive") {
+      try {
+        const payload = JSON.parse(artifact.payload) as { html?: unknown; path?: unknown };
+        const wrapHtml = (html: string) =>
+          (!html.includes("<!DOCTYPE") && !html.includes("<html"))
+            ? `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body>${html}</body></html>`
+            : html;
+
+        if (typeof payload.html === "string" && payload.html.trim()) {
+          response.setHeader("Content-Type", "text/html; charset=utf-8");
+          response.send(wrapHtml(payload.html));
+          return;
+        }
+
+        if (typeof payload.path === "string" && payload.path.trim()) {
+          const { existsSync } = await import("node:fs");
+          const { readFile } = await import("node:fs/promises");
+          const { isAbsolute, resolve } = await import("node:path");
+
+          const candidates: string[] = [];
+          const requestedPath = payload.path.trim();
+          if (isAbsolute(requestedPath)) {
+            candidates.push(resolve(requestedPath));
+          } else {
+            for (const run of runtime.db.listTaskRuns(artifact.taskId)) {
+              candidates.push(resolve(run.stagingPath, requestedPath));
+            }
+          }
+
+          for (const candidate of candidates) {
+            if (!existsSync(candidate)) {
+              continue;
+            }
+            const html = await readFile(candidate, "utf8");
+            response.setHeader("Content-Type", "text/html; charset=utf-8");
+            response.send(wrapHtml(html));
+            return;
+          }
+        }
+      } catch {
+        // fall through to friendly error below
+      }
+
+      response
+        .status(404)
+        .setHeader("Content-Type", "text/html; charset=utf-8")
+        .send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;color:#333;background:#f7f7f5}.box{max-width:440px;text-align:center}h2{margin:0 0 8px;font-size:1.2rem}p{color:#666;font-size:14px;line-height:1.5}</style></head><body><div class="box"><h2>Interactive preview unavailable</h2><p>Stuart found the artifact record, but could not resolve the generated HTML file for preview.</p></div></body></html>`);
+      return;
+    }
+
     // For document kinds, always try to render the binary first
     if (kind.startsWith("document_")) {
       const filePath = await runtime.ensureDocumentFile(artifact.id);

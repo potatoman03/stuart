@@ -2003,6 +2003,7 @@ textarea {
 .artifact-canvas-body {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 24px;
   display: flex;
   justify-content: center;
@@ -2517,6 +2518,8 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  width: 100%;
+  min-width: 0;
 }
 
 .quiz-question-number {
@@ -2541,6 +2544,8 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  width: 100%;
+  min-width: 0;
 }
 
 .quiz-option-card {
@@ -2557,7 +2562,9 @@ textarea {
   font-weight: 400;
   transition: all 80ms;
   width: 100%;
+  box-sizing: border-box;
   font-family: var(--font-body);
+  white-space: normal;
 }
 
 .quiz-option-card:hover:not(:disabled):not(.correct):not(.incorrect) {
@@ -2618,10 +2625,13 @@ textarea {
 
 .quiz-option-text {
   flex: 1;
+  min-width: 0;
   font-family: var(--font-body);
   font-size: 14px;
   line-height: 1.45;
   color: var(--ink);
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 .quiz-question-actions {
