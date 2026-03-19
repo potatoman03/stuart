@@ -349,7 +349,15 @@ function App() {
   }, [messagesByTask, selectedTask]);
 
   const visibleMessages = useMemo(
-    () => selectedMessages.filter((message) => message.role !== "system"),
+    () => selectedMessages.filter((message) => {
+      if (message.role !== "system") return true;
+      // Show system messages that describe tool activity, hide internal bookkeeping
+      const c = message.content;
+      return c.includes("Running") || c.includes("Command") || c.includes("tool") || c.includes("connector")
+        || c.includes("Loaded skill") || c.includes("Generated") || c.includes("Synced")
+        || c.includes("Re-indexed") || c.includes("Detected") || c.includes("sandbox")
+        || c.includes("extracted") || c.includes("Skill hint");
+    }),
     [selectedMessages]
   );
 
@@ -2325,14 +2333,30 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
     displayContent = beforeJson ? `${beforeJson}\n\n${summary}` : summary;
   }
 
+  // System messages render as compact tool-call indicators
+  if (message.role === "system") {
+    const content = message.content;
+    let icon = "terminal";
+    if (content.includes("skill") || content.includes("Skill")) icon = "bolt";
+    else if (content.includes("Generated") || content.includes("sandbox")) icon = "build";
+    else if (content.includes("Re-indexed") || content.includes("Synced")) icon = "sync";
+    else if (content.includes("extracted") || content.includes("memor")) icon = "psychology";
+    else if (content.includes("Detected")) icon = "auto_awesome";
+
+    return (
+      <div className="zen-tool-call">
+        <span className="zen-tool-icon">{icon === "terminal" ? ">" : icon === "bolt" ? "+" : icon === "build" ? "#" : icon === "sync" ? "~" : icon === "psychology" ? "*" : "!"}</span>
+        <span className="zen-tool-text">{content}</span>
+      </div>
+    );
+  }
+
   return (
     <article
       className={
         message.role === "user"
           ? "chat-bubble user"
-          : message.role === "system"
-            ? "chat-bubble system"
-            : "chat-bubble assistant"
+          : "chat-bubble assistant"
       }
     >
       <div className="chat-meta">
