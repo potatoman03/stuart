@@ -1046,6 +1046,34 @@ function App() {
                   </svg>
                   Workspaces
                 </button>
+
+                {projects.length > 0 && (
+                  <div className="zen-sidebar-list">
+                    {projects.map((project) => {
+                      const firstTask = tasks.find((t) => t.projectId === project.id);
+                      return (
+                        <button
+                          key={project.id}
+                          className="zen-sidebar-item"
+                          type="button"
+                          onClick={() => {
+                            if (firstTask) {
+                              setSelectedProjectId(project.id);
+                              setSelectedTaskId(firstTask.id);
+                            }
+                          }}
+                          disabled={!firstTask}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5A1 1 0 0 0 5.8 3H3a1 1 0 0 0-1 1z" />
+                          </svg>
+                          {project.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
                 <div style={{ flex: 1 }} />
                 <button
                   className="zen-sidebar-new-btn"
