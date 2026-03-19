@@ -1001,45 +1001,63 @@ textarea {
   font-size: 13px;
 }
 
-/* Tool call indicators in chat */
-.zen-tool-call {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 6px 12px;
-  margin: 2px 0;
-  font-size: 12px;
-  color: var(--zen-on-surface-variant);
-  font-family: var(--font-mono);
-  line-height: 1.5;
+/* Activity summary in chat */
+.zen-activity-summary {
+  margin: 4px 0;
+  padding: 0 4px;
 }
 
-.zen-tool-icon {
-  flex-shrink: 0;
-  width: 16px;
-  height: 16px;
+.zen-activity-toggle {
+  all: unset;
+  box-sizing: border-box;
   display: flex;
   align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--zen-primary);
-  opacity: 0.6;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--zen-on-surface-variant);
+  transition: background 150ms;
+  width: 100%;
 }
 
-.zen-tool-text {
+.zen-activity-toggle:hover {
+  background: var(--zen-surface-low);
+}
+
+.zen-activity-chevron {
+  font-size: 10px;
+  transition: transform 150ms;
+  flex-shrink: 0;
+  opacity: 0.5;
+}
+
+.zen-activity-label {
+  font-size: 12px;
+  color: var(--zen-on-surface-variant);
+}
+
+.zen-activity-parts {
+  opacity: 0.7;
+}
+
+.zen-activity-details {
+  padding: 4px 0 4px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.zen-activity-line {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--zen-on-surface-variant);
+  opacity: 0.7;
+  line-height: 1.5;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 100%;
-}
-
-.zen-tool-text code,
-.zen-tool-call code {
-  background: var(--zen-surface-container);
-  padding: 1px 4px;
-  border-radius: 3px;
-  font-size: 11px;
 }
 
 @keyframes blink-caret {
