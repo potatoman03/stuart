@@ -108,6 +108,10 @@ interface ActiveTurnState {
   cwd?: string;
   /** Whether this turn should trigger workspace re-indexing on completion */
   triggersReindex?: boolean;
+  /** The user's original message for this turn (used for memory extraction) */
+  userMessage?: string;
+  /** Whether this is a memory extraction turn (ephemeral, parse result as memories) */
+  memoryExtraction?: boolean;
 }
 
 interface ResolvedWorkspaceFile extends WorkspaceFileRecord {
@@ -377,6 +381,76 @@ export class StuartRuntime {
    */
   private resolveDocumentOutputDir(taskId: string): string {
     return this.resolveProjectRoot(taskId) ?? join(this.dataDir, "generated-documents", taskId);
+  }
+
+  /**
+   * Extract student memories from a completed turn.
+   * Runs a cheap ephemeral Codex thread to identify preferences, facts, goals, and progress.
+   * Fire-and-forget — errors are silently ignored.
+   */
+  private async extractStudentMemories(
+    taskId: string,
+    userMessage: string,
+    assistantText: string
+  ): Promise<void> {
+    // Gate: skip trivial messages
+    if (userMessage.length < 15 && !userMessage.includes("?")) return;
+    if (/^(yes|ok|okay|sure|thanks|thank you|got it|continue|go ahead|next|yep|yeah|no|nah)\.?$/i.test(userMessage.trim())) return;
+
+    const task = this.db.getTask(taskId);
+    if (!task) return;
+
+    const today = new Date().toISOString().split("T")[0];
+    const extractionPrompt = `Extract new facts about this student from their message. Only extract what the student explicitly stated or confirmed. Do not infer or guess. Return ONLY a JSON code block with an array (or [] if nothing new).
+
+Each item: { "scope_type": "global"|"project", "category": "preference"|"fact"|"goal"|"progress"|"context", "topic": "short label", "memory_key": "unique-key-for-contradictions", "content": "the memory", "event_date": "YYYY-MM-DD or null", "expires_at": "YYYY-MM-DD or null" }
+
+Rules:
+- "prefers X" or "I like X" → global preference
+- "I'm studying X", "my exam is on X" → project goal/context
+- "I understand X now" → project progress
+- Today is ${today}. Convert relative dates to absolute.
+- Do NOT store assistant guesses or inferences.
+
+Student message: ${userMessage}
+
+Assistant response (for confirmation detection only): ${assistantText.slice(0, 500)}`;
+
+    try {
+      // Start an ephemeral thread for extraction (separate from teaching thread)
+      const thread = await this.codex.request<{ thread: { id: string } }>("thread/start", {
+        cwd: this.dataDir,
+        approvalPolicy: "never",
+        model: "gpt-5.4-mini",
+        personality: "pragmatic",
+        ephemeral: true,
+      });
+
+      const extractionThreadId = thread.thread.id;
+
+      // Track the turn so the completion handler can parse the result
+      const turn = await this.codex.request<{ turn: { id: string } }>("turn/start", {
+        threadId: extractionThreadId,
+        cwd: this.dataDir,
+        approvalPolicy: "never",
+        effort: "low",
+        input: [{ type: "text" as const, text: extractionPrompt, text_elements: [] }]
+      });
+
+      // Store metadata so the turn/completed handler can process the extraction
+      this.turns.set(turn.turn.id, {
+        taskId,
+        threadId: extractionThreadId,
+        turnId: turn.turn.id,
+        kind: "worker" as const,
+        assistantText: "",
+        thinkingLabel: "Extracting memories",
+        startedEmitted: false,
+        memoryExtraction: true,
+      });
+    } catch {
+      // Extraction is best-effort — never block the main flow
+    }
   }
 
   /**
@@ -671,6 +745,7 @@ export class StuartRuntime {
       startedEmitted: true,
       cwd: context.cwd,
       triggersReindex: skill?.triggersReindex,
+      userMessage: trimmed,
     });
 
     this.emitEvent({
@@ -1185,6 +1260,38 @@ export class StuartRuntime {
 
   private async ensureTaskThread(task: TaskSpec, cwd: string): Promise<string> {
     const project = this.db.getProject(task.projectId);
+
+    // One-time migration: import .stuart-memory.md into structured memory
+    if (project && !this.db.hasStudentMemories(task.projectId)) {
+      try {
+        const legacyPath = join(project.rootPath, ".stuart-memory.md");
+        if (existsSync(legacyPath)) {
+          const content = require("node:fs").readFileSync(legacyPath, "utf8") as string;
+          if (content.trim()) {
+            // Split into lines and create one memory per meaningful line
+            const lines = content.split("\n").filter((l: string) => l.trim() && !l.startsWith("#"));
+            for (const line of lines) {
+              const cleaned = line.replace(/^[-*•]\s*/, "").trim();
+              if (cleaned.length < 5) continue;
+              this.db.createStudentMemory({
+                scopeType: "project",
+                scopeId: task.projectId,
+                category: "context",
+                content: cleaned,
+                sourceKind: "migration",
+              });
+            }
+            // Rename to mark as migrated
+            const { renameSync } = require("node:fs");
+            renameSync(legacyPath, `${legacyPath}.migrated`);
+            process.stdout.write(`[stuart] migrated .stuart-memory.md to structured memory (${lines.length} entries).\n`);
+          }
+        }
+      } catch {
+        // Migration is best-effort
+      }
+    }
+
     const persistedThreadId = this.db.getTaskThreadId(task.id);
     if (persistedThreadId) {
       if (!this.loadedThreadIds.has(persistedThreadId)) {
@@ -1596,11 +1703,54 @@ export class StuartRuntime {
                   startedEmitted: true,
                   cwd: undefined,
                   triggersReindex: undefined,
+                  userMessage: undefined,
+                  memoryExtraction: undefined,
                 }
               : null;
           })();
 
         if (!state) {
+          return;
+        }
+
+        // Memory extraction turn completed — parse and store memories
+        if (state.memoryExtraction) {
+          try {
+            const text = state.assistantText.trim();
+            const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/) ?? text.match(/(\[[\s\S]*\])/);
+            if (jsonMatch?.[1]) {
+              const task = this.db.getTask(state.taskId);
+              const memories = JSON.parse(jsonMatch[1]) as Array<{
+                scope_type?: string;
+                category?: string;
+                topic?: string;
+                memory_key?: string;
+                content?: string;
+                event_date?: string | null;
+                expires_at?: string | null;
+              }>;
+              for (const mem of memories) {
+                if (!mem.content || !mem.category) continue;
+                this.db.createStudentMemory({
+                  scopeType: (mem.scope_type === "global" ? "global" : "project") as "global" | "project",
+                  scopeId: mem.scope_type === "global" ? null : task?.projectId ?? null,
+                  category: mem.category as "preference" | "fact" | "goal" | "progress" | "context",
+                  topic: mem.topic ?? null,
+                  memoryKey: mem.memory_key ?? null,
+                  content: mem.content,
+                  sourceKind: "user_message",
+                  eventDate: mem.event_date ?? null,
+                  expiresAt: mem.expires_at ?? null,
+                });
+              }
+              if (memories.length > 0) {
+                process.stdout.write(`[stuart] extracted ${memories.length} student memor${memories.length === 1 ? "y" : "ies"} from turn.\n`);
+              }
+            }
+          } catch {
+            // Extraction parsing failed — non-critical
+          }
+          this.turns.delete(params.turn.id);
           return;
         }
 
@@ -1818,10 +1968,12 @@ export class StuartRuntime {
                   const destSources = join(projectRoot, "sources");
                   await cp(stagingSources, destSources, { recursive: true, force: true });
                 }
-                // Copy curriculum.md
-                const stagingCurriculum = join(state.cwd, "curriculum.md");
-                if (existsSync(stagingCurriculum)) {
-                  await cp(stagingCurriculum, join(projectRoot, "curriculum.md"), { force: true });
+                // Copy curriculum files
+                for (const currFile of ["curriculum.md", "curriculum.json"]) {
+                  const stagingPath = join(state.cwd, currFile);
+                  if (existsSync(stagingPath)) {
+                    await cp(stagingPath, join(projectRoot, currFile), { force: true });
+                  }
                 }
                 this.recordRuntimeMessage(
                   state.taskId,
@@ -1842,6 +1994,15 @@ export class StuartRuntime {
             } catch {
               // Non-critical — indexing will happen lazily on next retrieval
             }
+          }
+
+          // Extract student memories from this turn (fire-and-forget)
+          if (state.userMessage) {
+            void this.extractStudentMemories(
+              state.taskId,
+              state.userMessage,
+              state.assistantText
+            ).catch(() => {});
           }
         }
 
@@ -2458,18 +2619,76 @@ function buildPerformanceSnapshot(db: LocalDatabase, task: TaskSpec): string {
   }
 }
 
-function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: LocalDatabase): string {
-  // Load cross-session memory if it exists
-  const memoryPath = join(project.rootPath, ".stuart-memory.md");
-  let memoryContext = "";
+function buildCurriculumContext(projectRootPath: string): string {
   try {
-    if (existsSync(memoryPath)) {
-      const content = require("node:fs").readFileSync(memoryPath, "utf8") as string;
-      if (content.trim()) {
-        memoryContext = `\n\n## Cross-session memory\nThe following notes were saved from previous study sessions with this student. Use them to personalise your teaching.\n\n${content.trim()}`;
+    const specPath = join(projectRootPath, "curriculum.json");
+    const progressPath = join(projectRootPath, "curriculum-progress.json");
+    if (!existsSync(specPath)) return "";
+
+    const spec = JSON.parse(require("node:fs").readFileSync(specPath, "utf8") as string) as {
+      title?: string;
+      phases?: Array<{ id: string; title: string; checkpoints?: Array<{ id: string; topic: string }> }>;
+    };
+    if (!spec.phases?.length) return "";
+
+    let progress: { currentPhase?: string; phases?: Record<string, { status?: string; checkpoints?: Record<string, { passed?: boolean }> }> } | null = null;
+    try {
+      if (existsSync(progressPath)) {
+        progress = JSON.parse(require("node:fs").readFileSync(progressPath, "utf8") as string);
       }
+    } catch { /* ignore */ }
+
+    const lines: string[] = [];
+    for (const phase of spec.phases) {
+      const pp = progress?.phases?.[phase.id];
+      const status = pp?.status ?? "locked";
+      const icon = status === "complete" ? "done" : status === "in_progress" ? "current" : "locked";
+      const checkpoints = phase.checkpoints ?? [];
+      const passed = checkpoints.filter((c) => pp?.checkpoints?.[c.id]?.passed).length;
+      lines.push(`- [${icon}] ${phase.title} (${passed}/${checkpoints.length} checkpoints)`);
     }
-  } catch { /* ignore */ }
+
+    return `\n\n## Curriculum: ${spec.title ?? "Active"}\nCurrent phase: ${progress?.currentPhase ?? spec.phases[0]!.id}\n${lines.join("\n")}\n\nThe student can say "check my understanding of [phase]" to take a checkpoint quiz. When they do, generate a quiz targeting that phase's checkpoint topics.`;
+  } catch {
+    return "";
+  }
+}
+
+function buildStudentMemoryContext(db: LocalDatabase | undefined, projectId: string): string {
+  if (!db) return "";
+  try {
+    const memories = db.queryStudentMemories(projectId, 12);
+    if (memories.length === 0) return "";
+
+    const lines = memories.map((m) => {
+      const age = Math.floor((Date.now() - new Date(m.createdAt).getTime()) / 86400000);
+      const ageLabel = age === 0 ? "today" : age === 1 ? "yesterday" : `${age}d ago`;
+      return `- [${m.category}] ${m.content} (${ageLabel})`;
+    });
+
+    return `\n\n## About this student\n${lines.join("\n")}`;
+  } catch {
+    return "";
+  }
+}
+
+function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: LocalDatabase): string {
+  // Build structured student memory context from SQLite
+  const memoryContext = buildStudentMemoryContext(db, task.projectId);
+
+  // Fallback: read legacy .stuart-memory.md if no structured memories exist yet
+  let legacyMemoryContext = "";
+  if (!memoryContext && db && !db.hasStudentMemories(task.projectId)) {
+    try {
+      const memoryPath = join(project.rootPath, ".stuart-memory.md");
+      if (existsSync(memoryPath)) {
+        const content = require("node:fs").readFileSync(memoryPath, "utf8") as string;
+        if (content.trim()) {
+          legacyMemoryContext = `\n\n## Cross-session notes (legacy)\n${content.trim()}`;
+        }
+      }
+    } catch { /* ignore */ }
+  }
 
   // Lightweight performance snapshot
   const perfSnapshot = db ? buildPerformanceSnapshot(db, task) : "";
@@ -2491,17 +2710,13 @@ You have web search enabled. Use it when:
 - The student asks for comparisons with external resources.
 Always clearly indicate when information comes from the web vs. their local study materials.
 
-## Cross-session memory
-You can remember things across study sessions by writing to the file \`.stuart-memory.md\` in the project root.
-- When the student tells you about their learning preferences, exam dates, weak areas, or study goals, save a brief note to this file.
-- When the student says "remember this" or similar, write it to the memory file.
-- Keep the file concise and organized — use headings and bullet points.
-- Read this file at the start of each session to recall the student's context.
+## Student memory
+Stuart automatically remembers important facts about you across sessions — your preferences, goals, exam dates, and progress. You don't need to ask it to remember. If you want Stuart to note something specific, just say it naturally in conversation.
 
 ## Capabilities
 You can generate study artifacts (flashcards, quizzes, mind maps, diagrams, mock exams, interactive apps, PDF/DOCX/XLSX/PPTX documents). When asked to create one, you will receive detailed formatting instructions in the context. Always output artifacts as a single JSON code block with a "kind" and "title" field.
 
-You can also research new topics, fetch content from URLs and repos, and build structured curricula with saved source files — detailed instructions will be provided when the student asks for this.${memoryContext}${perfSnapshot}`;
+You can also research new topics, fetch content from URLs and repos, and build structured curricula with saved source files — detailed instructions will be provided when the student asks for this.${memoryContext}${legacyMemoryContext}${buildCurriculumContext(project.rootPath)}${perfSnapshot}`;
 }
 
 function buildWorkerDeveloperInstructions(task: TaskSpec, worker: TaskWorkerRecord): string {

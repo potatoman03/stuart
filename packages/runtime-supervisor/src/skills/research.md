@@ -69,7 +69,63 @@ Each source file should be a clean, well-structured markdown document:
 
 ## Step 4: Build the curriculum
 
-Create a `curriculum.md` file in the workspace root with a structured learning path:
+Create TWO files in the workspace root:
+
+### 4a. `curriculum.json` (machine-readable, required)
+
+This is the structured curriculum that Stuart uses for progress tracking and checkpoint quizzes.
+
+```json
+{
+  "title": "Machine Learning Fundamentals",
+  "phases": [
+    {
+      "id": "foundations",
+      "title": "Phase 1: Foundations",
+      "description": "Core concepts and mental models",
+      "sources": ["01-overview.md", "02-core-concepts.md"],
+      "checkpoints": [
+        {
+          "id": "what-is-ml",
+          "topic": "What is machine learning",
+          "description": "Can explain supervised vs unsupervised learning and give examples"
+        },
+        {
+          "id": "training-loop",
+          "topic": "The training loop",
+          "description": "Can describe forward pass, loss computation, backward pass, and parameter update"
+        }
+      ],
+      "estimatedDays": 3
+    },
+    {
+      "id": "optimization",
+      "title": "Phase 2: Gradients & Optimization",
+      "description": "How models learn and improve",
+      "sources": ["03-gradients-and-optimization.md"],
+      "checkpoints": [
+        {
+          "id": "gradient-descent",
+          "topic": "Gradient descent",
+          "description": "Can explain SGD, momentum, and learning rate schedules"
+        }
+      ],
+      "estimatedDays": 5
+    }
+  ]
+}
+```
+
+**Checkpoint rules:**
+- Each checkpoint should test a specific, testable concept — not vague understanding.
+- Write the `description` as "Can [verb] [specific thing]" — this becomes the quiz target.
+- 2-4 checkpoints per phase is ideal. More than 5 is too granular.
+- `sources` lists the files in `sources/` that cover this phase's material.
+- `id` values should be short kebab-case slugs.
+
+### 4b. `curriculum.md` (human-readable, required)
+
+This is the readable version for the student. It should mirror the JSON structure but be formatted nicely:
 
 ```markdown
 # Curriculum: [Topic]
@@ -82,31 +138,35 @@ What the student should already know (if anything).
 
 ## Learning Path
 
-### Phase 1: Foundations (Week 1)
-- [ ] Read: 01-overview.md
-- [ ] Read: 02-core-concepts.md
-- [ ] Exercise: [description]
-- Key concepts: [list]
+### Phase 1: Foundations (~3 days)
+**Goal:** [what the student should be able to do after this phase]
 
-### Phase 2: Core Skills (Week 2-3)
-- [ ] Read: 03-subtopic.md
-- [ ] Read: 04-subtopic.md
-- [ ] Exercise: [description]
-- Key concepts: [list]
+Reading:
+- [ ] 01-overview.md
+- [ ] 02-core-concepts.md
 
-### Phase 3: Advanced Topics (Week 4+)
-- [ ] Read: 05-advanced.md
-- [ ] Exercise: [description]
-- Key concepts: [list]
+Checkpoints — you should be able to:
+- [ ] Explain supervised vs unsupervised learning with examples
+- [ ] Describe the training loop: forward pass → loss → backward pass → update
+
+Exercise: [practical exercise description]
+
+### Phase 2: Gradients & Optimization (~5 days)
+**Goal:** [what the student should be able to do]
+
+Reading:
+- [ ] 03-gradients-and-optimization.md
+
+Checkpoints — you should be able to:
+- [ ] Explain SGD, momentum, and learning rate schedules
+
+Exercise: [practical exercise description]
 
 ## Recommended External Resources
-- [Course Name](url) — description
-- [Video Series](url) — description
-- [Book](url) — description
+- [Resource](url) — description
 
 ## Study Tips
 - Specific advice for this topic
-- Common pitfalls to avoid
 ```
 
 ## Step 5: Summarize
@@ -115,7 +175,8 @@ After saving all files, tell the student:
 1. What materials you found and saved (list the files)
 2. The curriculum structure (phases and timeline)
 3. Suggested first steps
-4. Remind them they can now ask for flashcards, quizzes, cheat sheets, or explanations on any of the saved materials
+4. That they can say "check my understanding of Phase 1" to take a checkpoint quiz
+5. That they can ask for flashcards, quizzes, cheat sheets, or explanations on any material
 
 ## Important rules
 

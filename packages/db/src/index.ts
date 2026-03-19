@@ -7,6 +7,7 @@ import type {
   ArtifactRecord,
   CardPerformanceRecord,
   CreateProjectInput,
+  CreateStudentMemoryInput,
   CreateTaskInput,
   CreateWorkerInput,
   IngestionDocumentRecord,
@@ -17,6 +18,7 @@ import type {
   ProjectLearningSummary,
   ProjectRecord,
   QuizPerformanceRecord,
+  StudentMemoryRecord,
   StudyArtifactRecord,
   StudySessionRecord,
   StudyTimelineEntry,
@@ -276,6 +278,32 @@ export class LocalDatabase {
     } catch {
       // Column already exists — safe to ignore
     }
+
+    // Student memory table for cross-session structured memory
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS student_memories (
+        id TEXT PRIMARY KEY,
+        scope_type TEXT NOT NULL,
+        scope_id TEXT,
+        category TEXT NOT NULL,
+        topic TEXT,
+        memory_key TEXT,
+        content TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_message_id TEXT,
+        created_at TEXT NOT NULL,
+        event_date TEXT,
+        expires_at TEXT,
+        superseded_by TEXT,
+        access_count INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS student_memories_scope_idx
+      ON student_memories (scope_type, scope_id, category);
+
+      CREATE INDEX IF NOT EXISTS student_memories_key_idx
+      ON student_memories (memory_key) WHERE memory_key IS NOT NULL;
+    `);
   }
 
   listProjects(): ProjectRecord[] {
@@ -2207,6 +2235,135 @@ export class LocalDatabase {
     }
 
     return entries;
+  }
+
+  // ---- Student Memory ----
+
+  createStudentMemory(input: CreateStudentMemoryInput): StudentMemoryRecord {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+
+    // If a memory_key is provided, supersede existing memories with the same key
+    if (input.memoryKey) {
+      const existing = this.db
+        .prepare(
+          `SELECT id FROM student_memories
+           WHERE memory_key = ? AND superseded_by IS NULL
+           ORDER BY created_at DESC`
+        )
+        .all(input.memoryKey) as Array<{ id: string }>;
+
+      for (const old of existing) {
+        this.db
+          .prepare(`UPDATE student_memories SET superseded_by = ? WHERE id = ?`)
+          .run(id, old.id);
+      }
+    }
+
+    const record: StudentMemoryRecord = {
+      id,
+      scopeType: input.scopeType,
+      scopeId: input.scopeId ?? null,
+      category: input.category,
+      topic: input.topic ?? null,
+      memoryKey: input.memoryKey ?? null,
+      content: input.content,
+      sourceKind: input.sourceKind,
+      sourceMessageId: input.sourceMessageId ?? null,
+      createdAt: now,
+      eventDate: input.eventDate ?? null,
+      expiresAt: input.expiresAt ?? null,
+      supersededBy: null,
+      accessCount: 0
+    };
+
+    this.db
+      .prepare(
+        `INSERT INTO student_memories
+         (id, scope_type, scope_id, category, topic, memory_key, content, source_kind, source_message_id, created_at, event_date, expires_at, superseded_by, access_count)
+         VALUES (@id, @scopeType, @scopeId, @category, @topic, @memoryKey, @content, @sourceKind, @sourceMessageId, @createdAt, @eventDate, @expiresAt, @supersededBy, @accessCount)`
+      )
+      .run(
+        asSqlParams({
+          id: record.id,
+          scopeType: record.scopeType,
+          scopeId: record.scopeId,
+          category: record.category,
+          topic: record.topic,
+          memoryKey: record.memoryKey,
+          content: record.content,
+          sourceKind: record.sourceKind,
+          sourceMessageId: record.sourceMessageId,
+          createdAt: record.createdAt,
+          eventDate: record.eventDate,
+          expiresAt: record.expiresAt,
+          supersededBy: record.supersededBy,
+          accessCount: record.accessCount
+        })
+      );
+
+    return record;
+  }
+
+  queryStudentMemories(projectId: string, limit = 12): StudentMemoryRecord[] {
+    const now = new Date().toISOString();
+    const rows = asRows<StudentMemoryRecord>(
+      this.db
+        .prepare(
+          `SELECT
+            id,
+            scope_type as scopeType,
+            scope_id as scopeId,
+            category,
+            topic,
+            memory_key as memoryKey,
+            content,
+            source_kind as sourceKind,
+            source_message_id as sourceMessageId,
+            created_at as createdAt,
+            event_date as eventDate,
+            expires_at as expiresAt,
+            superseded_by as supersededBy,
+            access_count as accessCount
+           FROM student_memories
+           WHERE (scope_type = 'global' OR (scope_type = 'project' AND scope_id = ?))
+             AND superseded_by IS NULL
+             AND (expires_at IS NULL OR expires_at > ?)
+           ORDER BY
+             CASE category
+               WHEN 'progress' THEN 1
+               WHEN 'goal' THEN 2
+               WHEN 'preference' THEN 3
+               WHEN 'fact' THEN 4
+               WHEN 'context' THEN 5
+             END,
+             created_at DESC
+           LIMIT ?`
+        )
+        .all(projectId, now, limit)
+    );
+
+    // Update access counts
+    if (rows.length > 0) {
+      const ids = rows.map((r) => r.id);
+      for (const memId of ids) {
+        this.db
+          .prepare(`UPDATE student_memories SET access_count = access_count + 1 WHERE id = ?`)
+          .run(memId);
+      }
+    }
+
+    return rows;
+  }
+
+  hasStudentMemories(projectId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) as cnt FROM student_memories
+         WHERE scope_type = 'global' OR (scope_type = 'project' AND scope_id = ?)`
+      )
+      .get(projectId) as { cnt: number } | undefined;
+    return (row?.cnt ?? 0) > 0;
   }
 
   close(): void {

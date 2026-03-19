@@ -896,6 +896,107 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     );
   });
 
+  // ---- Curriculum ----
+
+  router.get("/tasks/:taskId/curriculum", asyncRoute(async (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const task = runtime.db.getTask(taskId);
+    if (!task) {
+      response.status(404).send("Task not found.");
+      return;
+    }
+    const project = runtime.db.getProject(task.projectId);
+    if (!project) {
+      response.status(404).send("Project not found.");
+      return;
+    }
+
+    const { existsSync } = await import("node:fs");
+    const { readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+
+    // Try project root first, then staging
+    const roots = [project.rootPath];
+    const latestRun = runtime.db.listTaskRuns(taskId)[0];
+    if (latestRun) roots.push(latestRun.stagingPath);
+
+    let spec = null;
+    let progress = null;
+
+    for (const root of roots) {
+      const specPath = join(root, "curriculum.json");
+      if (!spec && existsSync(specPath)) {
+        try {
+          spec = JSON.parse(await readFile(specPath, "utf8"));
+        } catch { /* ignore */ }
+      }
+      const progressPath = join(root, "curriculum-progress.json");
+      if (!progress && existsSync(progressPath)) {
+        try {
+          progress = JSON.parse(await readFile(progressPath, "utf8"));
+        } catch { /* ignore */ }
+      }
+    }
+
+    if (!spec) {
+      response.json({ exists: false });
+      return;
+    }
+
+    // Initialize progress if it doesn't exist yet
+    if (!progress && spec.phases?.length) {
+      progress = {
+        currentPhase: spec.phases[0].id,
+        phases: Object.fromEntries(
+          spec.phases.map((p: { id: string }, i: number) => [
+            p.id,
+            { status: i === 0 ? "in_progress" : "locked", checkpoints: {} }
+          ])
+        )
+      };
+    }
+
+    response.json({ exists: true, spec, progress });
+  }));
+
+  router.patch("/tasks/:taskId/curriculum/progress", asyncRoute(async (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const task = runtime.db.getTask(taskId);
+    if (!task) {
+      response.status(404).send("Task not found.");
+      return;
+    }
+    const project = runtime.db.getProject(task.projectId);
+    if (!project) {
+      response.status(404).send("Project not found.");
+      return;
+    }
+
+    const { writeFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+
+    const progressData = request.body;
+    if (!progressData || !progressData.currentPhase) {
+      response.status(400).send("Progress data with currentPhase is required.");
+      return;
+    }
+
+    // Write to project root
+    const progressPath = join(project.rootPath, "curriculum-progress.json");
+    await writeFile(progressPath, JSON.stringify(progressData, null, 2));
+
+    // Also write to staging if a run exists
+    const latestRun = runtime.db.listTaskRuns(taskId)[0];
+    if (latestRun) {
+      const stagingPath = join(latestRun.stagingPath, "curriculum-progress.json");
+      await writeFile(stagingPath, JSON.stringify(progressData, null, 2)).catch(() => {});
+    }
+
+    response.json(progressData);
+  }));
+
+  // ---- Study Sessions ----
+
   router.post("/tasks/:taskId/study-sessions", (request, response) => {
     const taskId = firstParam(request.params.taskId);
     const task = runtime.db.getTask(taskId);
@@ -926,6 +1027,60 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       response.status(404).send("Study session not found.");
       return;
     }
+
+    // When a session ends, extract performance data into student memories
+    if (endedAt && updated.artifactIdsJson) {
+      try {
+        const artifactIds = JSON.parse(updated.artifactIdsJson) as string[];
+        const task = runtime.db.getTask(updated.taskId);
+        if (task) {
+          for (const artifactId of artifactIds) {
+            const artifact = runtime.db.getStudyArtifact(artifactId);
+            if (!artifact) continue;
+
+            const topic = extractTopic(artifact.title);
+
+            if (artifact.kind === "flashcards") {
+              const cards = runtime.db.listCardPerformance(artifactId);
+              if (cards.length >= 3) {
+                const total = cards.reduce((s, c) => s + c.totalReviews, 0);
+                const correct = cards.reduce((s, c) => s + c.correctCount, 0);
+                const accuracy = total > 0 ? Math.round((correct / total) * 100) : 0;
+                const status = accuracy >= 90 ? "mastered" : accuracy >= 70 ? "understands" : accuracy >= 40 ? "learning" : "struggling";
+                runtime.db.createStudentMemory({
+                  scopeType: "project",
+                  scopeId: task.projectId,
+                  category: "progress",
+                  topic,
+                  memoryKey: `progress-cards-${topic}`,
+                  content: `Flashcard accuracy on ${topic}: ${accuracy}% (${correct}/${total}). Status: ${status}.`,
+                  sourceKind: "card_review",
+                });
+              }
+            }
+
+            if (artifact.kind === "quiz") {
+              const results = runtime.db.listQuizPerformance(artifactId);
+              if (results.length >= 3) {
+                const correct = results.filter((r) => r.isCorrect).length;
+                const accuracy = Math.round((correct / results.length) * 100);
+                const status = accuracy >= 90 ? "mastered" : accuracy >= 70 ? "understands" : accuracy >= 40 ? "learning" : "struggling";
+                runtime.db.createStudentMemory({
+                  scopeType: "project",
+                  scopeId: task.projectId,
+                  category: "progress",
+                  topic,
+                  memoryKey: `progress-quiz-${topic}`,
+                  content: `Quiz accuracy on ${topic}: ${accuracy}% (${correct}/${results.length}). Status: ${status}.`,
+                  sourceKind: "quiz_result",
+                });
+              }
+            }
+          }
+        }
+      } catch { /* non-critical */ }
+    }
+
     response.json(updated satisfies StudySessionRecord);
   });
 

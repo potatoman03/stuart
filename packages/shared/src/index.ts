@@ -740,6 +740,96 @@ export type StudyTimelineEntry = {
   accuracy: number;
 };
 
+/* ---- Student Memory ---- */
+
+export type StudentMemoryScope = "global" | "project";
+export type StudentMemoryCategory = "preference" | "fact" | "goal" | "progress" | "context";
+export type StudentMemorySourceKind =
+  | "user_message"
+  | "user_confirmation"
+  | "quiz_result"
+  | "card_review"
+  | "session_end"
+  | "migration";
+
+export type StudentMemoryRecord = {
+  id: string;
+  scopeType: StudentMemoryScope;
+  scopeId: string | null;
+  category: StudentMemoryCategory;
+  topic: string | null;
+  memoryKey: string | null;
+  content: string;
+  sourceKind: StudentMemorySourceKind;
+  sourceMessageId: string | null;
+  createdAt: string;
+  eventDate: string | null;
+  expiresAt: string | null;
+  supersededBy: string | null;
+  accessCount: number;
+};
+
+export type CreateStudentMemoryInput = {
+  scopeType: StudentMemoryScope;
+  scopeId?: string | null;
+  category: StudentMemoryCategory;
+  topic?: string | null;
+  memoryKey?: string | null;
+  content: string;
+  sourceKind: StudentMemorySourceKind;
+  sourceMessageId?: string | null;
+  eventDate?: string | null;
+  expiresAt?: string | null;
+};
+
+/* ---- Curriculum ---- */
+
+export type CurriculumCheckpoint = {
+  id: string;
+  topic: string;
+  description: string;
+};
+
+export type CurriculumPhase = {
+  id: string;
+  title: string;
+  description?: string;
+  sources: string[];
+  checkpoints: CurriculumCheckpoint[];
+  estimatedDays?: number;
+};
+
+export type CurriculumSpec = {
+  title: string;
+  phases: CurriculumPhase[];
+};
+
+export type CheckpointStatus = {
+  passed: boolean;
+  quizScore?: number;
+  passedAt?: string;
+  lastAttempt?: string;
+};
+
+export type PhaseProgressStatus = "locked" | "in_progress" | "complete";
+
+export type PhaseProgress = {
+  status: PhaseProgressStatus;
+  checkpoints: Record<string, CheckpointStatus>;
+  startedAt?: string;
+  completedAt?: string;
+};
+
+export type CurriculumProgress = {
+  currentPhase: string;
+  phases: Record<string, PhaseProgress>;
+};
+
+export type CurriculumState = {
+  spec: CurriculumSpec;
+  progress: CurriculumProgress;
+};
+
 export function extractTopic(title: string, cue?: string): string {
   const segment = title.split(/\s*[—:\-]\s*/)[0] ?? title;
   const topic = segment.trim().toLowerCase();
