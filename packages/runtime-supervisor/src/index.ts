@@ -45,7 +45,7 @@ import {
   parseDocumentForIngestion
 } from "./ingestion.js";
 import { renderDocument } from "./document-renderer.js";
-import { matchSkill } from "./skills.js";
+import { matchSkills } from "./skills.js";
 import { SandboxExecutor } from "@stuart/sandbox-executor";
 import {
   collectSystemDiagnostics,
@@ -650,18 +650,18 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     const isLargeMaterialSet = stats && stats.documentsIndexed > 8;
 
     // Match a skill to inject detailed formatting/workflow instructions.
-    const skill = matchSkill(trimmed, this.sandboxAvailable);
-    if (skill) {
-      this.recordRuntimeMessage(task.id, `Loaded skill: ${skill.id}`);
+    const skills = matchSkills(trimmed, this.sandboxAvailable);
+    if (skills.length > 0) {
+      this.recordRuntimeMessage(task.id, `Loaded skill${skills.length === 1 ? "" : "s"}: ${skills.map((skill) => skill.id).join(", ")}`);
     }
 
     // Determine model + effort per turn based on what's needed.
     // Skills that generate code or do deep research → flagship gpt-5.4 + high effort.
     // Everything else → gpt-5.4-mini (set on thread) with dynamic effort.
-    const needsFlagship = skill && (
-      skill.requiresSandbox       // scripted document generation (code output)
-      || skill.id === "research"  // research + curriculum building
-      || skill.id === "interactive" // interactive HTML/JS apps
+    const needsFlagship = skills.some((skill) =>
+      skill.requiresSandbox
+      || skill.id === "research"
+      || skill.id === "interactive"
     );
     const isSimpleQuery = /^explain|^what is|^define|^describe|^tell me about/i.test(trimmed) && trimmed.length < 200;
     const turnModel = needsFlagship ? "gpt-5.4" : undefined; // undefined = use thread default (mini)
@@ -704,14 +704,12 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
             }
           ]
         : []),
-      ...(skill
-        ? [
-            {
-              type: "text" as const,
-              text: skill.prompt,
-              text_elements: []
-            }
-          ]
+      ...((skills.length > 0)
+        ? skills.map((skill) => ({
+            type: "text" as const,
+            text: skill.prompt,
+            text_elements: []
+          }))
         : []),
       {
         type: "text" as const,
@@ -744,7 +742,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       thinkingLabel: inferThinkingLabel(task, trimmed),
       startedEmitted: true,
       cwd: context.cwd,
-      triggersReindex: skill?.triggersReindex,
+      triggersReindex: skills.some((skill) => skill.triggersReindex),
       userMessage: trimmed,
     });
 
@@ -2774,16 +2772,48 @@ function formatWorkerLabel(role: string): string {
 function summarizeActivityForStudent(detail: string): string {
   // Convert technical runtime messages into student-friendly labels
   if (/web.*search|searching.*web/i.test(detail)) return "Searching the web...";
+
+  // Extract URLs from curl commands
+  const urlMatch = detail.match(/curl\s+(?:-\S+\s+)*(\S*https?:\/\/[^\s|"']+)/);
+  if (urlMatch) {
+    try {
+      const url = new URL(urlMatch[1]!);
+      const host = url.hostname.replace(/^www\./, "");
+      const path = url.pathname.length > 1 ? url.pathname.split("/").filter(Boolean).slice(-1)[0] : "";
+      return `Fetching ${host}${path ? "/" + path : ""}...`;
+    } catch {
+      return "Fetching content...";
+    }
+  }
+
+  // Git clone
+  const cloneMatch = detail.match(/git\s+clone\s+(?:--\S+\s+)*(\S+)/);
+  if (cloneMatch) {
+    const repo = cloneMatch[1]!.replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "");
+    return `Cloning ${repo}...`;
+  }
+
   if (/running command/i.test(detail)) {
-    if (/\brg\b|grep|search/i.test(detail)) return "Searching through your materials...";
-    if (/\bcat\b|\bsed\b|\bhead\b|\btail\b/i.test(detail)) return "Reading a source file...";
-    if (/\bls\b|\bfind\b/i.test(detail)) return "Browsing your study folder...";
-    return "Analyzing your materials...";
+    // File operations
+    const writeMatch = detail.match(/(?:writing|creating|saving)\s+.*?`([^`]+)`/i);
+    if (writeMatch) return `Writing ${writeMatch[1]!.split("/").pop()}...`;
+
+    if (/\brg\b|grep|search/i.test(detail)) return "Searching through materials...";
+    if (/\bcat\b|\bread\b/i.test(detail)) {
+      const fileMatch = detail.match(/(?:cat|head|tail|sed)\s+.*?([^\s/]+\.\w+)/);
+      return fileMatch ? `Reading ${fileMatch[1]}...` : "Reading a file...";
+    }
+    if (/\bls\b|\bfind\b/i.test(detail)) return "Browsing workspace...";
+    if (/\bmkdir\b/i.test(detail)) return "Setting up directories...";
+    if (/\bwc\b/i.test(detail)) return "Checking file sizes...";
+    return "Running a command...";
   }
   if (/command finished/i.test(detail)) return "Processing results...";
-  if (/reading|opening/i.test(detail)) return "Reading source content...";
-  if (/writing|creating/i.test(detail)) return "Preparing your answer...";
   if (/stuart-memory/i.test(detail)) return "Updating study memory...";
+  if (/tool.*call|using tool/i.test(detail)) {
+    const toolMatch = detail.match(/`([^`]+)`/);
+    return toolMatch ? `Using ${toolMatch[1]}...` : "Using a tool...";
+  }
   // Truncate and clean
   const cleaned = detail.replace(/`[^`]+`/g, "").replace(/\s+/g, " ").trim();
   return cleaned.length > 60 ? cleaned.slice(0, 57) + "..." : cleaned || "Working...";

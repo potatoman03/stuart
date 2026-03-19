@@ -32,91 +32,195 @@ function loadSkillFile(filename: string): string {
 
 export interface Skill {
   id: string;
-  /** Regex pattern to match against the user's message (case-insensitive) */
-  pattern: RegExp;
+  /** Match the skill against the user's message. */
+  match: (message: string) => boolean;
   /** The full skill prompt injected as context before the user message */
   prompt: string;
   /** Whether this skill requires the Docker sandbox to execute */
   requiresSandbox?: boolean;
   /** Whether this skill writes new files that need re-indexing after the turn */
   triggersReindex?: boolean;
+  /** Higher wins when multiple skills match. */
+  priority: number;
+}
+
+const CREATE_INTENT =
+  /\b(create|make|build|generate|draft|produce|write|design|prepare|assemble|export|turn|convert)\b/i;
+const EDIT_INTENT =
+  /\b(edit|update|revise|improve|expand|rewrite|fix|polish|reformat|add|fill|clean up)\b/i;
+const RESEARCH_INTENT =
+  /\b(research|find\s+materials?|gather\s+(?:resources|materials?|sources)|build\s+(?:me\s+)?a\s+(?:learning|study)\s*(?:plan|path|roadmap|curriculum)|get\s+me\s+up\s+to\s+speed|from\s+scratch|deep\s*dive|crash\s*course|comprehensive\s+guide|curriculum)\b/i;
+
+function hasCreateLikeIntent(message: string) {
+  return CREATE_INTENT.test(message) || EDIT_INTENT.test(message);
+}
+
+function mentionsAny(message: string, pattern: RegExp) {
+  return pattern.test(message);
+}
+
+function artifactRequest(message: string, pattern: RegExp) {
+  return mentionsAny(message, pattern) && hasCreateLikeIntent(message);
+}
+
+function directStudyQuizRequest(message: string) {
+  return /\b(quiz me|test me|give me a quiz|practice questions?|multiple choice questions?|mcq)\b/i.test(message);
+}
+
+function directDiagramRequest(message: string) {
+  return /\b(diagram this|visuali[sz]e this|map this out|show me a diagram|draw a diagram)\b/i.test(message);
+}
+
+function directMindmapRequest(message: string) {
+  return /\b(mind\s*map this|concept\s*map this|map out the topic)\b/i.test(message);
+}
+
+function documentRequest(message: string, pattern: RegExp) {
+  return mentionsAny(message, pattern) && (
+    hasCreateLikeIntent(message) ||
+    /\b(save as|export as|turn .* into|convert .* to)\b/i.test(message)
+  );
 }
 
 export const STUDY_SKILLS: Skill[] = [
   {
     id: "research",
-    pattern: /\b(research|curriculum|get\s+me\s+up\s+to\s+speed|from\s+the\s+ground\s+up|from\s+scratch|find\s+materials?|gather\s+(?:resources|materials?|sources)|build\s+(?:me\s+)?a\s+(?:learning|study)\s*(?:plan|path)|learn\s+(?:about|everything)|teach\s+me\s+(?:about|everything)|deep\s*dive|explore\s+the\s+topic|i\s+don'?t\s+know\s+anything|crash\s*course|comprehensive\s+guide|study\s+(?:plan|guide|roadmap))\b/i,
+    match: (message) => RESEARCH_INTENT.test(message),
     prompt: loadSkillFile("research.md"),
     triggersReindex: true,
+    priority: 40,
   },
   {
     id: "flashcards",
-    pattern: /\b(flashcard|flash card|study card|review card|cloze|fill.in.the.blank|anki)s?\b/i,
+    match: (message) =>
+      artifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|fill[- ]in[- ]the[- ]blank|anki)s?\b/i),
     prompt: loadSkillFile("flashcards.md"),
+    priority: 80,
   },
   {
     id: "quiz",
-    pattern: /\b(quiz|test me|test my|multiple choice|mcq|assessment)\b/i,
+    match: (message) =>
+      directStudyQuizRequest(message) ||
+      artifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i),
     prompt: loadSkillFile("quiz.md"),
+    priority: 82,
   },
   {
     id: "mindmap",
-    pattern: /\b(mind\s*map|concept\s*map|topic\s*map)\b/i,
+    match: (message) =>
+      directMindmapRequest(message) ||
+      artifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i),
     prompt: loadSkillFile("mindmap.md"),
+    priority: 79,
   },
   {
     id: "diagram",
-    pattern: /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|visuali[sz]e)\b/i,
+    match: (message) =>
+      directDiagramRequest(message) ||
+      artifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram|visuali[sz]e)\b/i),
     prompt: loadSkillFile("diagram.md"),
+    priority: 78,
   },
   {
     id: "mock-exam",
-    pattern: /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i,
+    match: (message) =>
+      artifactRequest(message, /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i),
     prompt: loadSkillFile("mock-exam.md"),
+    priority: 85,
   },
   {
     id: "interactive",
-    pattern: /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|app|widget)\b/i,
+    match: (message) =>
+      artifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
+      /\b(build|make|create)\b.*\b(interactive|simulator?|simulation|visuali[sz]er?|playground)\b/i.test(message),
     prompt: loadSkillFile("interactive.md"),
+    priority: 90,
   },
   {
     id: "document-pdf-scripted",
-    pattern: /\b(pdf|cheat\s*sheet|reference\s*card|formula\s*sheet|printable)\b/i,
+    match: (message) =>
+      documentRequest(message, /\b(pdf|cheat\s*sheet|reference\s*card|formula\s*sheet|printable)\b/i),
     prompt: loadSkillFile("document-pdf-scripted.md"),
     requiresSandbox: true,
+    priority: 92,
   },
   {
     id: "document-docx-scripted",
-    pattern: /\b(word\s*doc|\.docx|study\s*guide|revision\s*notes|summary\s*document|handout|write\s+\w*\s*document)\b/i,
+    match: (message) =>
+      documentRequest(message, /\b(word\s*doc(?:ument)?|\.docx|docx|study\s*guide|revision\s*notes|summary\s*document|handout)\b/i),
     prompt: loadSkillFile("document-docx-scripted.md"),
     requiresSandbox: true,
+    priority: 91,
   },
   {
     id: "document-xlsx-scripted",
-    pattern: /\b(spreadsheet|\.xlsx|excel|comparison\s*table|data\s*table|tabulate)\b/i,
+    match: (message) =>
+      documentRequest(message, /\b(spreadsheet|\.xlsx|xlsx|excel|comparison\s*table|data\s*table|tabulate)\b/i),
     prompt: loadSkillFile("document-xlsx-scripted.md"),
     requiresSandbox: true,
+    priority: 91,
   },
   {
     id: "document-pptx-scripted",
-    pattern: /\b(presentation|\.pptx|powerpoint|slide\s*deck|lecture\s*slides)\b/i,
+    match: (message) =>
+      documentRequest(message, /\b(presentation|\.pptx|pptx|powerpoint|slide\s*deck)\b/i),
     prompt: loadSkillFile("document-pptx-scripted.md"),
     requiresSandbox: true,
+    priority: 91,
+  },
+  {
+    id: "document-pdf",
+    match: (message) =>
+      documentRequest(message, /\b(pdf|cheat\s*sheet|reference\s*card|formula\s*sheet|printable)\b/i),
+    prompt: loadSkillFile("document-pdf.md"),
+    priority: 72,
+  },
+  {
+    id: "document-docx",
+    match: (message) =>
+      documentRequest(message, /\b(word\s*doc(?:ument)?|\.docx|docx|study\s*guide|revision\s*notes|summary\s*document|handout)\b/i),
+    prompt: loadSkillFile("document-docx.md"),
+    priority: 71,
+  },
+  {
+    id: "document-xlsx",
+    match: (message) =>
+      documentRequest(message, /\b(spreadsheet|\.xlsx|xlsx|excel|comparison\s*table|data\s*table|tabulate)\b/i),
+    prompt: loadSkillFile("document-xlsx.md"),
+    priority: 71,
+  },
+  {
+    id: "document-pptx",
+    match: (message) =>
+      documentRequest(message, /\b(presentation|\.pptx|pptx|powerpoint|slide\s*deck)\b/i),
+    prompt: loadSkillFile("document-pptx.md"),
+    priority: 71,
   },
 ];
 
 /**
- * Match a user message against skills and return the best matching skill,
- * or null if no skill matches.
+ * Match a user message against skills and return the active prompt set.
+ * Research can be paired with one primary creation skill for combined asks.
  */
-export function matchSkill(message: string, sandboxAvailable = false): Skill | null {
-  for (const skill of STUDY_SKILLS) {
-    if (skill.requiresSandbox && !sandboxAvailable) {
-      continue;
-    }
-    if (skill.pattern.test(message)) {
-      return skill;
-    }
+export function matchSkills(message: string, sandboxAvailable = false): Skill[] {
+  const matches = STUDY_SKILLS
+    .filter((skill) => (!skill.requiresSandbox || sandboxAvailable) && skill.match(message))
+    .sort((left, right) => right.priority - left.priority);
+
+  if (matches.length === 0) {
+    return [];
   }
-  return null;
+
+  const research = matches.find((skill) => skill.id === "research") ?? null;
+  const primary = matches.find((skill) => skill.id !== "research") ?? matches[0]!;
+
+  if (research && primary.id !== "research") {
+    return [research, primary];
+  }
+
+  return [primary];
+}
+
+export function matchSkill(message: string, sandboxAvailable = false): Skill | null {
+  return matchSkills(message, sandboxAvailable)[0] ?? null;
 }

@@ -13,6 +13,7 @@ The student has asked for something that goes beyond static cards, quizzes, or d
 - The app must work inside a sandboxed iframe with no network access.
 - Do not invent concepts not supported by the workspace evidence.
 - The interactive must be genuinely useful for learning, not just decorative.
+- Build a real teaching surface: controls, a live visual/state area, and a compact explanation or feedback area.
 
 ## Required output schema
 
@@ -24,6 +25,17 @@ The student has asked for something that goes beyond static cards, quizzes, or d
 }
 ```
 
+## Teaching first
+
+The interactive should help the student understand something that is hard to grasp from text alone:
+
+- a process that changes over time
+- a mechanism with adjustable inputs
+- a system with parts and relationships
+- a comparison where the student benefits from toggling scenarios
+
+If the concept would be better served by a static diagram or flashcards, do not fake interactivity with a dead page.
+
 ## What goes in `html`
 
 A complete HTML document with:
@@ -32,6 +44,18 @@ A complete HTML document with:
 - All CSS in a `<style>` block in `<head>`
 - All JavaScript in a `<script>` block at the end of `<body>`
 - Clean, modern UI that matches a study tool aesthetic
+
+### Recommended page structure
+
+Include all of these when they make sense:
+
+- a short title and one-line explanation of what the interactive teaches
+- a main stage or visual area
+- controls for changing inputs or stepping through the process
+- a compact explanation, feedback, or observation panel
+- a small sources footer or evidence panel
+
+The student should be able to understand what to do within a few seconds of opening it.
 
 ## Design rules
 
@@ -48,6 +72,9 @@ A complete HTML document with:
 - Add clear labels, tooltips, or a brief intro if the interaction isn't obvious.
 - Use hover states and transitions for polish.
 - Support both click and keyboard interaction where sensible.
+- Include a clear reset path when the state can drift or get messy.
+- Start in a meaningful default state instead of an empty shell.
+- Prefer 1 to 3 strong controls over a crowded control panel.
 
 ### Technical constraints
 - No external libraries — vanilla HTML/CSS/JS only.
@@ -56,6 +83,15 @@ A complete HTML document with:
 - Canvas API and SVG are both fine for visualisations.
 - requestAnimationFrame is fine for animations.
 - Keep the total HTML under 50KB.
+- Avoid console noise and uncaught runtime errors.
+- Keep logic deterministic on first load; do not require hidden async initialization.
+
+## Evidence use
+
+- Use workspace evidence to choose the concept, labels, rules, and examples.
+- If the student asks for an existing lecture/topic, anchor the interactive to that exact scope.
+- If the workspace evidence is partial, simplify the model and state the simplification in the UI.
+- Add a compact "Sources" or "Grounding" area in the app that names the files used.
 
 ## Types of interactives to generate
 
@@ -76,13 +112,6 @@ Side-by-side interactive comparison of two or more concepts, drugs, structures, 
 
 ### Interactive quizzes or games
 Drag-and-drop matching, sorting exercises, labeling diagrams, or other gamified learning.
-
-## Grounding rules
-
-- The interactive should teach real content from the workspace.
-- Use correct terminology and accurate relationships.
-- Cite your sources in a small footer or info section within the app.
-- If the workspace doesn't have enough detail, build a simpler interactive rather than inventing content.
 
 ## Quality bar
 
@@ -107,6 +136,21 @@ Drag-and-drop matching, sorting exercises, labeling diagrams, or other gamified 
 - Add comments for complex logic.
 - Handle edge cases (empty states, boundary values).
 - Test your event listeners — make sure clicks and inputs work.
+- Use semantic buttons, labels, and form controls.
+- Add `aria-label` where the control text is not explicit.
+- Keep text selectable and readable; do not bury explanations in canvas-only rendering.
+
+## Final deliverable shape
+
+The generated app should usually contain:
+
+- a visible teaching title
+- one focused interaction model
+- one or more controls
+- one live explanation or feedback region
+- a small evidence footer
+
+Do not return a landing page, essay page, or static infographic disguised as an app.
 
 ## Final self-check
 
@@ -121,3 +165,5 @@ Before returning, verify:
 - the app renders and is interactive
 - content is grounded in workspace material
 - visual design is clean and modern
+- there is a clear reset or replay path
+- there is a visible evidence/footer area
