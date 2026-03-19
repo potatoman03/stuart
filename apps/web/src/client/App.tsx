@@ -1156,6 +1156,7 @@ function App() {
                     projects={projects}
                     tasks={tasks}
                     onSelectTask={(taskId) => setSelectedTaskId(taskId)}
+                    onAddWorkspace={() => handleAddStudyMaterials()}
                   />
                 ) : (
                   /* ---- Onboarding: Welcome Screen ---- */
@@ -1859,17 +1860,18 @@ function DashboardView({
   projects,
   tasks,
   onSelectTask,
+  onAddWorkspace,
 }: {
   projects: ProjectRecord[];
   tasks: TaskSpec[];
   onSelectTask: (taskId: string) => void;
+  onAddWorkspace: () => void;
 }) {
-  const [expanded, setExpanded] = useState<string | null>(null);
   const [summaries, setSummaries] = useState<Record<string, ProjectLearningSummary>>({});
   const [timelines, setTimelines] = useState<Record<string, StudyTimelineEntry[]>>({});
-  const [taskBreakdowns, setTaskBreakdowns] = useState<Record<string, TaskPerformanceBreakdown>>({});
+  const [curriculumFlags, setCurriculumFlags] = useState<Record<string, boolean>>({});
 
-  // Fetch summaries for all projects
+  // Fetch summaries + timelines for all projects
   useEffect(() => {
     for (const project of projects) {
       fetch(`/api/projects/${project.id}/learning-summary`)
@@ -1878,164 +1880,184 @@ function DashboardView({
           setSummaries((prev) => ({ ...prev, [project.id]: data }));
         })
         .catch(() => {});
-    }
-  }, [projects]);
 
-  // Fetch timeline + task breakdowns when a project is expanded
-  useEffect(() => {
-    if (!expanded) return;
-    fetch(`/api/projects/${expanded}/study-timeline?days=14`)
-      .then((r) => r.json())
-      .then((data: StudyTimelineEntry[]) => {
-        setTimelines((prev) => ({ ...prev, [expanded]: data }));
-      })
-      .catch(() => {});
-
-    const projectTasks = tasks.filter((t) => t.projectId === expanded);
-    for (const task of projectTasks) {
-      fetch(`/api/tasks/${task.id}/performance`)
+      fetch(`/api/projects/${project.id}/study-timeline?days=30`)
         .then((r) => r.json())
-        .then((data: TaskPerformanceBreakdown) => {
-          setTaskBreakdowns((prev) => ({ ...prev, [task.id]: data }));
+        .then((data: StudyTimelineEntry[]) => {
+          setTimelines((prev) => ({ ...prev, [project.id]: data }));
         })
         .catch(() => {});
     }
-  }, [expanded, tasks]);
+  }, [projects]);
+
+  // Check curriculum existence for each task (first task per project)
+  useEffect(() => {
+    for (const task of tasks) {
+      if (curriculumFlags[task.id] !== undefined) continue;
+      fetch(`/api/tasks/${task.id}/curriculum`)
+        .then((r) => r.json())
+        .then((data: { exists: boolean }) => {
+          setCurriculumFlags((prev) => ({ ...prev, [task.id]: data.exists }));
+        })
+        .catch(() => {});
+    }
+  }, [tasks, curriculumFlags]);
+
+  // Merge all timelines into a 30-day aggregate
+  const aggregatedTimeline = useMemo(() => {
+    const dayMap: Record<string, { reviews: number; sessions: number }> = {};
+    for (const entries of Object.values(timelines)) {
+      for (const entry of entries) {
+        if (!dayMap[entry.date]) {
+          dayMap[entry.date] = { reviews: 0, sessions: 0 };
+        }
+        const bucket = dayMap[entry.date]!;
+        bucket.reviews += entry.reviews;
+        bucket.sessions += entry.sessions;
+      }
+    }
+    const today = new Date();
+    const days: { date: string; reviews: number }[] = [];
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      days.push({ date: key, reviews: dayMap[key]?.reviews ?? 0 });
+    }
+    return days;
+  }, [timelines]);
+
+  // Compute global stats from summaries
+  const globalStats = useMemo(() => {
+    const vals = Object.values(summaries);
+    const totalReviews = vals.reduce((s, v) => s + v.totalReviews, 0);
+    const maxStreak = vals.reduce((s, v) => Math.max(s, v.streakDays), 0);
+    return { totalReviews, streakDays: maxStreak };
+  }, [summaries]);
+
+  // Build workspace card data
+  const workspaces = useMemo(() => {
+    return projects.map((project) => {
+      const summary = summaries[project.id];
+      const projectTasks = tasks.filter((t) => t.projectId === project.id);
+      const firstTask = projectTasks[0] ?? null;
+      const hasCurriculum = firstTask ? curriculumFlags[firstTask.id] === true : false;
+      return { project, summary, firstTask, hasCurriculum };
+    });
+  }, [projects, summaries, tasks, curriculumFlags]);
+
+  const maxReviews = useMemo(
+    () => Math.max(...aggregatedTimeline.map((d) => d.reviews), 1),
+    [aggregatedTimeline],
+  );
 
   return (
-    <div className="dashboard-view">
-      <h1>Your Study Dashboard</h1>
-      <p>Click a project to see details, weak topics, and study options.</p>
-      {projects.map((project) => {
-        const summary = summaries[project.id];
-        const isExpanded = expanded === project.id;
-        const projectTasks = tasks.filter((t) => t.projectId === project.id);
-        const timeline = timelines[project.id];
-
-        return (
-          <div
-            key={project.id}
-            className={`dashboard-project-card${isExpanded ? " expanded" : ""}`}
-            onClick={() => setExpanded(isExpanded ? null : project.id)}
-          >
-            <div className="dashboard-project-header">
-              <h2>{project.name}</h2>
-              {summary && summary.cardsDue > 0 && (
-                <span className="dashboard-due-badge">{summary.cardsDue} due</span>
-              )}
-            </div>
-            {summary && (
-              <div className="dashboard-stats-row">
-                <span>{summary.totalArtifacts} artifacts</span>
-                <span>{(summary.overallAccuracy * 100).toFixed(0)}% accuracy</span>
-                {summary.streakDays > 0 && <span>{summary.streakDays}-day streak</span>}
-                {summary.lastStudiedAt && (
-                  <span>{formatTimeAgo(summary.lastStudiedAt)}</span>
-                )}
-              </div>
+    <div className="zen-dashboard">
+      {/* Activity heatmap bar */}
+      <section className="zen-activity-bar">
+        <div className="zen-activity-header">
+          <h1 className="zen-headline">Your Studio</h1>
+          <div className="zen-activity-stats">
+            {globalStats.streakDays > 0 && (
+              <span className="zen-stat-pill">
+                {globalStats.streakDays}-day streak
+              </span>
             )}
-
-            {isExpanded && (
-              <div className="dashboard-expanded-body" onClick={(e) => e.stopPropagation()}>
-                {/* Timeline sparkline */}
-                {timeline && timeline.length > 0 && (
-                  <div>
-                    <div className="dashboard-timeline">
-                      {timeline.map((entry) => {
-                        const maxReviews = Math.max(...timeline.map((e) => e.reviews), 1);
-                        const height = entry.reviews > 0 ? Math.max(8, (entry.reviews / maxReviews) * 48) : 2;
-                        const color =
-                          entry.reviews === 0
-                            ? "var(--line)"
-                            : entry.accuracy >= 0.7
-                              ? "var(--success)"
-                              : entry.accuracy >= 0.4
-                                ? "var(--warning)"
-                                : "var(--danger)";
-                        return (
-                          <div
-                            key={entry.date}
-                            className="dashboard-timeline-bar"
-                            style={{ height: `${height}px`, background: color }}
-                            data-tip={`${entry.date}: ${entry.reviews} reviews, ${(entry.accuracy * 100).toFixed(0)}%`}
-                          />
-                        );
-                      })}
-                    </div>
-                    <div className="dashboard-timeline-label">
-                      <span>{timeline[0]?.date.slice(5)}</span>
-                      <span>{timeline[timeline.length - 1]?.date.slice(5)}</span>
-                    </div>
-                  </div>
-                )}
-
-                {/* Weak topics */}
-                {summary && summary.weakTopics.length > 0 && (
-                  <div className="dashboard-weak-topics">
-                    <h3>Weak Topics</h3>
-                    {summary.weakTopics.map((topic) => {
-                      const pct =
-                        topic.totalAttempts > 0
-                          ? (topic.correctCount / topic.totalAttempts) * 100
-                          : 0;
-                      const color =
-                        pct >= 70
-                          ? "var(--success)"
-                          : pct >= 40
-                            ? "var(--warning)"
-                            : "var(--danger)";
-                      return (
-                        <div key={topic.id} className="dashboard-topic-row">
-                          <span className="dashboard-topic-name">{topic.topic}</span>
-                          <div className="dashboard-topic-bar-track">
-                            <div
-                              className="dashboard-topic-bar-fill"
-                              style={{ width: `${pct}%`, background: color }}
-                            />
-                          </div>
-                          <span className="dashboard-topic-pct">{pct.toFixed(0)}%</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Per-task breakdown */}
-                {projectTasks.length > 0 && (
-                  <div>
-                    {projectTasks.map((task) => {
-                      const bd = taskBreakdowns[task.id];
-                      return (
-                        <div key={task.id} className="dashboard-task-card">
-                          <span className="task-title">{task.title}</span>
-                          {bd && (
-                            <span className="task-stats">
-                              {bd.artifactCount} artifacts
-                              {bd.totalCards > 0 && ` | ${bd.cardsDue} due`}
-                              {bd.totalQuizQuestions > 0 &&
-                                ` | ${(bd.quizAccuracy * 100).toFixed(0)}% quiz`}
-                            </span>
-                          )}
-                          <button
-                            className="study-btn"
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onSelectTask(task.id);
-                            }}
-                          >
-                            Study
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
+            <span className="zen-stat-pill">
+              {globalStats.totalReviews} reviews
+            </span>
           </div>
-        );
-      })}
+        </div>
+        <div className="zen-heatmap">
+          {aggregatedTimeline.map((day) => {
+            const opacity = day.reviews === 0
+              ? 0.08
+              : Math.min(0.2 + (day.reviews / maxReviews) * 0.8, 1);
+            return (
+              <div
+                key={day.date}
+                className="zen-heatmap-dot"
+                style={{
+                  backgroundColor: day.reviews === 0
+                    ? "#2d3435"
+                    : "#296767",
+                  opacity,
+                }}
+                title={`${day.date}: ${day.reviews} reviews`}
+              />
+            );
+          })}
+        </div>
+      </section>
+
+      {/* Workspace bento grid */}
+      <section className="zen-bento-grid">
+        {workspaces.map(({ project, summary, firstTask, hasCurriculum }) => (
+          <button
+            key={project.id}
+            type="button"
+            className="zen-workspace-card"
+            onClick={() => firstTask && onSelectTask(firstTask.id)}
+            disabled={!firstTask}
+          >
+            <div className="zen-card-top">
+              <h2 className="zen-card-name">{project.name}</h2>
+              <span className="zen-card-badge">
+                {hasCurriculum ? "Curriculum" : "Research"}
+              </span>
+            </div>
+
+            {summary ? (
+              <div className="zen-card-body">
+                <div className="zen-card-meta">
+                  {summary.lastStudiedAt && (
+                    <span className="zen-label">{formatTimeAgo(summary.lastStudiedAt)}</span>
+                  )}
+                  {summary.cardsDue > 0 && (
+                    <span className="zen-label zen-label-due">{summary.cardsDue} due</span>
+                  )}
+                </div>
+                <div className="zen-accuracy-row">
+                  <span className="zen-accuracy-value">
+                    {(summary.overallAccuracy * 100).toFixed(0)}%
+                  </span>
+                  <div className="zen-progress-track">
+                    <div
+                      className="zen-progress-fill"
+                      style={{ width: `${(summary.overallAccuracy * 100).toFixed(0)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="zen-card-body">
+                <span className="zen-label">Loading...</span>
+              </div>
+            )}
+          </button>
+        ))}
+
+        {/* New Workspace placeholder */}
+        <button
+          type="button"
+          className="zen-workspace-card zen-add-card"
+          onClick={onAddWorkspace}
+        >
+          <svg
+            width="28"
+            height="28"
+            viewBox="0 0 28 28"
+            fill="none"
+            stroke="#296767"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          >
+            <line x1="14" y1="6" x2="14" y2="22" />
+            <line x1="6" y1="14" x2="22" y2="14" />
+          </svg>
+          <span className="zen-add-label">New Workspace</span>
+        </button>
+      </section>
     </div>
   );
 }

@@ -4,6 +4,7 @@
    ============================================================= */
 
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700&display=swap");
 
 /* ---- Design Tokens ---- */
 :root {
@@ -39,6 +40,27 @@
 
   --library-width: 260px;
   --tools-width: 340px;
+
+  /* Zen Studio palette */
+  --zen-primary: #296767;
+  --zen-primary-dim: #195b5b;
+  --zen-on-primary: #d9fffe;
+  --zen-primary-container: #b0eeed;
+  --zen-surface: #f9f9f9;
+  --zen-surface-low: #f2f4f4;
+  --zen-surface-lowest: #ffffff;
+  --zen-surface-high: #e4e9ea;
+  --zen-surface-container: #ebeeef;
+  --zen-on-surface: #2d3435;
+  --zen-on-surface-variant: #5a6061;
+  --zen-outline-variant: #adb3b4;
+  --zen-tertiary-container: #d9f9df;
+  --zen-on-tertiary-container: #45604d;
+  --zen-error: #9f403d;
+  --zen-error-container: #fe8983;
+  --zen-shadow: 0px 12px 32px rgba(45, 52, 53, 0.06);
+  --zen-font-headline: "Manrope", system-ui, sans-serif;
+  --zen-font-body: "Inter", system-ui, sans-serif;
 }
 
 /* ---- Reset & Base ---- */
@@ -309,7 +331,7 @@ textarea {
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--line);
-  background: var(--surface);
+  background: var(--zen-surface-low);
   overflow: hidden;
 }
 
@@ -326,7 +348,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: var(--ink);
+  color: var(--zen-primary);
 }
 
 .brand-mark {
@@ -1340,15 +1362,15 @@ textarea {
   height: 30px;
   padding: 0;
   border-radius: 50%;
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--zen-primary);
+  border-color: var(--zen-primary);
+  color: var(--zen-on-primary);
 }
 
 .send-button:hover:not(:disabled) {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
-  box-shadow: var(--shadow-brutal-accent);
+  background: var(--zen-primary-dim);
+  border-color: var(--zen-primary-dim);
+  box-shadow: none;
 }
 
 /* ======== RIGHT SIDEBAR: Study Tools ======== */
@@ -1369,6 +1391,7 @@ textarea {
   padding: 16px;
   border-bottom: 1px solid var(--line);
   flex-shrink: 0;
+  background: rgba(41, 103, 103, 0.03);
 }
 
 .tools-header > div {
@@ -3432,249 +3455,252 @@ textarea {
   }
 }
 
-/* ---- Dashboard View ---- */
+/* ---- Zen Studio Dashboard ---- */
 
-.dashboard-view {
-  max-width: 720px;
+.zen-dashboard {
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 32px 16px;
+  padding: 2rem;
+  font-family: var(--zen-font-body);
+  color: var(--zen-on-surface);
+}
+
+/* Activity section */
+.zen-activity-section {
+  background: var(--zen-surface-lowest);
+  border-radius: 12px;
+  padding: 1.5rem;
+}
+
+.zen-activity-dots {
   display: flex;
-  flex-direction: column;
-  gap: 16px;
+  flex-direction: row;
+  gap: 3px;
 }
 
-.dashboard-view h1 {
-  font-size: 22px;
-  font-weight: 700;
-  margin-bottom: 4px;
+.zen-activity-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--zen-primary);
+  opacity: 0.15;
 }
 
-.dashboard-view > p {
-  color: var(--ink-muted);
-  font-size: 13px;
-  margin-bottom: 8px;
-}
+.zen-activity-dot.level-1 { opacity: 0.3; }
+.zen-activity-dot.level-2 { opacity: 0.5; }
+.zen-activity-dot.level-3 { opacity: 0.7; }
+.zen-activity-dot.level-4 { opacity: 1; }
 
-.dashboard-project-card {
-  background: var(--surface);
-  border: 1.5px solid var(--line);
-  border-radius: var(--radius);
-  padding: 16px;
-  cursor: pointer;
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-
-.dashboard-project-card:hover {
-  border-color: var(--accent);
-  box-shadow: var(--shadow-brutal);
-}
-
-.dashboard-project-card.expanded {
-  border-color: var(--accent);
-}
-
-.dashboard-project-header {
+.zen-activity-stats {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: row;
+  gap: 2rem;
+  margin-top: 1rem;
 }
 
-.dashboard-project-header h2 {
-  font-size: 16px;
-  font-weight: 600;
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dashboard-stats-row {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  color: var(--ink-muted);
-  margin-top: 6px;
-}
-
-.dashboard-stats-row span {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.dashboard-due-badge {
-  background: var(--accent-subtle);
-  color: var(--accent);
-  font-weight: 600;
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  white-space: nowrap;
-}
-
-.dashboard-expanded-body {
-  margin-top: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-/* Sparkline timeline */
-.dashboard-timeline {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 48px;
-  padding: 0 2px;
-}
-
-.dashboard-timeline-bar {
-  flex: 1;
-  min-width: 4px;
-  border-radius: 2px 2px 0 0;
-  transition: height 0.2s;
-  position: relative;
-}
-
-.dashboard-timeline-bar:hover::after {
-  content: attr(data-tip);
-  position: absolute;
-  bottom: calc(100% + 4px);
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--ink);
-  color: var(--surface);
+.zen-activity-stats .stat-label {
   font-size: 10px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  white-space: nowrap;
-  pointer-events: none;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--zen-on-surface-variant);
+  font-weight: 500;
 }
 
-.dashboard-timeline-label {
+.zen-activity-stats .stat-value {
+  font-family: var(--zen-font-headline);
+  font-size: 1.25rem;
+  font-weight: 500;
+  color: var(--zen-on-surface);
+}
+
+/* Section label & title */
+.zen-section-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--zen-on-surface-variant);
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}
+
+.zen-section-title {
+  font-family: var(--zen-font-headline);
+  font-size: 3rem;
+  font-weight: 300;
+  line-height: 1.1;
+  max-width: 600px;
+  margin-bottom: 3rem;
+  color: var(--zen-on-surface);
+}
+
+/* Grid layout */
+.zen-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2rem;
+}
+
+@media (max-width: 960px) {
+  .zen-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 600px) {
+  .zen-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .zen-workspace-card.featured {
+    grid-column: span 1;
+  }
+}
+
+/* Workspace card */
+.zen-workspace-card {
+  background: var(--zen-surface-lowest);
+  border-radius: 12px;
+  padding: 2rem;
+  transition: all 500ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(173, 179, 180, 0.1);
+}
+
+.zen-workspace-card:hover {
+  box-shadow: var(--zen-shadow);
+}
+
+.zen-workspace-card.featured {
+  grid-column: span 2;
+  padding: 2.5rem;
+}
+
+/* Card tag */
+.zen-card-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 500;
+  border-radius: 9999px;
+  padding: 2px 12px;
+  display: inline-block;
+  width: fit-content;
+  margin-bottom: 1rem;
+}
+
+.zen-card-tag.curriculum {
+  background: var(--zen-tertiary-container);
+  color: var(--zen-on-tertiary-container);
+}
+
+.zen-card-tag.research {
+  background: var(--zen-surface-container);
+  color: var(--zen-on-surface-variant);
+}
+
+/* Card meta */
+.zen-card-meta {
+  font-size: 10px;
+  color: var(--zen-on-surface-variant);
+  letter-spacing: 0.05em;
+  margin-bottom: 0.5rem;
+}
+
+/* Card title */
+.zen-card-title {
+  font-family: var(--zen-font-headline);
+  font-size: 1.25rem;
+  font-weight: 500;
+  color: var(--zen-on-surface);
+  transition: color 500ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  margin-bottom: 1rem;
+}
+
+.zen-workspace-card:hover .zen-card-title {
+  color: var(--zen-primary);
+}
+
+.zen-card-title.featured {
+  font-family: var(--zen-font-headline);
+  font-size: 1.75rem;
+}
+
+/* Card progress */
+.zen-card-progress {
+  margin-top: auto;
+}
+
+.zen-card-progress-track {
+  width: 100%;
+  height: 1.5px;
+  background: var(--zen-surface-container);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+
+.zen-card-progress-fill {
+  height: 100%;
+  background: var(--zen-primary);
+  border-radius: 9999px;
+  transition: width 500ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.zen-card-progress-label {
   display: flex;
   justify-content: space-between;
+  font-size: 12px;
+  font-weight: 500;
+  margin-top: 0.5rem;
+}
+
+.zen-card-progress-label .label-text {
+  color: var(--zen-on-surface-variant);
+}
+
+.zen-card-progress-label .label-value {
+  color: var(--zen-primary);
+}
+
+/* Card stats */
+.zen-card-stats {
   font-size: 10px;
-  color: var(--ink-faint);
-  margin-top: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--zen-on-surface-variant);
+  margin-top: 0.75rem;
 }
 
-/* Weak topics */
-.dashboard-weak-topics {
+/* New workspace card */
+.zen-new-card {
+  border: 2px dashed rgba(173, 179, 180, 0.3);
+  border-radius: 12px;
   display: flex;
+  align-items: center;
+  justify-content: center;
   flex-direction: column;
-  gap: 8px;
-}
-
-.dashboard-weak-topics h3 {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ink-muted);
-}
-
-.dashboard-topic-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 13px;
-}
-
-.dashboard-topic-name {
-  flex: 0 0 140px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 500;
-  text-transform: capitalize;
-}
-
-.dashboard-topic-bar-track {
-  flex: 1;
-  height: 8px;
-  background: var(--surface-alt);
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.dashboard-topic-bar-fill {
-  height: 100%;
-  border-radius: 4px;
-  transition: width 0.3s;
-}
-
-.dashboard-topic-pct {
-  flex: 0 0 36px;
-  text-align: right;
-  font-size: 12px;
-  font-weight: 600;
-  font-family: var(--font-mono);
-}
-
-/* Per-task breakdown */
-.dashboard-task-card {
-  background: var(--surface-alt);
-  border-radius: var(--radius-sm);
-  padding: 12px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 13px;
-}
-
-.dashboard-task-card .task-title {
-  flex: 1;
-  font-weight: 500;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dashboard-task-card .task-stats {
-  color: var(--ink-muted);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.dashboard-task-card .study-btn {
-  padding: 4px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  background: var(--accent);
-  color: white;
-  border: none;
-  border-radius: var(--radius-sm);
+  gap: 0.5rem;
+  padding: 2rem;
   cursor: pointer;
-  white-space: nowrap;
-}
-
-.dashboard-task-card .study-btn:hover {
-  background: var(--accent-hover);
-}
-
-.dashboard-weak-study-btn {
-  align-self: flex-start;
-  padding: 8px 16px;
+  background: transparent;
+  color: var(--zen-on-surface-variant);
   font-size: 13px;
-  font-weight: 600;
-  background: var(--accent);
-  color: white;
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
+  transition: all 500ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-.dashboard-weak-study-btn:hover {
-  background: var(--accent-hover);
+.zen-new-card:hover {
+  background: var(--zen-surface-lowest);
+  border-color: rgba(41, 103, 103, 0.3);
 }
 
-.dashboard-empty {
-  text-align: center;
-  color: var(--ink-faint);
-  font-size: 13px;
-  padding: 24px 0;
+/* Streak badge */
+.zen-streak-badge {
+  display: inline;
+  font-size: 10px;
+  color: var(--zen-on-surface-variant);
+  text-transform: uppercase;
+  letter-spacing: -0.02em;
 }
 
 /* ---- Document Canvas ---- */
@@ -3743,4 +3769,240 @@ textarea {
   border-color: rgba(220, 38, 38, 0.4);
   box-shadow: 2px 2px 0 rgba(220, 38, 38, 0.15);
   color: #B91C1C;
+}
+
+/* ================================================================
+   Zen Dashboard
+   ================================================================ */
+
+.zen-dashboard {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+/* ---- Activity heatmap bar ---- */
+
+.zen-activity-bar {
+  background: #f2f4f4;
+  border-radius: 0.75rem;
+  padding: 1.5rem 2rem;
+}
+
+.zen-activity-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.zen-headline {
+  font-family: "Manrope", sans-serif;
+  font-size: 1.75rem;
+  font-weight: 500;
+  color: #2d3435;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.zen-activity-stats {
+  display: flex;
+  gap: 0.625rem;
+  align-items: center;
+}
+
+.zen-stat-pill {
+  font-family: "Inter", sans-serif;
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #2d3435;
+  opacity: 0.6;
+}
+
+.zen-heatmap {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.zen-heatmap-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  transition: opacity 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.zen-heatmap-dot:hover {
+  transform: scale(1.4);
+}
+
+/* ---- Bento grid ---- */
+
+.zen-bento-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+/* ---- Workspace card ---- */
+
+.zen-workspace-card {
+  background: #ffffff;
+  border: none;
+  border-radius: 0.75rem;
+  padding: 1.5rem;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  box-shadow: 0px 12px 32px rgba(45, 52, 53, 0.06);
+  transition:
+    transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1),
+    box-shadow 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+  font-family: "Inter", sans-serif;
+  min-height: 140px;
+}
+
+.zen-workspace-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0px 16px 40px rgba(45, 52, 53, 0.10);
+}
+
+.zen-workspace-card:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.zen-workspace-card:disabled:hover {
+  transform: none;
+  box-shadow: 0px 12px 32px rgba(45, 52, 53, 0.06);
+}
+
+.zen-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.zen-card-name {
+  font-family: "Manrope", sans-serif;
+  font-size: 1rem;
+  font-weight: 500;
+  color: #2d3435;
+  margin: 0;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.zen-card-badge {
+  font-family: "Inter", sans-serif;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  color: #296767;
+  background: rgba(41, 103, 103, 0.08);
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.zen-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+  margin-top: auto;
+}
+
+.zen-card-meta {
+  display: flex;
+  gap: 0.625rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.zen-label {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #2d3435;
+  opacity: 0.5;
+  letter-spacing: 0.02em;
+}
+
+.zen-label-due {
+  color: #296767;
+  opacity: 0.85;
+  font-weight: 600;
+}
+
+.zen-accuracy-row {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+
+.zen-accuracy-value {
+  font-family: "Manrope", sans-serif;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #2d3435;
+  min-width: 2.5rem;
+}
+
+.zen-progress-track {
+  flex: 1;
+  height: 3px;
+  background: #f2f4f4;
+  border-radius: 9999px;
+  overflow: hidden;
+}
+
+.zen-progress-fill {
+  height: 100%;
+  background: #296767;
+  border-radius: 9999px;
+  transition: width 0.4s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* ---- New workspace card ---- */
+
+.zen-add-card {
+  background: transparent;
+  border: 2px dashed rgba(45, 52, 53, 0.12);
+  box-shadow: none;
+  align-items: center;
+  justify-content: center;
+  gap: 0.625rem;
+  transition:
+    border-color 0.2s cubic-bezier(0.2, 0.8, 0.2, 1),
+    background 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.zen-add-card:hover {
+  border-color: #296767;
+  background: rgba(41, 103, 103, 0.03);
+  transform: none;
+  box-shadow: none;
+}
+
+.zen-add-label {
+  font-family: "Inter", sans-serif;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: #296767;
+  opacity: 0.8;
 }
