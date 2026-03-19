@@ -248,11 +248,13 @@ export class StuartRuntime {
       `[stuart] detected stale turn (${staleSecs}s idle, ${taskTurns.length} task turn(s) in-flight). Reconnecting...\n`
     );
 
-    // Notify the user for each stalled task turn
+    // Collect stalled turns for retry
+    const retryQueue: Array<{ taskId: string; message: string }> = [];
+
     for (const state of taskTurns) {
       this.recordRuntimeMessage(
         state.taskId,
-        "Stuart's connection stalled. Reconnecting automatically — you can resend your last message."
+        "Stuart's connection stalled. Reconnecting and retrying automatically..."
       );
       this.emitEvent({
         type: "codex.turn.completed",
@@ -262,6 +264,9 @@ export class StuartRuntime {
         status: "failed",
         error: "Turn timed out — connection stalled."
       });
+      if (state.userMessage) {
+        retryQueue.push({ taskId: state.taskId, message: state.userMessage });
+      }
     }
 
     // Clear all in-flight turns
@@ -273,6 +278,24 @@ export class StuartRuntime {
       await this.codex.reconnect();
     } catch (err) {
       process.stderr.write(`[stuart] reconnect failed: ${String(err)}\n`);
+      return;
+    }
+
+    // Auto-retry the stalled messages (one at a time)
+    for (const retry of retryQueue) {
+      try {
+        this.recordRuntimeMessage(retry.taskId, "Retrying your last message...");
+        this.emitEvent({
+          type: "task.message",
+          taskId: retry.taskId
+        });
+        await this.sendTaskMessage(retry.taskId, retry.message);
+      } catch (retryErr) {
+        this.recordRuntimeMessage(
+          retry.taskId,
+          `Retry failed: ${String(retryErr)}. Please resend your message manually.`
+        );
+      }
     }
   }
 
@@ -721,16 +744,18 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     }
 
     // Determine model + effort per turn based on what's needed.
-    // Skills that generate code or do deep research → flagship gpt-5.4 + high effort.
+    // Code generation and interactive apps → flagship gpt-5.4 + high effort.
+    // Research → gpt-5.4-mini at high effort (fetching + writing doesn't need flagship).
     // Everything else → gpt-5.4-mini (set on thread) with dynamic effort.
     const needsFlagship = skills.some((skill) =>
       skill.requiresSandbox
-      || skill.id === "research"
       || skill.id === "interactive"
     );
+    const isResearch = skills.some((skill) => skill.id === "research");
     const isSimpleQuery = /^explain|^what is|^define|^describe|^tell me about/i.test(trimmed) && trimmed.length < 200;
     const turnModel = needsFlagship ? "gpt-5.4" : undefined; // undefined = use thread default (mini)
     const effort = needsFlagship ? "high"
+      : isResearch ? "high"
       : isSimpleQuery ? "low"
       : isLargeMaterialSet && !targetedFiles.length ? "high"
       : "medium";
@@ -792,9 +817,16 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     });
 
     // For large material sets with complex queries, spawn parallel explore workers
-    if (isLargeMaterialSet && !targetedFiles.length && !isSimpleQuery) {
+    if (isLargeMaterialSet && !targetedFiles.length && !isSimpleQuery && !isResearch) {
       void this.spawnExploreWorkers(task, context, trimmed).catch(() => {
         // Non-critical — the main turn will still work
+      });
+    }
+
+    // For research tasks, spawn research workers to fetch content in parallel
+    if (isResearch) {
+      void this.spawnResearchWorkers(task, context, trimmed).catch(() => {
+        // Non-critical — the main turn will still handle research
       });
     }
 
@@ -1298,6 +1330,62 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       agentId: "explore-swarm",
       status: "running",
       label: `Exploring ${docs.length} sources across ${maxWorkers} agents`,
+    });
+  }
+
+  /**
+   * Spawn parallel research workers to fetch content from the web.
+   * Each worker handles a specific research subtask (Tier 1 sources, repo analysis, etc.)
+   * so the main thread can focus on synthesis and writing.
+   */
+  private async spawnResearchWorkers(
+    task: TaskSpec,
+    context: TaskExecutionContext,
+    question: string
+  ): Promise<void> {
+    // Extract URLs from the student's message
+    const urlPattern = /https?:\/\/[^\s)]+/gi;
+    const urls = question.match(urlPattern) ?? [];
+    const hasGithub = urls.some((u) => u.includes("github.com"));
+
+    const workers: Array<{ role: string; objective: string }> = [];
+
+    // Worker 1: Fetch Tier 1 educational sources
+    workers.push({
+      role: "researcher",
+      objective: `Search the web for the best Tier 1 educational sources on: "${question}". Focus on university course materials (CS231N, fast.ai, MIT OCW), official documentation (PyTorch, TensorFlow), and authoritative textbooks (D2L, Deep Learning Book). For each good source found, use curl to fetch the full content and save it as a file in the research/ directory. Save at least 3-5 high-quality source files. Use \`wc -l\` to verify each file has substantial content (>100 lines).`,
+    });
+
+    // Worker 2: Fetch secondary sources and references
+    workers.push({
+      role: "researcher",
+      objective: `Search the web for Tier 2 educational sources on: "${question}". Focus on well-known technical blogs (Andrej Karpathy, Lilian Weng, Jay Alammar, Sebastian Raschka, Distill.pub), conference tutorials, and interactive notebooks. For each good source, use curl to fetch content and save to research/ directory. Also compile a references.md with links to the best video lectures (with durations), interactive notebooks (Colab/Kaggle), and recommended textbooks.`,
+    });
+
+    // Worker 3: If a GitHub URL was provided, deep-dive the repo
+    if (hasGithub) {
+      const repoUrl = urls.find((u) => u.includes("github.com")) ?? "";
+      workers.push({
+        role: "researcher",
+        objective: `Clone and analyze the repository: ${repoUrl}. Read the README, key source files, and documentation. Write a detailed analysis of the codebase architecture, key concepts it demonstrates, and how it connects to the broader topic. Save your analysis as research/repo-analysis.md. Include code snippets with explanations.`,
+      });
+    }
+
+    const workerPromises = workers.map((w) =>
+      this.createTaskWorker(task.id, {
+        role: w.role,
+        objective: w.objective,
+        taskRunId: context.taskRun?.id,
+      }).then(() => undefined)
+    );
+
+    await Promise.allSettled(workerPromises);
+    this.emitEvent({
+      type: "task.agent",
+      taskId: task.id,
+      agentId: "research-swarm",
+      status: "running",
+      label: `Researching with ${workers.length} parallel agents`,
     });
   }
 
@@ -2745,7 +2833,7 @@ function buildStudentMemoryContext(db: LocalDatabase | undefined, projectId: str
   }
 }
 
-function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: LocalDatabase): string {
+export function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: LocalDatabase): string {
   // Build structured student memory context from SQLite
   const memoryContext = buildStudentMemoryContext(db, task.projectId);
 
@@ -2766,14 +2854,33 @@ function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: 
   // Lightweight performance snapshot
   const perfSnapshot = db ? buildPerformanceSnapshot(db, task) : "";
 
-  return `You are Stuart, an interactive study tutor inside a local workspace.
+  return `You are Stuart, the student's study companion, guide, and subject-matter expert inside a local workspace.
+
+## Role
+- Act like a strong domain expert in whatever the student is studying in this workspace.
+- Use subject-matter expertise to explain concepts accurately, connect ideas, choose good examples, and highlight what matters most.
+- Stay grounded in the student's local material for course-specific claims. If you use general domain knowledge or web research, label that clearly.
+- Your job is to help the student learn efficiently, not to show off or dump everything you know.
+
+## Teaching style
+- Be concise, effective, and digestible by default.
+- Start with the direct answer or core takeaway in 1 to 2 sentences.
+- Then give a short structured explanation using brief bullets or short paragraphs.
+- Prefer simple language, clean structure, and concrete examples over dense jargon.
+- Break difficult ideas into layers: overview -> key mechanism -> important detail.
+- Avoid walls of text, long preambles, filler, and raw excerpt dumps.
+- Only go deep when the student asks for depth or when the concept genuinely requires it.
+- When helpful, end with one useful next step, memory hook, or quick check for understanding. Do not turn every answer into homework.
 
 ## Core behaviour
-- Teach from the workspace evidence. Stay grounded in indexed material.
-- If the evidence does not cover the question, say so honestly.
+- Use your domain expertise to enrich and improve on what the workspace materials provide — add better examples, clearer explanations, and deeper context.
+- When your knowledge conflicts with the workspace evidence, default to the workspace evidence. The student's course materials are the authority for course-specific claims.
+- Diagnose what the student is probably trying to understand, not just the literal wording of the question.
+- If neither the workspace nor your domain knowledge covers the question, say so honestly.
 - Cite sources by name. Prefer lecture slides, chapters, notes, and study guides over code/config files.
-- Synthesize concepts clearly — don't dump raw excerpts. Use markdown with headings and bullets.
-- When the student references a specific chapter/lecture/week number, search for matching filenames first (e.g. "Lecture 01", "Chapter 1") before exploring broadly.
+- Synthesize concepts clearly instead of listing files or pasting raw excerpts.
+- When the student references a specific chapter, lecture, week, or worksheet, search for matching filenames first (e.g. "Lecture 01", "Chapter 1") before exploring broadly.
+- If the question is broad, give the student the clean mental model first, then the most important supporting details.
 
 ## Web research
 You have web search enabled. Use it when:

@@ -1001,6 +1001,40 @@ textarea {
   font-size: 13px;
 }
 
+/* Inline tool status — single updating line */
+.zen-inline-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  align-self: flex-start;
+}
+
+.zen-inline-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--zen-primary, #296767);
+  opacity: 0.5;
+  animation: zen-pulse 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes zen-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.8; }
+}
+
+.zen-inline-status-text {
+  font-size: 12px;
+  color: var(--zen-on-surface-variant, #5a6061);
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 500px;
+}
+
 /* Activity summary in chat */
 .zen-activity-summary {
   margin: 4px 0;

@@ -199,6 +199,7 @@ function App() {
   const [tasks, setTasks] = useState<TaskSpec[]>([]);
   const [taskRuns, setTaskRuns] = useState<Record<string, TaskRunRecord[]>>({});
   const [workersByTask, setWorkersByTask] = useState<Record<string, TaskWorkerRecord[]>>({});
+  const [toolLogByTask, setToolLogByTask] = useState<Record<string, string[]>>({});
   const [agentActivityByTask, setAgentActivityByTask] = useState<Record<string, AgentActivity[]>>(
     {}
   );
@@ -751,20 +752,30 @@ function App() {
 
       case "codex.turn.started":
         setThinkingState({ taskId: event.taskId, label: "Stuart is thinking...", recentActions: [] });
+        setToolLogByTask((cur) => ({ ...cur, [event.taskId]: [] }));
         setStreamingDelta(null);
         return;
 
-      case "codex.thinking":
+      case "codex.thinking": {
+        const newLabel = event.label || "Analyzing your materials...";
         setThinkingState((cur) => {
-          const newLabel = event.label || "Analyzing your materials...";
           const prev = cur?.taskId === event.taskId ? cur.recentActions : [];
-          // Add to log if it's a different action than the current label
           const updated = cur && cur.label !== newLabel && cur.label !== "Stuart is thinking..."
             ? [...prev, cur.label].slice(-5)
             : prev;
           return { taskId: event.taskId, label: newLabel, recentActions: updated };
         });
+        // Also accumulate into the inline tool log (skip generic labels)
+        if (newLabel !== "Stuart is thinking..." && newLabel !== "Analyzing your materials..." && newLabel !== "Working..." && newLabel !== "Processing results...") {
+          setToolLogByTask((cur) => {
+            const prev = cur[event.taskId] ?? [];
+            // Don't add duplicates
+            if (prev.length > 0 && prev[prev.length - 1] === newLabel) return cur;
+            return { ...cur, [event.taskId]: [...prev, newLabel] };
+          });
+        }
         return;
+      }
 
       case "codex.message.delta":
         setStreamingDelta((cur) => {
@@ -782,6 +793,7 @@ function App() {
       case "codex.message.completed":
         setThinkingState((cur) => (cur?.taskId === event.taskId ? null : cur));
         setStreamingDelta((cur) => (cur?.taskId === event.taskId ? null : cur));
+        setToolLogByTask((cur) => ({ ...cur, [event.taskId]: [] }));
         setMessagesByTask((cur) => ({
           ...cur,
           [event.taskId]: upsertMessage(cur[event.taskId] ?? [], event.message)
@@ -1315,6 +1327,16 @@ function App() {
                       </article>
                     );
                   })() : null}
+
+                  {/* Inline tool status — single updating line */}
+                  {selectedTask && (toolLogByTask[selectedTask.id]?.length ?? 0) > 0 && (
+                    <div className="zen-inline-status">
+                      <span className="zen-inline-status-dot" />
+                      <span className="zen-inline-status-text">
+                        {toolLogByTask[selectedTask.id]![toolLogByTask[selectedTask.id]!.length - 1]}
+                      </span>
+                    </div>
+                  )}
 
                   {/* Thinking State */}
                   {thinkingState?.taskId === selectedTask.id && !isStreaming ? (
