@@ -1657,6 +1657,12 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
           return;
         }
 
+        // Memory extraction turns: capture text but don't store as a chat message
+        if (state?.memoryExtraction) {
+          state.assistantText = params.item.text;
+          return;
+        }
+
         // Store the final assistant text for artifact detection in turn/completed
         if (state) {
           state.assistantText = params.item.text;

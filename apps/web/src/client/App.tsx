@@ -351,35 +351,16 @@ function App() {
   // Group messages: consecutive system messages between user/assistant turns become a single activity group
   const visibleMessages = useMemo(() => {
     type VisibleItem = TaskMessageRecord | { role: "activity"; messages: TaskMessageRecord[]; id: string };
-    const result: VisibleItem[] = [];
-    let pendingSystem: TaskMessageRecord[] = [];
-
-    function flushSystem() {
-      if (pendingSystem.length === 0) return;
-      // Filter to only interesting system messages
-      const interesting = pendingSystem.filter((m) => {
-        const c = m.content;
-        return c.includes("Running") || c.includes("Command") || c.includes("tool") || c.includes("connector")
-          || c.includes("Loaded skill") || c.includes("Skill hint") || c.includes("Generated") || c.includes("Synced")
-          || c.includes("Re-indexed") || c.includes("Detected") || c.includes("sandbox")
-          || c.includes("extracted") || c.includes("memor");
-      });
-      if (interesting.length > 0) {
-        result.push({ role: "activity", messages: interesting, id: `activity-${interesting[0]!.id}` });
+    return selectedMessages.filter((msg) => {
+      if (msg.role === "system") return false;
+      // Hide memory extraction responses (raw JSON arrays from ephemeral threads)
+      if (msg.role === "assistant") {
+        const t = msg.content.trim();
+        if (t.startsWith("[") && t.includes("scope_type") && t.includes("memory_key")) return false;
+        if (t === "[]") return false;
       }
-      pendingSystem = [];
-    }
-
-    for (const msg of selectedMessages) {
-      if (msg.role === "system") {
-        pendingSystem.push(msg);
-      } else {
-        flushSystem();
-        result.push(msg);
-      }
-    }
-    flushSystem();
-    return result;
+      return true;
+    });
   }, [selectedMessages]);
 
   const selectedWorkspaceScopeKey = selectedTask
@@ -1301,13 +1282,9 @@ function App() {
               ) : (
                 <>
                   {/* Messages */}
-                  {visibleMessages.map((item) =>
-                    "messages" in item && item.role === "activity" ? (
-                      <ActivitySummary key={item.id} messages={item.messages} />
-                    ) : (
-                      <ChatBubble key={(item as TaskMessageRecord).id} message={item as TaskMessageRecord} />
-                    )
-                  )}
+                  {visibleMessages.map((message) => (
+                    <ChatBubble key={message.id} message={message} />
+                  ))}
 
                   {/* Streaming Response */}
                   {isStreaming && streamingDelta ? (() => {
@@ -2220,52 +2197,6 @@ function ArtifactMenu({ onDelete }: { onDelete: () => void }) {
           >
             Delete
           </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ActivitySummary({ messages }: { messages: TaskMessageRecord[] }) {
-  const [expanded, setExpanded] = useState(false);
-
-  // Categorize and count
-  const counts = useMemo(() => {
-    let commands = 0, skills = 0, files = 0, other = 0;
-    for (const m of messages) {
-      const c = m.content;
-      if (c.includes("Running") || c.includes("Command")) commands++;
-      else if (c.includes("skill") || c.includes("Skill")) skills++;
-      else if (c.includes("Generated") || c.includes("Synced") || c.includes("file") || c.includes("sandbox")) files++;
-      else other++;
-    }
-    return { commands, skills, files, other };
-  }, [messages]);
-
-  const parts: string[] = [];
-  if (counts.skills > 0) parts.push(`${counts.skills} skill${counts.skills > 1 ? "s" : ""}`);
-  if (counts.commands > 0) parts.push(`${counts.commands} command${counts.commands > 1 ? "s" : ""}`);
-  if (counts.files > 0) parts.push(`${counts.files} output${counts.files > 1 ? "s" : ""}`);
-  if (counts.other > 0) parts.push(`${counts.other} action${counts.other > 1 ? "s" : ""}`);
-
-  return (
-    <div className="zen-activity-summary">
-      <button
-        className="zen-activity-toggle"
-        type="button"
-        onClick={() => setExpanded((v) => !v)}
-      >
-        <span className="zen-activity-chevron" style={{ transform: expanded ? "rotate(90deg)" : undefined }}>&#x25B8;</span>
-        <span className="zen-activity-label">
-          Stuart used {messages.length} tool{messages.length !== 1 ? "s" : ""}
-          {parts.length > 0 && <span className="zen-activity-parts"> · {parts.join(" · ")}</span>}
-        </span>
-      </button>
-      {expanded && (
-        <div className="zen-activity-details">
-          {messages.map((m) => (
-            <div key={m.id} className="zen-activity-line">{m.content}</div>
-          ))}
         </div>
       )}
     </div>
