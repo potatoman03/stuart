@@ -3477,8 +3477,11 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 2rem;
-  flex-wrap: wrap;
+  gap: 1.5rem;
+}
+
+@media (max-width: 800px) {
+  .zen-activity-row { flex-wrap: wrap; }
 }
 
 .zen-activity-label-group {
@@ -3554,17 +3557,17 @@ textarea {
 
 /* Hero headline */
 .zen-hero {
-  margin-bottom: 3rem;
+  margin-bottom: 2rem;
 }
 
 .zen-hero-title {
   font-family: var(--zen-font-headline);
-  font-size: 3rem;
+  font-size: 2.5rem;
   font-weight: 300;
   line-height: 1.15;
   color: var(--zen-on-surface);
-  max-width: 600px;
-  margin: 0.75rem 0 0;
+  max-width: 500px;
+  margin: 0.5rem 0 0;
 }
 
 .zen-hero-title em {
@@ -3588,18 +3591,17 @@ textarea {
 
 /* Workspace cards */
 .zen-workspace-card {
+  all: unset;
+  box-sizing: border-box;
   background: var(--zen-surface-lowest);
   border-radius: 12px;
   padding: 2rem;
   display: flex;
   flex-direction: column;
-  gap: 0;
   cursor: pointer;
   border: 1px solid rgba(173, 179, 180, 0.1);
   text-align: left;
-  transition:
-    box-shadow 500ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    transform 500ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: box-shadow 500ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .zen-workspace-card:hover {
@@ -3627,6 +3629,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
 .zen-card-tag {
@@ -3636,6 +3639,7 @@ textarea {
   letter-spacing: 0.12em;
   padding: 3px 12px;
   border-radius: 999px;
+  line-height: 1.4;
 }
 
 .zen-card-tag.curriculum {
@@ -3656,8 +3660,8 @@ textarea {
 }
 
 .zen-card-icon {
-  width: 44px;
-  height: 44px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   border: 1px solid rgba(173, 179, 180, 0.2);
   display: flex;
@@ -3688,21 +3692,23 @@ textarea {
   font-size: 0.8125rem;
   color: var(--zen-on-surface-variant);
   line-height: 1.5;
-  margin: 0 0 1rem;
+  margin: 0 0 0.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Card footer */
 .zen-card-footer {
   margin-top: auto;
-  padding-top: 1.5rem;
+  padding-top: 1rem;
 }
 
 .zen-card-due {
-  font-size: 0.8125rem;
+  font-size: 0.75rem;
   font-weight: 600;
   color: var(--zen-primary);
   margin-bottom: 0.5rem;
-  display: block;
 }
 
 .zen-card-progress-row {
@@ -3714,13 +3720,14 @@ textarea {
 .zen-card-accuracy {
   font-size: 0.8125rem;
   font-weight: 600;
-  color: var(--zen-primary);
+  color: var(--zen-on-surface-variant);
   flex-shrink: 0;
+  min-width: 32px;
 }
 
 .zen-progress-track {
   flex: 1;
-  height: 3px;
+  height: 4px;
   background: var(--zen-surface-low);
   border-radius: 999px;
   overflow: hidden;
@@ -3731,10 +3738,13 @@ textarea {
   background: var(--zen-primary);
   border-radius: 999px;
   transition: width 700ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  min-width: 2px;
 }
 
 /* Add card */
 .zen-add-card {
+  all: unset;
+  box-sizing: border-box;
   border: 2px dashed rgba(173, 179, 180, 0.3);
   border-radius: 12px;
   padding: 2rem;
