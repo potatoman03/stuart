@@ -63,6 +63,7 @@ type SystemDiagnostics = {
 type ThinkingState = {
   taskId: string;
   label: string;
+  recentActions: string[];
 };
 
 type StreamingDelta = {
@@ -749,12 +750,20 @@ function App() {
         return;
 
       case "codex.turn.started":
-        setThinkingState({ taskId: event.taskId, label: "Stuart is thinking..." });
+        setThinkingState({ taskId: event.taskId, label: "Stuart is thinking...", recentActions: [] });
         setStreamingDelta(null);
         return;
 
       case "codex.thinking":
-        setThinkingState({ taskId: event.taskId, label: event.label || "Analyzing your materials..." });
+        setThinkingState((cur) => {
+          const newLabel = event.label || "Analyzing your materials...";
+          const prev = cur?.taskId === event.taskId ? cur.recentActions : [];
+          // Add to log if it's a different action than the current label
+          const updated = cur && cur.label !== newLabel && cur.label !== "Stuart is thinking..."
+            ? [...prev, cur.label].slice(-5)
+            : prev;
+          return { taskId: event.taskId, label: newLabel, recentActions: updated };
+        });
         return;
 
       case "codex.message.delta":
@@ -848,7 +857,7 @@ function App() {
       });
 
       // Send the initial ingest message
-      setThinkingState({ taskId: created.id, label: "Analyzing your materials..." });
+      setThinkingState({ taskId: created.id, label: "Analyzing your materials...", recentActions: [] });
 
       const result = await request<SendMessageResponse>(`/api/tasks/${created.id}/messages`, {
         method: "POST",
@@ -884,7 +893,7 @@ function App() {
     if (selectedTask) {
       try {
         setBusy("message");
-        setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking..." });
+        setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking...", recentActions: [] });
         const result = await request<SendMessageResponse>(
           `/api/tasks/${selectedTask.id}/messages`,
           { method: "POST", body: JSON.stringify({ content: prompt }) }
@@ -915,7 +924,7 @@ function App() {
     void (async () => {
       try {
         setBusy("message");
-        setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking..." });
+        setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking...", recentActions: [] });
         const result = await request<SendMessageResponse>(
           `/api/tasks/${selectedTask.id}/messages`,
           { method: "POST", body: JSON.stringify({ content: prompt }) }
@@ -939,7 +948,7 @@ function App() {
   async function sendTaskMessage(taskId: string, content: string) {
     try {
       setBusy("message");
-      setThinkingState({ taskId, label: "Stuart is thinking..." });
+      setThinkingState({ taskId, label: "Stuart is thinking...", recentActions: [] });
       const result = await request<SendMessageResponse>(
         `/api/tasks/${taskId}/messages`,
         { method: "POST", body: JSON.stringify({ content }) }
@@ -1309,7 +1318,7 @@ function App() {
 
                   {/* Thinking State */}
                   {thinkingState?.taskId === selectedTask.id && !isStreaming ? (
-                    <ThinkingBubble label={thinkingState.label} activities={agentActivityByTask[selectedTask.id]} />
+                    <ThinkingBubble label={thinkingState.label} recentActions={thinkingState.recentActions} activities={agentActivityByTask[selectedTask.id]} />
                   ) : null}
                 </>
               )}
@@ -1469,7 +1478,7 @@ function App() {
                           void (async () => {
                             try {
                               setBusy("message");
-                              setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking..." });
+                              setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking...", recentActions: [] });
                               const result = await request<SendMessageResponse>(
                                 `/api/tasks/${selectedTask.id}/messages`,
                                 { method: "POST", body: JSON.stringify({ content: prompt }) }
@@ -1502,7 +1511,7 @@ function App() {
                         void (async () => {
                           try {
                             setBusy("message");
-                            setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking..." });
+                            setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking...", recentActions: [] });
                             const result = await request<SendMessageResponse>(
                               `/api/tasks/${selectedTask.id}/messages`,
                               { method: "POST", body: JSON.stringify({ content: prompt }) }
@@ -2358,14 +2367,21 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
   );
 }
 
-function ThinkingBubble({ label, activities }: { label: string; activities?: AgentActivity[] }) {
+function ThinkingBubble({ label, recentActions, activities }: { label: string; recentActions?: string[]; activities?: AgentActivity[] }) {
   const running = activities?.filter(a => a.status === "running") ?? [];
   return (
     <article className="thinking-bubble">
       <div className="thinking-spinner" />
-      <div>
+      <div className="thinking-content">
         <span className="chat-label">Stuart</span>
         <p>{label}</p>
+        {(recentActions && recentActions.length > 0) && (
+          <div className="thinking-log">
+            {recentActions.map((action, i) => (
+              <span key={i} className="thinking-log-item">{action}</span>
+            ))}
+          </div>
+        )}
         {running.length > 0 && (
           <div className="thinking-activities">
             {running.map(a => (

@@ -1122,6 +1122,25 @@ textarea {
   color: var(--ink-muted);
 }
 
+.thinking-log {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--zen-surface-container, #ebeeef);
+}
+
+.thinking-log-item {
+  font-size: 11px;
+  color: var(--zen-on-surface-variant, #5a6061);
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 400px;
+}
+
 .thinking-activities {
   display: flex;
   flex-direction: column;
