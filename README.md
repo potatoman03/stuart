@@ -92,7 +92,10 @@ What works today:
 - persistent tasks, runs, messages, workers, and artifacts in SQLite
 - retrieval support over indexed local content
 - previews for PDF, DOCX, XLSX, JSX, HTML, images, and text
-- artifact generation for flashcards, quiz, mind map, diagram, interactive, mock exam, and document (PDF/DOCX/XLSX/PPTX) flows
+- artifact generation for flashcards, quiz (MCQ + MRQ), mind map, diagram, interactive, mock exam, and document (PDF/DOCX/XLSX/PPTX) flows
+- structured student memory with automatic fact extraction, performance tracking, and cross-session persistence
+- mastery-based curriculum progression with checkpoints and targeted quizzes
+- quiz checking agent that validates answers before students see them
 - document generation via sandbox-executed scripts (reportlab, python-docx) or JSON-to-binary renderers (pdfkit, docx, pptxgenjs)
 - research and curriculum builder: web search, repo cloning, article fetching, curated source files saved to workspace, phased learning plans
 - auto-reindex after research turns so new materials are immediately available for study artifacts
@@ -242,14 +245,14 @@ Codex integration:
 - Stuart launches `codex app-server` over WebSockets.
 - Each study session persists a main thread id.
 - Model routing: Stuart selects the model and effort per turn based on what's needed:
-  - **Main teaching thread**: `gpt-5.4-mini` (thread default)
-  - **Research / curriculum turns**: `gpt-5.4` at `high` effort (flagship for deep reasoning + web search)
-  - **Scripted document generation**: `gpt-5.4` at `high` effort (code gen needs flagship quality)
-  - **Interactive artifact generation**: `gpt-5.4` at `high` effort (HTML/JS code gen)
+  - **Scripted document generation** (Python/JS): `gpt-5.4` at `high` effort (only use case for flagship)
+  - **Research / curriculum turns**: `gpt-5.4-mini` at `high` effort
+  - **Interactive artifact generation**: `gpt-5.4-mini` at `high` effort
   - **Simple Q&A** ("what is X"): `gpt-5.4-mini` at `low` effort
   - **Normal study turns**: `gpt-5.4-mini` at `medium` effort
-  - **Explorer workers** (parallel file scanning): `gpt-5.4-mini` at `medium` effort
-- Skill matching is regex-based as a boost: when matched, detailed skill prompts are injected as turn context. The system prompt also describes all capabilities so the LLM can self-select when regex misses.
+  - **Explorer / research workers**: `gpt-5.4-mini` at `medium` effort
+- Skill matching uses priority-based regex with intent detection. Detailed skill prompts are injected as turn context when matched.
+- Stale turn watchdog: if no Codex activity for 5 minutes with turns in-flight, auto-reconnects and retries the last message.
 - On shutdown, Stuart cleans up child `codex app-server` processes (SIGINT/SIGTERM handlers).
 
 Retrieval:
@@ -272,8 +275,30 @@ Artifacts:
 Research:
 
 - The `research` skill instructs the LLM to search the web, clone repos, fetch articles, and save curated markdown files to `sources/` in the workspace.
-- A `curriculum.md` with phased learning path is generated alongside.
+- Parallel research workers fetch Tier 1 sources, Tier 2 sources, and repo analysis simultaneously.
+- A `curriculum.json` (machine-readable) and `curriculum.md` (human-readable) with phased learning paths and checkpoints are generated.
 - After a research turn completes, files are synced from staging to the project root and the ingestion index is rebuilt.
+
+Student memory:
+
+- Structured cross-session memory in SQLite replaces the old flat `.stuart-memory.md` file.
+- Automatic fact extraction after substantive turns via ephemeral `gpt-5.4-mini` calls.
+- Performance-to-memory pipeline: quiz and flashcard scores automatically become progress memories.
+- Scoped (global preferences vs project-specific progress), with contradiction resolution and expiry.
+- Injected into the teaching prompt as a compact "About this student" block (~200 tokens).
+
+Curriculum:
+
+- `curriculum.json` defines phases with checkpoints — each checkpoint is a testable concept.
+- Students can say "check my understanding of Phase 1" to take a targeted checkpoint quiz.
+- Progress tracked in `curriculum-progress.json` in the workspace.
+- Curriculum state injected into the teaching prompt so Stuart knows where the student is.
+
+Quiz quality:
+
+- MRQ (multiple response questions) supported alongside single-answer MCQ.
+- Post-generation checking agent validates every answer via an ephemeral `gpt-5.4-mini` call.
+- Incorrect answers are fixed in-place before the student sees them.
 
 Dependency surfaces:
 
