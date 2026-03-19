@@ -924,11 +924,16 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     let progress = null;
 
     for (const root of roots) {
+      // Check for curriculum.json first, fall back to curriculum.md existence
       const specPath = join(root, "curriculum.json");
       if (!spec && existsSync(specPath)) {
         try {
           spec = JSON.parse(await readFile(specPath, "utf8"));
         } catch { /* ignore */ }
+      }
+      if (!spec && existsSync(join(root, "curriculum.md"))) {
+        // curriculum.md exists but no JSON spec — mark as existing but without structured data
+        spec = { title: "Curriculum", phases: [] };
       }
       const progressPath = join(root, "curriculum-progress.json");
       if (!progress && existsSync(progressPath)) {

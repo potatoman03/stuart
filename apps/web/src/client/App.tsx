@@ -1953,109 +1953,123 @@ function DashboardView({
 
   return (
     <div className="zen-dashboard">
-      {/* Activity heatmap bar */}
-      <section className="zen-activity-bar">
-        <div className="zen-activity-header">
-          <h1 className="zen-headline">Your Studio</h1>
-          <div className="zen-activity-stats">
-            {globalStats.streakDays > 0 && (
-              <span className="zen-stat-pill">
-                {globalStats.streakDays}-day streak
-              </span>
-            )}
-            <span className="zen-stat-pill">
-              {globalStats.totalReviews} reviews
-            </span>
+      {/* Activity pulse bar */}
+      <section className="zen-activity-section">
+        <div className="zen-activity-row">
+          <div className="zen-activity-label-group">
+            <span className="zen-section-label">Engagement Pulse</span>
+            <span className="zen-activity-title">Daily Activity</span>
           </div>
-        </div>
-        <div className="zen-heatmap">
-          {aggregatedTimeline.map((day) => {
-            const opacity = day.reviews === 0
-              ? 0.08
-              : Math.min(0.2 + (day.reviews / maxReviews) * 0.8, 1);
-            return (
-              <div
-                key={day.date}
-                className="zen-heatmap-dot"
-                style={{
-                  backgroundColor: day.reviews === 0
-                    ? "#2d3435"
-                    : "#296767",
-                  opacity,
-                }}
-                title={`${day.date}: ${day.reviews} reviews`}
-              />
-            );
-          })}
+          <div className="zen-heatmap-wrap">
+            <div className="zen-heatmap">
+              {aggregatedTimeline.map((day) => {
+                const opacity = day.reviews === 0
+                  ? 0.08
+                  : Math.min(0.25 + (day.reviews / maxReviews) * 0.75, 1);
+                return (
+                  <div
+                    key={day.date}
+                    className="zen-heatmap-dot"
+                    style={{
+                      backgroundColor: day.reviews === 0 ? "var(--zen-on-surface)" : "var(--zen-primary)",
+                      opacity,
+                    }}
+                    title={`${day.date}: ${day.reviews} reviews`}
+                  />
+                );
+              })}
+            </div>
+            {globalStats.streakDays > 0 && (
+              <span className="zen-streak-pill">Current Streak: {globalStats.streakDays} Days</span>
+            )}
+          </div>
+          <div className="zen-stat-group">
+            <div className="zen-stat">
+              <span className="zen-section-label">Reviews</span>
+              <span className="zen-stat-value">{globalStats.totalReviews}</span>
+            </div>
+            <div className="zen-stat">
+              <span className="zen-section-label">Workspaces</span>
+              <span className="zen-stat-value">{projects.length}</span>
+            </div>
+          </div>
         </div>
       </section>
 
+      {/* Hero headline */}
+      <div className="zen-hero">
+        <span className="zen-section-label" style={{ color: "var(--zen-primary)" }}>Your Workspaces</span>
+        <h2 className="zen-hero-title">
+          Your focused study{" "}<em>ecosystems.</em>
+        </h2>
+      </div>
+
       {/* Workspace bento grid */}
       <section className="zen-bento-grid">
-        {workspaces.map(({ project, summary, firstTask, hasCurriculum }) => (
-          <button
-            key={project.id}
-            type="button"
-            className="zen-workspace-card"
-            onClick={() => firstTask && onSelectTask(firstTask.id)}
-            disabled={!firstTask}
-          >
-            <div className="zen-card-top">
-              <h2 className="zen-card-name">{project.name}</h2>
-              <span className="zen-card-badge">
-                {hasCurriculum ? "Curriculum" : "Research"}
-              </span>
-            </div>
+        {workspaces.map(({ project, summary, firstTask, hasCurriculum }, idx) => {
+          const isFeatured = idx === 0 && workspaces.length > 1;
+          const accuracy = summary ? Math.round(summary.overallAccuracy * 100) : 0;
 
-            {summary ? (
-              <div className="zen-card-body">
-                <div className="zen-card-meta">
-                  {summary.lastStudiedAt && (
-                    <span className="zen-label">{formatTimeAgo(summary.lastStudiedAt)}</span>
-                  )}
-                  {summary.cardsDue > 0 && (
-                    <span className="zen-label zen-label-due">{summary.cardsDue} due</span>
+          return (
+            <button
+              key={project.id}
+              type="button"
+              className={`zen-workspace-card${isFeatured ? " featured" : ""}`}
+              onClick={() => firstTask && onSelectTask(firstTask.id)}
+              disabled={!firstTask}
+            >
+              <div className="zen-card-header">
+                <div className="zen-card-badges">
+                  <span className={`zen-card-tag ${hasCurriculum ? "curriculum" : "research"}`}>
+                    {hasCurriculum ? "Curriculum" : "Research"}
+                  </span>
+                  {summary?.lastStudiedAt && (
+                    <span className="zen-card-meta">Last active {formatTimeAgo(summary.lastStudiedAt)}</span>
                   )}
                 </div>
-                <div className="zen-accuracy-row">
-                  <span className="zen-accuracy-value">
-                    {(summary.overallAccuracy * 100).toFixed(0)}%
-                  </span>
+                <div className="zen-card-icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--zen-primary)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    {hasCurriculum ? (
+                      <><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" /><path d="M8 7h6" /><path d="M8 11h8" /></>
+                    ) : (
+                      <><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>
+                    )}
+                  </svg>
+                </div>
+              </div>
+
+              <h3 className={`zen-card-name${isFeatured ? " featured" : ""}`}>{project.name}</h3>
+
+              {isFeatured && firstTask && (
+                <p className="zen-card-desc">{firstTask.objective?.slice(0, 80) || "Study workspace"}</p>
+              )}
+
+              <div className="zen-card-footer">
+                {summary && summary.cardsDue > 0 && (
+                  <span className="zen-card-due">{summary.cardsDue} due</span>
+                )}
+                <div className="zen-card-progress-row">
+                  <span className="zen-card-accuracy">{accuracy}%</span>
                   <div className="zen-progress-track">
-                    <div
-                      className="zen-progress-fill"
-                      style={{ width: `${(summary.overallAccuracy * 100).toFixed(0)}%` }}
-                    />
+                    <div className="zen-progress-fill" style={{ width: `${accuracy}%` }} />
                   </div>
                 </div>
               </div>
-            ) : (
-              <div className="zen-card-body">
-                <span className="zen-label">Loading...</span>
-              </div>
-            )}
-          </button>
-        ))}
+            </button>
+          );
+        })}
 
-        {/* New Workspace placeholder */}
-        <button
-          type="button"
-          className="zen-workspace-card zen-add-card"
-          onClick={onAddWorkspace}
-        >
-          <svg
-            width="28"
-            height="28"
-            viewBox="0 0 28 28"
-            fill="none"
-            stroke="#296767"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-          >
-            <line x1="14" y1="6" x2="14" y2="22" />
-            <line x1="6" y1="14" x2="22" y2="14" />
-          </svg>
-          <span className="zen-add-label">New Workspace</span>
+        {/* New workspace placeholder */}
+        <button type="button" className="zen-add-card" onClick={onAddWorkspace}>
+          <div className="zen-add-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--zen-on-surface-variant, #5a6061)" strokeWidth="1.5" strokeLinecap="round">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="8" x2="12" y2="16" />
+              <line x1="8" y1="12" x2="16" y2="12" />
+            </svg>
+          </div>
+          <span className="zen-add-title">New Workspace</span>
+          <span className="zen-add-desc">Start curating a new idea.</span>
         </button>
       </section>
     </div>
