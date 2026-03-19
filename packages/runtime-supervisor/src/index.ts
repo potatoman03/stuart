@@ -160,6 +160,7 @@ export class StuartRuntime {
   private readonly codex: CodexAppServerClient;
   private readonly vmHelperBinaryPath?: string;
   private diagnosticsCache?: { expiresAt: number; value: SystemDiagnostics };
+  private turnWatchdog?: ReturnType<typeof setInterval>;
 
   constructor(options: RuntimeOptions) {
     this.dataDir = resolve(options.dataDir);
@@ -216,6 +217,62 @@ export class StuartRuntime {
       process.stderr.write(
         `[stuart] sandbox executor setup failed: ${String(error)}\n`
       );
+    }
+
+    // Start turn watchdog — detects stalled turns and reconnects
+    this.turnWatchdog = setInterval(() => {
+      void this.checkStaleTurns();
+    }, 15_000);
+    this.turnWatchdog.unref();
+  }
+
+  /**
+   * Check for stalled turns and reconnect if needed.
+   * A turn is stale if no activity has been received for 120 seconds
+   * while turns are in-flight.
+   */
+  private async checkStaleTurns(): Promise<void> {
+    if (this.turns.size === 0) return;
+    if (!this.codex.isConnected) return;
+
+    // Only check task turns, not workers or memory extraction
+    const taskTurns = [...this.turns.values()].filter(
+      (t) => t.kind === "task" && !t.memoryExtraction
+    );
+    if (taskTurns.length === 0) return;
+
+    const staleSecs = this.codex.idleSeconds;
+    if (staleSecs < 120) return;
+
+    process.stderr.write(
+      `[stuart] detected stale turn (${staleSecs}s idle, ${taskTurns.length} task turn(s) in-flight). Reconnecting...\n`
+    );
+
+    // Notify the user for each stalled task turn
+    for (const state of taskTurns) {
+      this.recordRuntimeMessage(
+        state.taskId,
+        "Stuart's connection stalled. Reconnecting automatically — you can resend your last message."
+      );
+      this.emitEvent({
+        type: "codex.turn.completed",
+        taskId: state.taskId,
+        threadId: state.threadId,
+        turnId: state.turnId,
+        status: "failed",
+        error: "Turn timed out — connection stalled."
+      });
+    }
+
+    // Clear all in-flight turns
+    this.turns.clear();
+    this.loadedThreadIds.clear();
+
+    // Reconnect
+    try {
+      await this.codex.reconnect();
+    } catch (err) {
+      process.stderr.write(`[stuart] reconnect failed: ${String(err)}\n`);
     }
   }
 
@@ -603,6 +660,14 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     const task = this.db.getTask(taskId);
     if (!task) {
       throw new Error(`Task ${taskId} not found.`);
+    }
+
+    // Check if a turn is already in-flight for this task
+    const activeTurn = [...this.turns.values()].find(
+      (t) => t.taskId === taskId && t.kind === "task" && !t.memoryExtraction
+    );
+    if (activeTurn) {
+      throw new Error("A turn is already in progress for this task. Please wait for it to complete.");
     }
 
     const trimmed = content.trim();
@@ -2363,6 +2428,10 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
   }
 
   async close(): Promise<void> {
+    if (this.turnWatchdog) {
+      clearInterval(this.turnWatchdog);
+      this.turnWatchdog = undefined;
+    }
     await this.sandbox.close();
     await this.codex.close();
     this.db.close();

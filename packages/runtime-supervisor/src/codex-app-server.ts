@@ -53,12 +53,29 @@ export class CodexAppServerClient {
   private socket?: SocketLike;
   private readyPromise?: Promise<void>;
   private requestCounter = 0;
+  private lastActivityAt = Date.now();
+  private reconnecting = false;
 
   constructor(options: CodexAppServerClientOptions) {
     this.binaryPath = options.binaryPath ?? process.env.CODEX_BINARY_PATH ?? "codex";
     this.onNotification = options.onNotification;
     this.onServerRequest = options.onServerRequest;
     this.onStderr = options.onStderr;
+  }
+
+  /** Track that we received activity from the server. */
+  private markActivity(): void {
+    this.lastActivityAt = Date.now();
+  }
+
+  /** Seconds since last activity from the server. */
+  get idleSeconds(): number {
+    return Math.floor((Date.now() - this.lastActivityAt) / 1000);
+  }
+
+  /** Returns true if the connection appears healthy. */
+  get isConnected(): boolean {
+    return this.socket !== undefined && this.child !== undefined;
   }
 
   async ensureReady(): Promise<void> {
@@ -71,6 +88,24 @@ export class CodexAppServerClient {
     } catch (error) {
       this.readyPromise = undefined;
       throw error;
+    }
+  }
+
+  /**
+   * Tear down the current connection and start a fresh one.
+   * Rejects all in-flight requests. Callers should re-issue any needed requests.
+   */
+  async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    try {
+      process.stderr.write("[stuart] reconnecting codex app-server...\n");
+      await this.close();
+      this.readyPromise = this.start();
+      await this.readyPromise;
+      process.stderr.write("[stuart] codex app-server reconnected.\n");
+    } finally {
+      this.reconnecting = false;
     }
   }
 
@@ -208,6 +243,7 @@ export class CodexAppServerClient {
       return;
     }
 
+    this.markActivity();
     const parsed = JSON.parse(raw) as JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
 
     if ("method" in parsed && "id" in parsed) {
