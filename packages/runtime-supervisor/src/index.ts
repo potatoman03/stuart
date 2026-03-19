@@ -83,6 +83,10 @@ interface SendTaskMessageResult {
   startedTurn: boolean;
 }
 
+interface SendTaskMessageOptions {
+  retryCount?: number;
+}
+
 interface PermissionGap {
   title: string;
   detail: string;
@@ -99,12 +103,14 @@ interface ActiveTurnState {
   threadId: string;
   turnId: string;
   startedAt?: string;
+  lastActivityAt: number;
   kind: "task" | "worker";
   workerId?: string;
   assistantItemId?: string;
   assistantText: string;
   thinkingLabel: string;
   startedEmitted: boolean;
+  retryCount?: number;
   /** The working directory for this turn (staging path) */
   cwd?: string;
   /** Whether this turn should trigger workspace re-indexing on completion */
@@ -231,8 +237,9 @@ export class StuartRuntime {
 
   /**
    * Check for stalled turns and reconnect if needed.
-   * A turn is stale if no activity has been received for 300 seconds (5 minutes)
-   * while turns are in-flight.
+   * A turn is stale if it has not received any per-turn activity for too long.
+   * This is tracked per turn rather than globally because the Codex app-server
+   * may still be active for other tasks while one turn is silently hung.
    */
   private async checkStaleTurns(): Promise<void> {
     if (this.turns.size === 0) return;
@@ -244,20 +251,35 @@ export class StuartRuntime {
     );
     if (taskTurns.length === 0) return;
 
-    const staleSecs = this.codex.idleSeconds;
-    if (staleSecs < 300) return;
+    const now = Date.now();
+    const perTurnStallMs = 75_000;
+    const staleTurns = taskTurns.filter((turn) => {
+      const lastActivityAt = turn.lastActivityAt || (turn.startedAt ? new Date(turn.startedAt).getTime() : now);
+      return now - lastActivityAt >= perTurnStallMs;
+    });
+    if (staleTurns.length === 0) return;
+
+    // Only reconnect if every active task turn is stale. This avoids killing
+    // healthy turns just because one task is lagging.
+    if (staleTurns.length !== taskTurns.length) {
+      return;
+    }
+
+    const staleSecs = Math.floor(
+      Math.max(...staleTurns.map((turn) => now - (turn.lastActivityAt || now))) / 1000
+    );
 
     process.stderr.write(
-      `[stuart] detected stale turn (${staleSecs}s idle, ${taskTurns.length} task turn(s) in-flight). Reconnecting...\n`
+      `[stuart] detected ${staleTurns.length} stale task turn(s) (oldest idle ${staleSecs}s, codex connection idle ${this.codex.idleSeconds}s). Reconnecting...\n`
     );
 
     // Collect stalled turns for retry
-    const retryQueue: Array<{ taskId: string; message: string }> = [];
+    const retryQueue: Array<{ taskId: string; message: string; retryCount: number }> = [];
 
-    for (const state of taskTurns) {
+    for (const state of staleTurns) {
       this.recordRuntimeMessage(
         state.taskId,
-        "Stuart's connection stalled. Reconnecting and retrying automatically..."
+        `Stuart stalled after ${Math.max(1, Math.floor((now - state.lastActivityAt) / 1000))}s without progress. Reconnecting and retrying automatically...`
       );
       this.emitEvent({
         type: "codex.turn.completed",
@@ -267,8 +289,17 @@ export class StuartRuntime {
         status: "failed",
         error: "Turn timed out — connection stalled."
       });
-      if (state.userMessage) {
-        retryQueue.push({ taskId: state.taskId, message: state.userMessage });
+      if (state.userMessage && (state.retryCount ?? 0) < 1) {
+        retryQueue.push({
+          taskId: state.taskId,
+          message: state.userMessage,
+          retryCount: (state.retryCount ?? 0) + 1
+        });
+      } else if (state.userMessage) {
+        this.recordRuntimeMessage(
+          state.taskId,
+          "Automatic retry was already attempted for this turn. Please resend your message if you still want this artifact."
+        );
       }
     }
 
@@ -292,7 +323,9 @@ export class StuartRuntime {
           type: "task.message",
           taskId: retry.taskId
         });
-        await this.sendTaskMessage(retry.taskId, retry.message);
+        await this.sendTaskMessage(retry.taskId, retry.message, {
+          retryCount: retry.retryCount
+        });
       } catch (retryErr) {
         this.recordRuntimeMessage(
           retry.taskId,
@@ -428,6 +461,7 @@ export class StuartRuntime {
       threadId,
       turnId: turn.turn.id,
       startedAt: new Date().toISOString(),
+      lastActivityAt: Date.now(),
       kind: "worker",
       workerId: worker.id,
       assistantText: "",
@@ -527,6 +561,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
         threadId: extractionThreadId,
         turnId: turn.turn.id,
         startedAt: new Date().toISOString(),
+        lastActivityAt: Date.now(),
         kind: "worker" as const,
         assistantText: "",
         thinkingLabel: "Extracting memories",
@@ -684,7 +719,11 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     return this.db.listTaskMessages(taskId);
   }
 
-  async sendTaskMessage(taskId: string, content: string): Promise<SendTaskMessageResult> {
+  async sendTaskMessage(
+    taskId: string,
+    content: string,
+    options: SendTaskMessageOptions = {}
+  ): Promise<SendTaskMessageResult> {
     const task = this.db.getTask(taskId);
     if (!task) {
       throw new Error(`Task ${taskId} not found.`);
@@ -851,6 +890,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       threadId,
       turnId: turn.turn.id,
       startedAt: new Date().toISOString(),
+      lastActivityAt: Date.now(),
       kind: "task",
       assistantText: "",
       thinkingLabel: inferThinkingLabel(task, trimmed),
@@ -858,6 +898,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       cwd: context.cwd,
       triggersReindex: skills.some((skill) => skill.triggersReindex),
       userMessage: trimmed,
+      retryCount: options.retryCount ?? 0,
     });
 
     this.emitEvent({
@@ -1415,6 +1456,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
         threadId: thread.thread.id,
         turnId: turn.turn.id,
         startedAt: new Date().toISOString(),
+        lastActivityAt: Date.now(),
         kind: "worker" as const,
         assistantText: "",
         thinkingLabel: "Checking quiz accuracy",
@@ -1661,6 +1703,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
             threadId: params.threadId,
             turnId: params.turn.id,
             startedAt: new Date().toISOString(),
+            lastActivityAt: Date.now(),
             kind: owner.worker ? "worker" : "task",
             workerId: owner.worker?.id,
             assistantText: "",
@@ -1688,6 +1731,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
         }
 
         if (!state.startedEmitted && state.kind === "task") {
+          state.lastActivityAt = Date.now();
           state.startedEmitted = true;
           this.emitEvent({
             type: "codex.turn.started",
@@ -1711,6 +1755,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
           return;
         }
 
+        state.lastActivityAt = Date.now();
         state.thinkingLabel = summarizeThinkingDelta(
           `${state.thinkingLabel} ${params.delta}`.trim()
         );
@@ -1739,6 +1784,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
           return;
         }
 
+        state.lastActivityAt = Date.now();
         state.assistantItemId = params.itemId;
         state.assistantText += params.delta;
 
@@ -1774,6 +1820,10 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
           : this.resolveThreadOwner(params.threadId);
         if (!owner) {
           return;
+        }
+
+        if (state) {
+          state.lastActivityAt = Date.now();
         }
 
         // Detect context compaction starting
@@ -1874,6 +1924,10 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
           return;
         }
 
+        if (state) {
+          state.lastActivityAt = Date.now();
+        }
+
         if (params.item.type !== "agentMessage" || typeof params.item.text !== "string") {
           const agentEvent = buildCodexAgentEvent(params.item, "completed");
           if (agentEvent) {
@@ -1947,6 +2001,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                   taskId: owner.taskId,
                   threadId: params.threadId,
                   turnId: params.turn.id,
+                  lastActivityAt: Date.now(),
                   kind: owner.worker ? "worker" : "task",
                   workerId: owner.worker?.id,
                   assistantText: "",
