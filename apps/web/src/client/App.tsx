@@ -1003,7 +1003,7 @@ function App() {
         style={isArtifactOpen ? { "--artifact-pane-width": `${artifactPaneWidth}px` } as React.CSSProperties : undefined}
       >
         {/* ======== LEFT SIDEBAR: Your Library ======== */}
-        <aside className="library-panel">
+        <aside className={`library-panel${!selectedTask ? " zen-sidebar" : ""}`}>
           <div className="library-header">
             <div
               className="brand-lockup"
@@ -1030,6 +1030,38 @@ function App() {
           </div>
 
           <div className="library-body">
+            {!selectedTask ? (
+              /* Dashboard mode: simplified sidebar */
+              <div className="zen-sidebar-content">
+                <button
+                  className="zen-sidebar-nav active"
+                  type="button"
+                  onClick={() => { setSelectedTaskId(null); setSelectedRunId(null); }}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                    <rect x="3" y="3" width="8" height="8" rx="2" />
+                    <rect x="13" y="3" width="8" height="8" rx="2" />
+                    <rect x="3" y="13" width="8" height="8" rx="2" />
+                    <rect x="13" y="13" width="8" height="8" rx="2" />
+                  </svg>
+                  Workspaces
+                </button>
+                <div style={{ flex: 1 }} />
+                <button
+                  className="zen-sidebar-new-btn"
+                  type="button"
+                  onClick={() => void handleAddStudyMaterials()}
+                  disabled={busy === "add-materials" || busy === "folder"}
+                >
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                    <line x1="7" y1="2" x2="7" y2="12" />
+                    <line x1="2" y1="7" x2="12" y2="7" />
+                  </svg>
+                  New Workspace
+                </button>
+              </div>
+            ) : (
+            <>
             <button
               className="add-materials-button"
               type="button"
@@ -1130,6 +1162,8 @@ function App() {
                 </div>
               </div>
             ) : null}
+            </>
+            )}
           </div>
         </aside>
 
@@ -1956,11 +1990,11 @@ function DashboardView({
       {/* Activity pulse bar */}
       <section className="zen-activity-section">
         <div className="zen-activity-row">
-          <div className="zen-activity-label-group">
+          <div className="zen-activity-left">
             <span className="zen-section-label">Engagement Pulse</span>
             <span className="zen-activity-title">Daily Activity</span>
           </div>
-          <div className="zen-heatmap-wrap">
+          <div className="zen-activity-center">
             <div className="zen-heatmap">
               {aggregatedTimeline.map((day) => {
                 const opacity = day.reviews === 0
@@ -1984,10 +2018,6 @@ function DashboardView({
             )}
           </div>
           <div className="zen-stat-group">
-            <div className="zen-stat">
-              <span className="zen-section-label">Reviews</span>
-              <span className="zen-stat-value">{globalStats.totalReviews}</span>
-            </div>
             <div className="zen-stat">
               <span className="zen-section-label">Workspaces</span>
               <span className="zen-stat-value">{projects.length}</span>

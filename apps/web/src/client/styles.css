@@ -3455,6 +3455,74 @@ textarea {
   }
 }
 
+/* ---- Zen Sidebar (dashboard mode) ---- */
+
+.library-panel.zen-sidebar {
+  background: var(--zen-surface-low);
+  border-right: none;
+}
+
+.zen-sidebar-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: 0.5rem 0;
+}
+
+.zen-sidebar-nav {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.625rem 1rem;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--zen-on-surface-variant);
+  cursor: pointer;
+  transition: background 200ms, color 200ms;
+}
+
+.zen-sidebar-nav:hover {
+  background: var(--zen-surface-lowest);
+  color: var(--zen-primary);
+}
+
+.zen-sidebar-nav.active {
+  background: var(--zen-surface-lowest);
+  color: var(--zen-primary);
+  box-shadow: 0px 12px 32px rgba(45, 52, 53, 0.06);
+}
+
+.zen-sidebar-new-btn {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.75rem;
+  background: linear-gradient(135deg, var(--zen-primary), var(--zen-primary-dim));
+  color: var(--zen-on-primary);
+  border-radius: 999px;
+  font-family: var(--zen-font-headline);
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 200ms;
+}
+
+.zen-sidebar-new-btn:hover {
+  opacity: 0.9;
+}
+
+.zen-sidebar-new-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ---- Zen Studio Dashboard ---- */
 
 .zen-dashboard {
@@ -3468,7 +3536,7 @@ textarea {
 /* Activity Pulse Section */
 .zen-activity-section {
   background: var(--zen-surface-lowest);
-  border-radius: 12px;
+  border-radius: 16px;
   padding: 1.5rem 2rem;
   margin-bottom: 3rem;
 }
@@ -3477,14 +3545,14 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1.5rem;
+  gap: 2rem;
 }
 
 @media (max-width: 800px) {
   .zen-activity-row { flex-wrap: wrap; }
 }
 
-.zen-activity-label-group {
+.zen-activity-left {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -3505,24 +3573,28 @@ textarea {
   color: var(--zen-on-surface-variant);
 }
 
-.zen-heatmap-wrap {
+.zen-activity-center {
   display: flex;
   align-items: center;
   gap: 12px;
   flex: 1;
   min-width: 0;
-  justify-content: center;
+  overflow-x: auto;
+}
+
+.zen-activity-center::-webkit-scrollbar {
+  display: none;
 }
 
 .zen-heatmap {
   display: flex;
-  gap: 3px;
+  gap: 4px;
   align-items: center;
 }
 
 .zen-heatmap-dot {
-  width: 11px;
-  height: 11px;
+  width: 12px;
+  height: 12px;
   border-radius: 2px;
   flex-shrink: 0;
 }
@@ -3538,7 +3610,7 @@ textarea {
 
 .zen-stat-group {
   display: flex;
-  gap: 2rem;
+  gap: 2.5rem;
   flex-shrink: 0;
 }
 
