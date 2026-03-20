@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { Worker } from "node:worker_threads";
 import {
   cp,
   mkdir,
@@ -11,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, extname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { LocalDatabase } from "@stuart/db";
 import type {
   AttachmentMode,
@@ -42,7 +44,7 @@ import { CodexAppServerClient } from "./codex-app-server.js";
 import {
   buildChunkIdentifiers,
   isIngestiblePath,
-  parseDocumentForIngestion
+  type ParsedIngestionDocument
 } from "./ingestion.js";
 import { renderDocument } from "./document-renderer.js";
 import { matchSkills, type Skill } from "./skills.js";
@@ -104,6 +106,7 @@ interface ActiveTurnState {
   turnId: string;
   startedAt?: string;
   lastActivityAt: number;
+  stallTimeoutMs?: number;
   kind: "task" | "worker";
   workerId?: string;
   assistantItemId?: string;
@@ -126,6 +129,28 @@ interface ActiveTurnState {
 interface ResolvedWorkspaceFile extends WorkspaceFileRecord {
   absolutePath: string;
   rootPath: string;
+}
+
+const ingestionConcurrency = Math.max(
+  1,
+  Math.min(4, Number(process.env.STUART_INGESTION_CONCURRENCY ?? 2) || 2)
+);
+const defaultTurnStallMs = Math.max(30_000, Number(process.env.STUART_TURN_STALL_MS ?? 120_000) || 120_000);
+const complexTurnStallMs = Math.max(defaultTurnStallMs, Number(process.env.STUART_COMPLEX_TURN_STALL_MS ?? 300_000) || 300_000);
+
+function resolveIngestionWorkerConfig() {
+  const jsUrl = new URL("./ingestion-worker.js", import.meta.url);
+  if (existsSync(fileURLToPath(jsUrl))) {
+    return {
+      url: jsUrl,
+      execArgv: undefined as string[] | undefined,
+    };
+  }
+
+  return {
+    url: new URL("./ingestion-worker.ts", import.meta.url),
+    execArgv: ["--import", "tsx"],
+  };
 }
 
 export class VmHelperClient {
@@ -166,6 +191,7 @@ export class StuartRuntime {
   private readonly events = new EventEmitter();
   private readonly loadedThreadIds = new Set<string>();
   private readonly turns = new Map<string, ActiveTurnState>();
+  private readonly ingestionBuilds = new Map<string, Promise<IngestionIndexStats>>();
   private readonly codex: CodexAppServerClient;
   private readonly vmHelperBinaryPath?: string;
   private diagnosticsCache?: { expiresAt: number; value: SystemDiagnostics };
@@ -252,10 +278,10 @@ export class StuartRuntime {
     if (taskTurns.length === 0) return;
 
     const now = Date.now();
-    const perTurnStallMs = 75_000;
     const staleTurns = taskTurns.filter((turn) => {
       const lastActivityAt = turn.lastActivityAt || (turn.startedAt ? new Date(turn.startedAt).getTime() : now);
-      return now - lastActivityAt >= perTurnStallMs;
+      const stallTimeoutMs = turn.stallTimeoutMs ?? defaultTurnStallMs;
+      return now - lastActivityAt >= stallTimeoutMs;
     });
     if (staleTurns.length === 0) return;
 
@@ -357,6 +383,8 @@ export class StuartRuntime {
       codexBinaryPath: process.env.CODEX_BINARY_PATH,
       vmHelperBinaryPath: this.vmHelperBinaryPath,
       sandboxAvailable: this.sandboxAvailable,
+      surface: process.env.STUART_RUNTIME_MODE === "desktop" || process.env.STUART_RUNTIME_MODE === "standalone" ? "desktop" : "developer",
+      managedCodex: process.env.STUART_DESKTOP_MANAGED_CODEX === "1",
     });
     this.diagnosticsCache = {
       expiresAt: Date.now() + 30_000,
@@ -796,6 +824,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     );
     const isResearch = skills.some((skill) => skill.id === "research");
     const isCodeGen = skills.some((skill) => skill.id === "interactive");
+    const isArtifactTurn = skills.some((skill) => skill.id !== "research");
     const isSimpleQuery = /^explain|^what is|^define|^describe|^tell me about/i.test(trimmed) && trimmed.length < 200;
     const turnModel = needsFlagship ? "gpt-5.4" : undefined; // undefined = use thread default (mini)
     const effort = needsFlagship ? "high"
@@ -803,6 +832,10 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       : isSimpleQuery ? "low"
       : isLargeMaterialSet && !targetedFiles.length ? "high"
       : "medium";
+    const stallTimeoutMs =
+      isResearch || isArtifactTurn || isLargeMaterialSet
+        ? complexTurnStallMs
+        : defaultTurnStallMs;
 
     // Detect weak-topic intent and inject performance context
     const isWeakTopicRequest = /\bweak\s*(topic|area)s?\b|\bstruggl|\bfocus.*weak|\bworst\b/i.test(trimmed);
@@ -895,6 +928,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       assistantText: "",
       thinkingLabel: inferThinkingLabel(task, trimmed),
       startedEmitted: true,
+      stallTimeoutMs,
       cwd: context.cwd,
       triggersReindex: skills.some((skill) => skill.triggersReindex),
       userMessage: trimmed,
@@ -1007,6 +1041,61 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       force?: boolean;
     }
   ): Promise<IngestionIndexStats> {
+    return this.runTaskIngestionIndex(taskId, options);
+  }
+
+  private getIngestionBuildKey(taskId: string, taskRunId?: string): string {
+    return `${taskId}:${taskRunId ?? "global"}`;
+  }
+
+  private scheduleTaskIngestionIndex(
+    task: TaskSpec,
+    options?: {
+      taskRunId?: string;
+      force?: boolean;
+      reason?: string;
+    }
+  ): void {
+    const key = this.getIngestionBuildKey(task.id, options?.taskRunId);
+    if (this.ingestionBuilds.has(key)) {
+      return;
+    }
+
+    if (options?.reason) {
+      this.recordRuntimeMessage(task.id, options.reason);
+    }
+
+    void this.runTaskIngestionIndex(task.id, options)
+      .then((stats) => {
+        if (stats.documentsIndexed > 0) {
+          this.recordRuntimeMessage(
+            task.id,
+            `The local context index is ready with ${stats.documentsIndexed} document${stats.documentsIndexed === 1 ? "" : "s"} and ${stats.chunksIndexed} chunks.`
+          );
+        }
+      })
+      .catch((error) => {
+        this.recordRuntimeMessage(
+          task.id,
+          `Background indexing hit a problem, so Stuart will keep working directly from the workspace files.\n\n${error instanceof Error ? error.message : String(error)}`
+        );
+      });
+  }
+
+  private async runTaskIngestionIndex(
+    taskId: string,
+    options?: {
+      taskRunId?: string;
+      force?: boolean;
+    }
+  ): Promise<IngestionIndexStats> {
+    const key = this.getIngestionBuildKey(taskId, options?.taskRunId);
+    const inFlight = this.ingestionBuilds.get(key);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const build = (async () => {
     const existing = this.db.getIngestionStats(taskId, options?.taskRunId);
     if (!options?.force && existing.documentsIndexed > 0) {
       return existing;
@@ -1016,47 +1105,62 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       (entry) => isIngestiblePath(entry.absolutePath)
     );
     this.db.clearIngestionScope(taskId, options?.taskRunId);
+    let nextFileIndex = 0;
+    const processNextFile = async (): Promise<void> => {
+      while (true) {
+        const currentIndex = nextFileIndex;
+        nextFileIndex += 1;
+        if (currentIndex >= files.length) {
+          return;
+        }
 
-    for (const file of files) {
-      const documentId = createHash("sha1")
-        .update(`${taskId}:${options?.taskRunId ?? "global"}:${file.absolutePath}`)
-        .digest("hex");
-      const parsed = await parseDocumentForIngestion(file.absolutePath);
-      const documentRecord: IngestionDocumentRecord = {
-        id: documentId,
-        taskId,
-        taskRunId: options?.taskRunId,
-        sourcePath: file.absolutePath,
-        relativePath: file.relativePath,
-        fileType: parsed.fileType,
-        parser: parsed.parser,
-        chunkCount: parsed.chunks.length,
-        size: file.size,
-        status: parsed.status,
-        error: parsed.status === "failed" ? parsed.error : undefined,
-        indexedAt: new Date().toISOString()
-      };
-      this.db.upsertIngestionDocument(documentRecord);
-
-      if (parsed.status !== "indexed" || parsed.chunks.length === 0) {
-        continue;
-      }
-
-      for (const chunk of buildChunkIdentifiers(documentId, parsed.chunks)) {
-        this.db.insertIngestionChunk({
-          chunkId: chunk.chunkId,
-          documentId,
+        const file = files[currentIndex]!;
+        const documentId = createHash("sha1")
+          .update(`${taskId}:${options?.taskRunId ?? "global"}:${file.absolutePath}`)
+          .digest("hex");
+        const parsed = await this.parseDocumentForIngestionIsolated(file.absolutePath);
+        const documentRecord: IngestionDocumentRecord = {
+          id: documentId,
           taskId,
           taskRunId: options?.taskRunId,
           sourcePath: file.absolutePath,
           relativePath: file.relativePath,
           fileType: parsed.fileType,
-          heading: chunk.heading,
-          locator: chunk.locator,
-          text: chunk.text
-        });
+          parser: parsed.parser,
+          chunkCount: parsed.chunks.length,
+          size: file.size,
+          status: parsed.status,
+          error: parsed.status === "failed" ? parsed.error : undefined,
+          indexedAt: new Date().toISOString()
+        };
+        this.db.upsertIngestionDocument(documentRecord);
+
+        if (parsed.status !== "indexed" || parsed.chunks.length === 0) {
+          continue;
+        }
+
+        for (const chunk of buildChunkIdentifiers(documentId, parsed.chunks)) {
+          this.db.insertIngestionChunk({
+            chunkId: chunk.chunkId,
+            documentId,
+            taskId,
+            taskRunId: options?.taskRunId,
+            sourcePath: file.absolutePath,
+            relativePath: file.relativePath,
+            fileType: parsed.fileType,
+            heading: chunk.heading,
+            locator: chunk.locator,
+            text: chunk.text
+          });
+        }
       }
-    }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(ingestionConcurrency, Math.max(1, files.length)) }, () =>
+        processNextFile()
+      )
+    );
 
     const stats = this.db.getIngestionStats(taskId, options?.taskRunId);
     if (options?.taskRunId) {
@@ -1073,6 +1177,53 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     }
 
     return stats;
+    })();
+
+    this.ingestionBuilds.set(key, build);
+    build.finally(() => {
+      if (this.ingestionBuilds.get(key) === build) {
+        this.ingestionBuilds.delete(key);
+      }
+    });
+    return build;
+  }
+
+  private async parseDocumentForIngestionIsolated(filePath: string): Promise<ParsedIngestionDocument> {
+    return new Promise((resolve, reject) => {
+      const workerConfig = resolveIngestionWorkerConfig();
+      const worker = new Worker(workerConfig.url, {
+        ...(workerConfig.execArgv ? { execArgv: workerConfig.execArgv } : {}),
+        workerData: { filePath },
+      });
+
+      const cleanup = () => {
+        worker.removeAllListeners("message");
+        worker.removeAllListeners("error");
+        worker.removeAllListeners("exit");
+      };
+
+      worker.once("message", (payload: { ok: boolean; parsed?: ParsedIngestionDocument; error?: string }) => {
+        cleanup();
+        void worker.terminate().catch(() => undefined);
+        if (payload.ok && payload.parsed) {
+          resolve(payload.parsed);
+          return;
+        }
+        reject(new Error(payload.error || `Failed to parse ${filePath}`));
+      });
+
+      worker.once("error", (error) => {
+        cleanup();
+        reject(error);
+      });
+
+      worker.once("exit", (code) => {
+        cleanup();
+        if (code !== 0) {
+          reject(new Error(`Ingestion worker exited early with code ${code} while parsing ${filePath}`));
+        }
+      });
+    });
   }
 
   async prepareTaskRun(taskId: string): Promise<TaskRunRecord> {
@@ -1102,24 +1253,11 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
         status: "ready",
         updatedAt: new Date().toISOString()
       });
-      try {
-        const stats = await this.buildTaskIngestionIndex(task.id, {
-          taskRunId: run.id,
-          force: true
-        });
-        if (stats.documentsIndexed > 0) {
-          this.recordRuntimeMessage(
-            task.id,
-            `Prepared the Codex context index with ${stats.documentsIndexed} document${stats.documentsIndexed === 1 ? "" : "s"} and ${stats.chunksIndexed} chunks.`
-          );
-          await this.updateWorkspaceScaffold(task, run.id, manifest);
-        }
-      } catch (error) {
-        this.recordRuntimeMessage(
-          task.id,
-          `The local context index could not be prebuilt for this run.\n\n${error instanceof Error ? error.message : String(error)}`
-        );
-      }
+      this.scheduleTaskIngestionIndex(task, {
+        taskRunId: run.id,
+        force: true,
+        reason: "Stuart is warming the local context index in the background while your workspace opens."
+      });
       return this.db.getTaskRun(run.id)!;
     } catch (error) {
       this.db.updateTaskRun({
@@ -2553,16 +2691,13 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
     }
 
     const statsBefore = this.db.getIngestionStats(task.id, taskRun.id);
-    const stats =
-      statsBefore.documentsIndexed > 0
-        ? statsBefore
-        : await this.buildTaskIngestionIndex(task.id, { taskRunId: taskRun.id, force: true });
-
-    if (statsBefore.documentsIndexed === 0 && stats.documentsIndexed > 0) {
-      this.recordRuntimeMessage(
-        task.id,
-        `Indexed ${stats.documentsIndexed} local document${stats.documentsIndexed === 1 ? "" : "s"} into the context store (${stats.chunksIndexed} chunks).`
-      );
+    if (statsBefore.documentsIndexed === 0) {
+      this.scheduleTaskIngestionIndex(task, {
+        taskRunId: taskRun.id,
+        force: true,
+        reason: "The local index is still warming, so Stuart will start from the staged workspace files and layer in indexed context as it becomes ready."
+      });
+      return this.buildWorkspaceObservationContext(task, taskRun, message);
     }
 
     // Smart file targeting: if user mentions specific chapters/lectures, prioritize those files
@@ -2635,6 +2770,84 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       ),
       ...(conversationContext ? [conversationContext] : [])
     ].join("\n\n");
+  }
+
+  private async buildWorkspaceObservationContext(
+    task: TaskSpec,
+    taskRun: TaskRunRecord,
+    message: string
+  ): Promise<string | null> {
+    const files = await this.collectWorkspaceFiles(task.id, taskRun.id, 500);
+    if (files.length === 0) {
+      return null;
+    }
+
+    const targetedFiles = extractTargetedFiles(message).map((value) => value.toLowerCase());
+    const queryTokens = [...new Set(
+      sanitizeRetrievalQuery(message)
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .map((token) => token.trim())
+        .filter((token) => token.length >= 3)
+    )];
+    const studyLikePattern = /\b(lecture|chapter|week|notes?|slides?|tutorial|assignment|quiz|exam|syllabus|reading|module|lab|worksheet)\b/i;
+
+    const ranked = files
+      .map((entry) => {
+        const relativePath = entry.relativePath.toLowerCase();
+        let score = 0;
+        for (const target of targetedFiles) {
+          if (relativePath.includes(target)) {
+            score += 24;
+          }
+        }
+        for (const token of queryTokens) {
+          if (relativePath.includes(token)) {
+            score += 6;
+          }
+        }
+        if (studyLikePattern.test(relativePath)) {
+          score += 3;
+        }
+        if (/\.(pdf|docx|pptx|xlsx|md|txt|html)$/i.test(entry.relativePath)) {
+          score += 2;
+        }
+        return { entry, score };
+      })
+      .sort((left, right) =>
+        right.score - left.score ||
+        left.entry.relativePath.length - right.entry.relativePath.length
+      );
+
+    const prioritized = ranked
+      .filter((candidate) => candidate.score > 0)
+      .slice(0, 12)
+      .map((candidate) => candidate.entry);
+    const fallback = files
+      .filter((entry) =>
+        studyLikePattern.test(entry.relativePath) ||
+        /\.(pdf|docx|pptx|xlsx|md|txt|html)$/i.test(entry.relativePath)
+      )
+      .slice(0, 12);
+    const shortlist = prioritized.length > 0 ? prioritized : fallback;
+
+    if (shortlist.length === 0) {
+      return [
+        "The workspace is mounted locally and available to inspect directly.",
+        "The background index is still warming, so use `rg`, `ls`, `cat`, and targeted file opens in the staged workspace rather than waiting for indexed excerpts.",
+      ].join("\n");
+    }
+
+    return [
+      "The workspace is mounted locally and available to inspect directly.",
+      "The background index is still warming, so inspect the staged files directly instead of waiting for indexed excerpts.",
+      targetedFiles.length > 0
+        ? `Prioritise files matching: ${[...new Set(targetedFiles)].slice(0, 6).join(", ")}.`
+        : "Start from the most relevant study materials below.",
+      "Suggested files to inspect first:",
+      ...shortlist.map((entry) => `- ${entry.relativePath}`),
+      `Visible workspace files: ${files.length}.`,
+    ].join("\n");
   }
 
   private async writeWorkspaceScaffold(
@@ -2984,7 +3197,9 @@ function buildDeveloperInstructions(task: TaskSpec): string {
   return [
     "You are Stuart, a local task assistant built on Codex.",
     "Work from the approved local workspace, stay concise, and keep outputs directly useful.",
-    "When local retrieved context is supplied, use it first and cite relative workspace paths in your answer when helpful.",
+    "When local retrieved context is supplied, use it first and cite source names, lecture titles, or short relative file labels when helpful.",
+    "Never expose absolute staging paths, local filesystem prefixes, or raw `/Users/...` paths in student-facing answers.",
+    "If you include a markdown link to a local source, use compact markdown with no space before the opening parenthesis, for example `[Lecture 2](Lecture 2 - Solving Problems by Searching.pdf)`.",
     "When the student asks you to build an artifact, the artifact itself is the main deliverable. Do not stop at prose alone.",
     "If you create an HTML interactive or generated file, save it inside the staged workspace and end with exactly one JSON code block describing the artifact handoff.",
     "Use `.stuart/workspace-map.json` to understand the staged workspace layout and attachment mapping before touching files.",
@@ -3376,7 +3591,15 @@ async function collectWorkspaceFilesFromRoot(
   const entries: ResolvedWorkspaceFile[] = [];
 
   async function visit(directory: string): Promise<void> {
-    const children = await readdir(directory, { withFileTypes: true });
+    let children;
+    try {
+      children = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
     for (const child of children) {
       const absolutePath = join(directory, child.name);
       const relativePath = relative(normalizedRoot, absolutePath);
@@ -3392,7 +3615,15 @@ async function collectWorkspaceFilesFromRoot(
         continue;
       }
 
-      const fileStat = await stat(absolutePath);
+      let fileStat;
+      try {
+        fileStat = await stat(absolutePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          continue;
+        }
+        throw error;
+      }
       if (shouldHideWorkspacePath(relativePath)) {
         continue;
       }
@@ -3736,6 +3967,7 @@ export function tryParseArtifactJson(
       mockexam: "mock_exam",
       "mock-exam": "mock_exam",
       interactive: "interactive",
+      "interactive-web-preview": "interactive",
       "interactive app": "interactive",
       "interactive artifact": "interactive",
       html: "interactive",
@@ -3778,10 +4010,13 @@ export function tryParseArtifactJson(
     }
 
     // If interactive/html artifact referenced a file path instead of inline html, read it
-    if (kind === "interactive" && !normalized.html && typeof parsed.path === "string") {
+    if (kind === "interactive" && !normalized.path && typeof parsed.entry === "string") {
+      normalized.path = parsed.entry;
+    }
+    if (kind === "interactive" && !normalized.html && typeof normalized.path === "string") {
       try {
         const { readFileSync, existsSync: existsSyncLocal } = require("node:fs") as typeof import("node:fs");
-        const requestedPath = parsed.path as string;
+        const requestedPath = normalized.path as string;
         const resolvedPath =
           baseDir && !requestedPath.startsWith("/")
             ? resolve(baseDir, requestedPath)

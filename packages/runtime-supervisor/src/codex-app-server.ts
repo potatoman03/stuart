@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
+import { buildCodexCommandArgs, resolveCodexCommandConfig } from "./codex-command.js";
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -45,6 +46,8 @@ interface CodexAppServerClientOptions {
 
 export class CodexAppServerClient {
   private readonly binaryPath: string;
+  private readonly binaryArgsPrefix: string[];
+  private readonly binaryEnv: NodeJS.ProcessEnv;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly onNotification: CodexAppServerClientOptions["onNotification"];
   private readonly onServerRequest: CodexAppServerClientOptions["onServerRequest"];
@@ -57,7 +60,10 @@ export class CodexAppServerClient {
   private reconnecting = false;
 
   constructor(options: CodexAppServerClientOptions) {
-    this.binaryPath = options.binaryPath ?? process.env.CODEX_BINARY_PATH ?? "codex";
+    const command = resolveCodexCommandConfig(options.binaryPath);
+    this.binaryPath = command.binaryPath;
+    this.binaryArgsPrefix = command.argsPrefix;
+    this.binaryEnv = command.env;
     this.onNotification = options.onNotification;
     this.onServerRequest = options.onServerRequest;
     this.onStderr = options.onStderr;
@@ -171,9 +177,21 @@ export class CodexAppServerClient {
 
   private async start(): Promise<void> {
     const port = await reservePort();
-    const child = spawn(this.binaryPath, ["app-server", "--listen", `ws://127.0.0.1:${port}`], {
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+    const child = spawn(
+      this.binaryPath,
+      buildCodexCommandArgs({ argsPrefix: this.binaryArgsPrefix }, [
+        "app-server",
+        "--listen",
+        `ws://127.0.0.1:${port}`
+      ]),
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          ...this.binaryEnv,
+        }
+      }
+    );
 
     this.child = child;
 

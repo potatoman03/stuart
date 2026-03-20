@@ -2,8 +2,10 @@ import { execFile } from "node:child_process";
 import { copyFile, mkdir, access } from "node:fs/promises";
 import { constants, existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { buildCodexCommandArgs, resolveCodexCommandConfig } from "./codex-command.js";
 
 export type SystemDiagnosticStatus = "ok" | "warn" | "error";
+export type SystemDiagnosticsSurface = "developer" | "desktop";
 
 export interface SystemDiagnosticCheck {
   id: string;
@@ -30,6 +32,8 @@ export interface CollectSystemDiagnosticsOptions {
   codexBinaryPath?: string;
   vmHelperBinaryPath?: string;
   sandboxAvailable?: boolean | null;
+  surface?: SystemDiagnosticsSurface;
+  managedCodex?: boolean;
 }
 
 type CommandResult = {
@@ -48,49 +52,84 @@ export async function collectSystemDiagnostics(
   const envFilePath = resolve(options.envFilePath ?? join(workspaceRoot, ".env"));
   const dataDir = resolve(options.dataDir ?? join(workspaceRoot, ".stuart-data"));
   const codexBinaryPath = options.codexBinaryPath ?? process.env.CODEX_BINARY_PATH ?? "codex";
+  const codexCommand = resolveCodexCommandConfig(codexBinaryPath);
   const vmHelperPath = resolveVmHelperPath(workspaceRoot, options.vmHelperBinaryPath);
+  const surface =
+    options.surface ??
+    (process.env.STUART_RUNTIME_MODE === "desktop" || process.env.STUART_RUNTIME_MODE === "standalone" ? "desktop" : "developer");
+  const managedCodex =
+    options.managedCodex ??
+    process.env.STUART_DESKTOP_MANAGED_CODEX === "1";
 
   const checks: SystemDiagnosticCheck[] = [];
 
-  const nodeVersion = process.version;
-  const nodeMajor = Number.parseInt(nodeVersion.replace(/^v/, "").split(".")[0] ?? "0", 10);
+  if (surface === "developer") {
+    const nodeVersion = process.version;
+    const nodeMajor = Number.parseInt(nodeVersion.replace(/^v/, "").split(".")[0] ?? "0", 10);
+    checks.push({
+      id: "node",
+      label: "Node.js",
+      status: nodeMajor >= 22 ? "ok" : "error",
+      required: true,
+      summary: `Detected ${nodeVersion}`,
+      detail: nodeMajor >= 22 ? undefined : "Stuart expects Node 22 or newer.",
+      command: "node --version",
+      resolution: nodeMajor >= 22 ? undefined : "Install Node 22+ and restart the shell.",
+    });
+
+    const pnpmVersion = await runCommand("pnpm", ["--version"]);
+    checks.push(commandCheck({
+      id: "pnpm",
+      label: "pnpm",
+      required: true,
+      command: "pnpm --version",
+      result: pnpmVersion,
+      summary: pnpmVersion.stdout || "pnpm is available",
+      failureSummary: "pnpm is not available.",
+      resolution: "Install pnpm and run `pnpm install`.",
+    }));
+  } else {
+    checks.push({
+      id: "stuart-runtime",
+      label: "Stuart desktop runtime",
+      status: "ok",
+      required: true,
+      summary: "The app's built-in runtime is available.",
+    });
+  }
+
+  const codexVersion = await runCommand(
+    codexCommand.binaryPath,
+    buildCodexCommandArgs(codexCommand, ["--version"]),
+    codexCommand.env
+  );
   checks.push({
-    id: "node",
-    label: "Node.js",
-    status: nodeMajor >= 22 ? "ok" : "error",
+    id: "codex-cli",
+    label: surface === "desktop" ? "Codex runtime" : "Codex CLI",
+    status: codexVersion.ok ? "ok" : "error",
     required: true,
-    summary: `Detected ${nodeVersion}`,
-    detail: nodeMajor >= 22 ? undefined : "Stuart expects Node 22 or newer.",
-    command: "node --version",
-    resolution: nodeMajor >= 22 ? undefined : "Install Node 22+ and restart the shell.",
+    summary: codexVersion.ok
+      ? (managedCodex
+        ? `Included with Stuart (${codexVersion.stdout || "Codex runtime detected"})`
+        : (codexVersion.stdout || "Codex CLI is available"))
+      : (surface === "desktop"
+        ? "Stuart could not load its built-in Codex runtime."
+        : "Codex CLI is not available."),
+    detail: codexVersion.ok ? undefined : codexVersion.detail || firstMeaningfulLine(codexVersion.stderr),
+    command: surface === "developer" ? `${codexCommand.displayCommand} --version` : undefined,
+    resolution: codexVersion.ok
+      ? undefined
+      : (surface === "desktop"
+        ? "Reinstall Stuart or update to the latest desktop build."
+        : "Install Codex CLI and ensure it is on PATH, or set CODEX_BINARY_PATH."),
   });
 
-  const pnpmVersion = await runCommand("pnpm", ["--version"]);
-  checks.push(commandCheck({
-    id: "pnpm",
-    label: "pnpm",
-    required: true,
-    command: "pnpm --version",
-    result: pnpmVersion,
-    summary: pnpmVersion.stdout || "pnpm is available",
-    failureSummary: "pnpm is not available.",
-    resolution: "Install pnpm and run `pnpm install`.",
-  }));
-
-  const codexVersion = await runCommand(codexBinaryPath, ["--version"]);
-  checks.push(commandCheck({
-    id: "codex-cli",
-    label: "Codex CLI",
-    required: true,
-    command: `${codexBinaryPath} --version`,
-    result: codexVersion,
-    summary: codexVersion.stdout || "Codex CLI is available",
-    failureSummary: "Codex CLI is not available.",
-    resolution: "Install Codex CLI and ensure it is on PATH, or set CODEX_BINARY_PATH.",
-  }));
-
   const codexLogin = codexVersion.ok
-    ? await runCommand(codexBinaryPath, ["login", "status"])
+    ? await runCommand(
+      codexCommand.binaryPath,
+      buildCodexCommandArgs(codexCommand, ["login", "status"]),
+      codexCommand.env
+    )
     : { ok: false, stdout: "", stderr: "", detail: "Skipped because Codex CLI is unavailable." };
   checks.push({
     id: "codex-auth",
@@ -98,32 +137,44 @@ export async function collectSystemDiagnostics(
     status: codexLogin.ok ? "ok" : "error",
     required: true,
     summary: codexLogin.ok
-      ? firstMeaningfulLine(codexLogin.stdout, "Codex is authenticated.")
-      : "Codex is not authenticated.",
+      ? firstMeaningfulLine(codexLogin.stdout, "ChatGPT account connected.")
+      : (surface === "desktop" ? "Your ChatGPT account is not connected yet." : "Codex is not authenticated."),
     detail: codexLogin.ok ? undefined : codexLogin.detail || firstMeaningfulLine(codexLogin.stderr),
-    command: `${codexBinaryPath} login status`,
-    resolution: codexLogin.ok ? undefined : `Run \`${codexBinaryPath} login\` and complete authentication.`,
+    command: surface === "developer" ? `${codexCommand.displayCommand} login status` : undefined,
+    resolution: codexLogin.ok
+      ? undefined
+      : (surface === "desktop"
+        ? "Use the “Connect ChatGPT” step in Stuart to finish signing in."
+        : `Run \`${codexCommand.displayCommand} login\` and complete authentication.`),
   });
 
-  const envPresent = existsSync(envFilePath);
-  checks.push({
-    id: "env-file",
-    label: "Local .env",
-    status: envPresent ? "ok" : "warn",
-    required: false,
-    summary: envPresent ? `.env found at ${envFilePath}` : `.env not found at ${envFilePath}`,
-    resolution: envPresent ? undefined : "Run `pnpm bootstrap` to create a starter .env from .env.example.",
-  });
+  if (surface === "developer") {
+    const envPresent = existsSync(envFilePath);
+    checks.push({
+      id: "env-file",
+      label: "Local .env",
+      status: envPresent ? "ok" : "warn",
+      required: false,
+      summary: envPresent ? `.env found at ${envFilePath}` : `.env not found at ${envFilePath}`,
+      resolution: envPresent ? undefined : "Run `pnpm bootstrap` to create a starter .env from .env.example.",
+    });
+  }
 
   const dataDirWritable = await ensurePathWritable(dataDir);
   checks.push({
     id: "data-dir",
-    label: "Stuart data directory",
+    label: surface === "desktop" ? "Study data storage" : "Stuart data directory",
     status: dataDirWritable.ok ? "ok" : "error",
     required: true,
-    summary: dataDirWritable.ok ? `Using ${dataDir}` : `Cannot write to ${dataDir}`,
+    summary: dataDirWritable.ok
+      ? (surface === "desktop" ? "Stuart can save study history and artifacts locally." : `Using ${dataDir}`)
+      : `Cannot write to ${dataDir}`,
     detail: dataDirWritable.detail,
-    resolution: dataDirWritable.ok ? undefined : "Check STUART_DATA_DIR and local filesystem permissions.",
+    resolution: dataDirWritable.ok
+      ? undefined
+      : (surface === "desktop"
+        ? "Check macOS file permissions and make sure Stuart can access its local app data folder."
+        : "Check STUART_DATA_DIR and local filesystem permissions."),
   });
 
   const dockerVersion = await runCommand("docker", ["--version"]);
@@ -137,52 +188,62 @@ export async function collectSystemDiagnostics(
       ? `Docker daemon reachable (${firstMeaningfulLine(dockerInfo.stdout, dockerVersion.stdout)})`
       : "Docker sandbox unavailable.",
     detail: dockerInfo.ok ? undefined : dockerInfo.detail || firstMeaningfulLine(dockerInfo.stderr, dockerVersion.stdout),
-    command: "docker info --format '{{.ServerVersion}}'",
+    command: surface === "developer" ? "docker info --format '{{.ServerVersion}}'" : undefined,
     resolution: dockerInfo.ok
       ? undefined
-      : "Start Docker Desktop or another Docker daemon if you want sandboxed scripted artifact generation.",
+      : (surface === "desktop"
+        ? "Optional only. Install or start Docker Desktop if you want advanced scripted document generation."
+        : "Start Docker Desktop or another Docker daemon if you want sandboxed scripted artifact generation."),
   });
 
-  const swiftVersion = await runCommand("swift", ["--version"]);
-  checks.push(optionalCommandCheck({
-    id: "swift",
-    label: "Swift",
-    command: "swift --version",
-    result: swiftVersion,
-    resolution: "Install Xcode Command Line Tools or Swift if you want the native VM helper and macOS PDF render path.",
-  }));
+  if (surface === "developer") {
+    const swiftVersion = await runCommand("swift", ["--version"]);
+    checks.push(optionalCommandCheck({
+      id: "swift",
+      label: "Swift",
+      command: "swift --version",
+      result: swiftVersion,
+      resolution: "Install Xcode Command Line Tools or Swift if you want the native VM helper and macOS PDF render path.",
+    }));
+  }
 
   const tesseractVersion = await runCommand("tesseract", ["--version"]);
   checks.push(optionalCommandCheck({
     id: "tesseract",
     label: "Tesseract OCR",
-    command: "tesseract --version",
+    command: surface === "developer" ? "tesseract --version" : undefined,
     result: tesseractVersion,
-    resolution: "Install Tesseract if you want OCR for image-heavy or scanned study material.",
+    resolution: surface === "desktop"
+      ? "Optional only. Install Tesseract if you want OCR for scanned or image-heavy study material."
+      : "Install Tesseract if you want OCR for image-heavy or scanned study material.",
   }));
 
   const sofficeVersion = await runCommand("soffice", ["--version"]);
   checks.push(optionalCommandCheck({
     id: "soffice",
     label: "LibreOffice",
-    command: "soffice --version",
+    command: surface === "developer" ? "soffice --version" : undefined,
     result: sofficeVersion,
-    resolution: "Install LibreOffice if you want richer DOCX to PDF conversion during ingestion.",
+    resolution: surface === "desktop"
+      ? "Optional only. Install LibreOffice if you want richer Word document extraction."
+      : "Install LibreOffice if you want richer DOCX to PDF conversion during ingestion.",
   }));
 
-  checks.push({
-    id: "vm-helper",
-    label: "Native VM helper",
-    status: vmHelperPath && existsSync(vmHelperPath) ? "ok" : "warn",
-    required: false,
-    summary: vmHelperPath && existsSync(vmHelperPath)
-      ? `Found ${basename(vmHelperPath)}`
-      : "Native VM helper not built.",
-    detail: vmHelperPath ? `Expected path: ${vmHelperPath}` : undefined,
-    resolution: vmHelperPath && existsSync(vmHelperPath)
-      ? undefined
-      : "Run `node scripts/ensure-vm-helper.mjs` if you need the native helper. Normal web dev skips it by default.",
-  });
+  if (surface === "developer") {
+    checks.push({
+      id: "vm-helper",
+      label: "Native VM helper",
+      status: vmHelperPath && existsSync(vmHelperPath) ? "ok" : "warn",
+      required: false,
+      summary: vmHelperPath && existsSync(vmHelperPath)
+        ? `Found ${basename(vmHelperPath)}`
+        : "Native VM helper not built.",
+      detail: vmHelperPath ? `Expected path: ${vmHelperPath}` : undefined,
+      resolution: vmHelperPath && existsSync(vmHelperPath)
+        ? undefined
+        : "Run `node scripts/ensure-vm-helper.mjs` if you need the native helper. Normal web dev skips it by default.",
+    });
+  }
 
   if (typeof options.sandboxAvailable === "boolean") {
     checks.push({
@@ -253,7 +314,7 @@ function commandCheck(input: {
 function optionalCommandCheck(input: {
   id: string;
   label: string;
-  command: string;
+  command?: string;
   result: CommandResult;
   resolution: string;
 }): SystemDiagnosticCheck {
@@ -271,7 +332,11 @@ function optionalCommandCheck(input: {
   };
 }
 
-async function runCommand(command: string, args: string[]): Promise<CommandResult> {
+async function runCommand(
+  command: string,
+  args: string[],
+  extraEnv: NodeJS.ProcessEnv = {}
+): Promise<CommandResult> {
   return new Promise((resolveResult) => {
     execFile(
       command,
@@ -279,6 +344,10 @@ async function runCommand(command: string, args: string[]): Promise<CommandResul
       {
         encoding: "utf8",
         timeout: DEFAULT_TIMEOUT_MS,
+        env: {
+          ...process.env,
+          ...extraEnv,
+        },
       },
       (error, stdout, stderr) => {
         if (!error) {

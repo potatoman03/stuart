@@ -1,20 +1,45 @@
 # Stuart
 
-Stuart is a local-first study workspace built around staged local folders, Codex app-server turns, and persistent learning artifacts.
+Stuart is a local-first study workspace that turns any course folder into a guided study environment. Pick a folder of lecture slides, notes, PDFs, or assignments — Stuart indexes everything, connects to your ChatGPT account via Codex, and lets you generate flashcards, quizzes, mind maps, diagrams, interactive visualizations, and more.
 
- A student picks a folder, Stuart stages that material into an isolated run, builds local retrieval support, and lets Codex work inside that staged workspace while the UI streams the turn back live.
+## Download
 
-## Quick Start
+**macOS (Apple Silicon):** grab the latest DMG from `apps/desktop/release/` and drag Stuart to Applications. On first launch, right-click > Open to bypass Gatekeeper (the app is not yet code-signed).
 
-Prerequisites: Node 22+, pnpm, [Codex CLI](https://github.com/openai/codex) (authenticated), Docker (optional, for sandbox document generation).
+Stuart bundles its own Codex runtime — no terminal, no `npm install`, no dev tools required. Open the app, sign in with ChatGPT once, pick your study folder, done.
+
+## Quick Start (developers)
+
+Prerequisites: Node `22+`, `pnpm`, [Codex CLI](https://github.com/openai/codex) (authenticated), Docker (optional, for sandbox document generation).
 
 ```bash
 pnpm install
-pnpm bootstrap   # creates .env, checks prerequisites
-pnpm dev          # starts Vite client + Express server
+pnpm bootstrap
+pnpm dev:desktop
 ```
 
-Open `http://localhost:5173`, pick a study folder, and start chatting.
+That launches the full desktop app with:
+
+- a native Electron window
+- a first-run onboarding flow
+- a local Stuart API behind the app
+- native folder picking
+- a bundled Codex runtime inside the desktop build
+
+For web-only development:
+
+```bash
+pnpm dev
+```
+
+To build a distributable:
+
+```bash
+pnpm build:desktop
+pnpm --filter @stuart/desktop package:mac
+```
+
+Output: `apps/desktop/release/Stuart-{version}-arm64.dmg`
 
 ## What Stuart Is
 
@@ -119,10 +144,11 @@ Baseline:
 Codex-specific prerequisites:
 
 - Stuart launches `codex app-server` locally.
-- That means the Codex CLI must already be installed on the machine before Stuart can run.
-- The CLI must also already be authenticated, because Stuart does not handle the Codex sign-in flow itself.
+- For repo and web/developer flows, the Codex CLI must already be installed on the machine before Stuart can run.
+- The CLI must also already be authenticated for those flows.
+- The packaged desktop app now bundles its own Codex runtime and launches the ChatGPT sign-in flow itself.
 
-Recommended install:
+Recommended install for developer/web flows:
 
 ```bash
 npm i -g @openai/codex
@@ -139,7 +165,7 @@ On first run, Codex will prompt you to authenticate with either:
 - your ChatGPT account
 - or an API key
 
-If Stuart cannot find an authenticated Codex CLI, `codex app-server` startup will fail and the study runtime will not come up correctly.
+If Stuart cannot find an authenticated Codex runtime, `codex app-server` startup will fail and the study runtime will not come up correctly.
 
 Helpful native tools:
 
@@ -199,7 +225,9 @@ STUART_INGESTION_OVERLAP_TOKENS=80
 Important nuance:
 
 - root `pnpm dev`, `pnpm dev:desktop`, `pnpm dev:harness`, `pnpm bootstrap`, and `pnpm preflight` all load `.env` automatically if it exists
-- Codex authentication is separate from `.env`; Stuart expects the local Codex CLI to already be signed in
+- Codex authentication is separate from `.env`
+- repo/web flows still expect a local Codex CLI to already be signed in
+- packaged desktop builds use the bundled Codex runtime instead
 - `pnpm dev` skips the native VM helper build by default through `STUART_SKIP_VM_HELPER=1`
 - the Docker sandbox is warmed non-blockingly; if Docker is unavailable, Stuart logs that sandboxed script generation is disabled
 - the web UI shows an in-app system check card sourced from the same diagnostics layer as `pnpm preflight`
@@ -209,10 +237,33 @@ In practice, the normal technical-user path is:
 ```bash
 pnpm install
 pnpm bootstrap
-pnpm dev
+pnpm dev:desktop
 ```
 
 ## Running Stuart
+
+Desktop app:
+
+```bash
+pnpm dev:desktop
+```
+
+That starts:
+
+- the Electron shell
+- the local Stuart API on `http://127.0.0.1:8787`
+- the web renderer behind the Electron window
+
+The first run should guide you through:
+
+1. system check
+2. Codex sign-in
+3. picking a study folder
+
+Important distinction:
+
+- `pnpm dev:desktop` is still a developer workflow built from the repo on your machine
+- the packaged desktop app is the non-technical-user path and includes the bundled Codex runtime
 
 Web app:
 
@@ -225,6 +276,16 @@ That starts:
 - Vite client on `http://127.0.0.1:5173`
 - local server on `http://127.0.0.1:8787`
 
+Desktop packaging:
+
+```bash
+pnpm build:desktop
+pnpm --filter @stuart/desktop package:mac
+```
+
+Output: `apps/desktop/release/Stuart-{version}-arm64.dmg` (macOS DMG + zip).
+
+The packaged app bundles the Codex runtime, the web server, and all study skills. The server runs in a separate forked process so the UI stays responsive during heavy ingestion.
 
 Other useful entry points:
 
@@ -233,6 +294,9 @@ pnpm bootstrap
 pnpm preflight
 pnpm dev:harness
 pnpm build
+pnpm build:desktop
+pnpm package:desktop
+pnpm package:desktop:mac
 pnpm typecheck
 pnpm test
 pnpm test:e2e
@@ -309,7 +373,7 @@ Dependency surfaces:
 - Document and preview stack:
   - `mammoth`, `xlsx`, `pdfjs-dist`, `fast-xml-parser`, `jszip`, `docx`, `pdfkit`, `pptxgenjs`
 - Desktop shell:
-  - `electron`
+  - `electron`, `electron-builder`
 - Optional sandbox runtime:
   - `dockerode`
 - UI helpers:
@@ -359,6 +423,7 @@ Current dedicated test areas include:
 - The runtime is still mid-pivot toward a cleaner workspace-first model.
 - Retrieval is much better than the earlier snippet-only path, but it is still FTS-backed support rather than full semantic search.
 - Native document fidelity depends on the optional local tools listed above.
+- Desktop packaging is working. The app has a custom icon but is not yet code-signed or notarized (requires an Apple Developer account).
 
 ## Philosophy
 

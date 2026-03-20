@@ -1,0 +1,42 @@
+{
+  "appId": "ai.stuart.desktop",
+  "productName": "Stuart",
+  "asar": true,
+  "asarUnpack": [
+    "node_modules/**/vendor/**/*"
+  ],
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "package.json"
+  ],
+  "mac": {
+    "category": "public.app-category.education",
+    "icon": "build/icon.icns",
+    "target": [
+      "dmg",
+      "zip"
+    ],
+    "artifactName": "Stuart-${version}-${arch}.${ext}"
+  },
+  "win": {
+    "target": [
+      "nsis"
+    ],
+    "artifactName": "Stuart-${version}-${arch}.${ext}"
+  },
+  "nsis": {
+    "oneClick": true,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": false
+  },
+  "linux": {
+    "category": "Education",
+    "target": [
+      "AppImage"
+    ],
+    "artifactName": "Stuart-${version}-${arch}.${ext}"
+  }
+}

@@ -7,7 +7,15 @@ import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import JSZip from "jszip";
 import mammoth from "mammoth";
 import { XMLParser } from "fast-xml-parser";
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+// Lazy-imported to avoid DOMMatrix reference at load time (crashes in Electron main process).
+type PdfjsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
+let _pdfjs: PdfjsModule | null = null;
+async function loadPdfjs(): Promise<PdfjsModule> {
+  if (!_pdfjs) {
+    _pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  }
+  return _pdfjs;
+}
 import XLSX from "xlsx";
 
 // ---------------------------------------------------------------------------
@@ -876,6 +884,7 @@ const extractPdfSections = async (
   sparsePageCount: number;
   previews: PersistedVisualPreview[];
 }> => {
+  const { getDocument } = await loadPdfjs();
   const loadingTask = getDocument({
     data: new Uint8Array(buffer),
     standardFontDataUrl: pdfStandardFontDataUrl,

@@ -16,165 +16,178 @@ import {
 import type { WorkspaceFileRecord } from "@stuart/shared";
 import XLSX from "xlsx";
 
+export interface StuartWebServerOptions {
+  workspaceRoot?: string;
+  dataDir?: string;
+  staticDir?: string;
+  vmHelperBinaryPath?: string;
+  port?: number;
+  openExternalPath?: (absolutePath: string) => Promise<void>;
+}
+
+export interface RunningStuartWebServer {
+  harness: StuartHarness;
+  server: StuartHarnessServer;
+  app: express.Express;
+  port: number;
+  dataDir: string;
+  workspaceRoot: string;
+  close: () => Promise<void>;
+}
+
 const execFileAsync = promisify(execFile);
-const workspaceRoot = resolve(fileURLToPath(new URL("../../../../", import.meta.url)));
 const require = createRequire(import.meta.url);
-const dataDir = resolveDataDir();
-const preferredHelperCandidate = join(
-  workspaceRoot,
-  "native",
-  "vm-helper",
-  ".build",
-  "debug",
-  "StuartVMHelper"
-);
-const legacyHelperCandidate = join(
-  workspaceRoot,
-  "native",
-  "vm-helper",
-  ".build",
-  "debug",
-  "CoworkVMHelper"
-);
-const helperCandidate = existsSync(preferredHelperCandidate)
-  ? preferredHelperCandidate
-  : existsSync(legacyHelperCandidate)
-    ? legacyHelperCandidate
-    : undefined;
-const staticDir = join(workspaceRoot, "apps", "web", "dist");
 const reactEntry = require.resolve("react");
 const reactDomClientEntry = require.resolve("react-dom/client");
 const reactJsxRuntimeEntry = require.resolve("react/jsx-runtime");
+const previewWorkspaceRoot = resolveWorkspaceRoot();
 
-const harness = new StuartHarness({
-  dataDir,
-  vmHelperBinaryPath: helperCandidate,
-  workspaceRoot
-});
-
-const server = new StuartHarnessServer({
-  harness,
-  openExternalPath: async (absolutePath) => {
-    await execFileAsync("open", [absolutePath]);
-  }
-});
-const app = server.app;
-const port = Number(process.env.PORT ?? 8787);
-
-app.use(cors());
-
-app.get("/api/tasks/:taskId/workspace-files/:entryId/preview", asyncRoute(async (request, response) => {
-  const taskId = firstParam(request.params.taskId);
-  const entryId = firstParam(request.params.entryId);
-  const taskRunId =
-    typeof request.query.taskRunId === "string" ? request.query.taskRunId : undefined;
-  const entry = await harness.runtime.resolveWorkspaceFile(
-    taskId,
-    entryId,
-    taskRunId
-  );
-
-  switch (entry.previewKind) {
-    case "pdf":
-      response.type("application/pdf");
-      response.sendFile(entry.absolutePath);
-      return;
-    case "image":
-      response.sendFile(entry.absolutePath);
-      return;
-    case "html":
-      response.type("text/html");
-      response.send(
-        rewriteHtmlAssets(
-          await readFile(entry.absolutePath, "utf8"),
-          taskId,
-          entry.id,
-          taskRunId
-        )
-      );
-      return;
-    case "docx":
-      response.type("text/html");
-      response.send(await renderDocxPreview(entry.absolutePath, entry.name));
-      return;
-    case "xlsx":
-      response.type("text/html");
-      response.send(renderWorkbookPreview(entry.absolutePath, entry.name));
-      return;
-    case "jsx":
-      response.type("text/html");
-      response.send(await renderJsxPreview(entry.absolutePath, entry.name));
-      return;
-    case "text":
-      response.type("text/html");
-      response.send(renderTextPreview(await readFile(entry.absolutePath, "utf8"), entry.name));
-      return;
-    default:
-      response.type("text/html");
-      response.send(renderUnsupportedPreview(entry));
-  }
-}));
-
-app.get("/api/tasks/:taskId/workspace-files/:entryId/asset", asyncRoute(async (request, response) => {
-  const taskId = firstParam(request.params.taskId);
-  const entryId = firstParam(request.params.entryId);
-  const relativeAssetPath =
-    typeof request.query.asset === "string" ? request.query.asset.trim() : "";
-  if (!relativeAssetPath) {
-    response.status(400).send("Asset path is required.");
-    return;
-  }
-
-  const taskRunId =
-    typeof request.query.taskRunId === "string" ? request.query.taskRunId : undefined;
-  const entry = await harness.runtime.resolveWorkspaceFile(
-    taskId,
-    entryId,
-    taskRunId
-  );
-  const assetPath = resolve(dirname(entry.absolutePath), relativeAssetPath);
-  if (!assetPath.startsWith(entry.rootPath)) {
-    response.status(403).send("Asset path escapes the workspace root.");
-    return;
-  }
-  if (!existsSync(assetPath)) {
-    response.status(404).send("Asset not found.");
-    return;
-  }
-
-  response.sendFile(assetPath);
-}));
-
-app.post("/api/dialogs/folder", async (request, response) => {
-  const prompt =
-    typeof request.body?.prompt === "string" && request.body.prompt.trim() !== ""
-      ? request.body.prompt.trim()
-      : "Choose a folder";
-
-  response.json({
-    path: await chooseFolder(prompt)
+export async function startStuartWebServer(
+  options: StuartWebServerOptions = {}
+): Promise<RunningStuartWebServer> {
+  const workspaceRoot = resolveWorkspaceRoot(options.workspaceRoot);
+  const dataDir = resolveDataDir(workspaceRoot, options.dataDir);
+  const helperCandidate = resolveVmHelperBinaryPath(workspaceRoot, options.vmHelperBinaryPath);
+  const staticDir = resolveStaticDir(workspaceRoot, options.staticDir);
+  const harness = new StuartHarness({
+    dataDir,
+    vmHelperBinaryPath: helperCandidate,
+    workspaceRoot
   });
-});
+  const server = new StuartHarnessServer({
+    harness,
+    openExternalPath: options.openExternalPath ?? defaultOpenExternalPath
+  });
+  const app = server.app;
+  const port = Number(options.port ?? process.env.PORT ?? 8787);
 
-if (existsSync(staticDir)) {
-  app.use(express.static(staticDir));
-  app.get("*", (request, response, next) => {
-    if (request.path.startsWith("/api/")) {
-      next();
+  app.use(cors());
+
+  app.get("/api/tasks/:taskId/workspace-files/:entryId/preview", asyncRoute(async (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const entryId = firstParam(request.params.entryId);
+    const taskRunId =
+      typeof request.query.taskRunId === "string" ? request.query.taskRunId : undefined;
+    const entry = await harness.runtime.resolveWorkspaceFile(
+      taskId,
+      entryId,
+      taskRunId
+    );
+
+    switch (entry.previewKind) {
+      case "pdf":
+        response.type("application/pdf");
+        response.sendFile(entry.absolutePath);
+        return;
+      case "image":
+        response.sendFile(entry.absolutePath);
+        return;
+      case "html":
+        response.type("text/html");
+        response.send(
+          rewriteHtmlAssets(
+            await readFile(entry.absolutePath, "utf8"),
+            taskId,
+            entry.id,
+            taskRunId
+          )
+        );
+        return;
+      case "docx":
+        response.type("text/html");
+        response.send(await renderDocxPreview(entry.absolutePath, entry.name));
+        return;
+      case "xlsx":
+        response.type("text/html");
+        response.send(renderWorkbookPreview(entry.absolutePath, entry.name));
+        return;
+      case "jsx":
+        response.type("text/html");
+        response.send(await renderJsxPreview(entry.absolutePath, entry.name));
+        return;
+      case "text":
+        response.type("text/html");
+        response.send(renderTextPreview(await readFile(entry.absolutePath, "utf8"), entry.name));
+        return;
+      default:
+        response.type("text/html");
+        response.send(renderUnsupportedPreview(entry));
+    }
+  }));
+
+  app.get("/api/tasks/:taskId/workspace-files/:entryId/asset", asyncRoute(async (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const entryId = firstParam(request.params.entryId);
+    const relativeAssetPath =
+      typeof request.query.asset === "string" ? request.query.asset.trim() : "";
+    if (!relativeAssetPath) {
+      response.status(400).send("Asset path is required.");
       return;
     }
-    response.sendFile(join(staticDir, "index.html"));
+
+    const taskRunId =
+      typeof request.query.taskRunId === "string" ? request.query.taskRunId : undefined;
+    const entry = await harness.runtime.resolveWorkspaceFile(
+      taskId,
+      entryId,
+      taskRunId
+    );
+    const assetPath = resolve(dirname(entry.absolutePath), relativeAssetPath);
+    if (!assetPath.startsWith(entry.rootPath)) {
+      response.status(403).send("Asset path escapes the workspace root.");
+      return;
+    }
+    if (!existsSync(assetPath)) {
+      response.status(404).send("Asset not found.");
+      return;
+    }
+
+    response.sendFile(assetPath);
+  }));
+
+  app.post("/api/dialogs/folder", async (request, response) => {
+    const prompt =
+      typeof request.body?.prompt === "string" && request.body.prompt.trim() !== ""
+        ? request.body.prompt.trim()
+        : "Choose a folder";
+
+    response.json({
+      path: await chooseFolder(prompt)
+    });
   });
-}
 
-app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
-  const message = error instanceof Error ? error.message : "Unknown local server error";
-  response.status(500).send(message);
-});
+  if (existsSync(staticDir)) {
+    app.use(express.static(staticDir));
+    app.get("*", (request, response, next) => {
+      if (request.path.startsWith("/api/")) {
+        next();
+        return;
+      }
+      response.sendFile(join(staticDir, "index.html"));
+    });
+  }
 
-async function main() {
+  app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
+    const message = error instanceof Error ? error.message : "Unknown local server error";
+    response.status(500).send(message);
+  });
+
   await server.listen(port);
   process.stdout.write(`Stuart web api listening on http://localhost:${port}\n`);
+
+  return {
+    harness,
+    server,
+    app,
+    port,
+    dataDir,
+    workspaceRoot,
+    close: () => server.close()
+  };
+}
+
+async function main() {
+  return startStuartWebServer();
 }
 
 async function chooseFolder(prompt: string): Promise<string | null> {
@@ -218,10 +231,82 @@ function firstParam(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? "" : value ?? "";
 }
 
-function resolveDataDir(): string {
+function resolveWorkspaceRoot(override?: string): string {
+  if (override && override.trim() !== "") {
+    return resolve(override);
+  }
+
+  if (process.env.STUART_WORKSPACE_ROOT) {
+    return resolve(process.env.STUART_WORKSPACE_ROOT);
+  }
+
+  return resolve(fileURLToPath(new URL("../../../", import.meta.url)));
+}
+
+function resolveDataDir(workspaceRoot: string, override?: string): string {
+  if (override && override.trim() !== "") {
+    return resolve(override);
+  }
+
+  if (process.env.STUART_DATA_DIR) {
+    const configured = process.env.STUART_DATA_DIR;
+    return configured.startsWith("/")
+      ? resolve(configured)
+      : resolve(workspaceRoot, configured);
+  }
+
   const preferred = join(workspaceRoot, ".stuart-data", "web");
   const legacy = join(workspaceRoot, ".cowork-data", "web");
   return existsSync(preferred) || !existsSync(legacy) ? preferred : legacy;
+}
+
+function resolveStaticDir(workspaceRoot: string, override?: string): string {
+  if (override && override.trim() !== "") {
+    return resolve(override);
+  }
+
+  if (process.env.STUART_WEB_STATIC_DIR) {
+    return resolve(process.env.STUART_WEB_STATIC_DIR);
+  }
+
+  return join(workspaceRoot, "apps", "web", "dist");
+}
+
+function resolveVmHelperBinaryPath(workspaceRoot: string, override?: string): string | undefined {
+  if (override && override.trim() !== "") {
+    return resolve(override);
+  }
+
+  if (process.env.STUART_VM_HELPER_BINARY_PATH) {
+    return resolve(process.env.STUART_VM_HELPER_BINARY_PATH);
+  }
+
+  const preferredHelperCandidate = join(
+    workspaceRoot,
+    "native",
+    "vm-helper",
+    ".build",
+    "debug",
+    "StuartVMHelper"
+  );
+  const legacyHelperCandidate = join(
+    workspaceRoot,
+    "native",
+    "vm-helper",
+    ".build",
+    "debug",
+    "CoworkVMHelper"
+  );
+
+  return existsSync(preferredHelperCandidate)
+    ? preferredHelperCandidate
+    : existsSync(legacyHelperCandidate)
+      ? legacyHelperCandidate
+      : undefined;
+}
+
+async function defaultOpenExternalPath(absolutePath: string) {
+  await execFileAsync("open", [absolutePath]);
 }
 
 async function renderDocxPreview(absolutePath: string, title: string): Promise<string> {
@@ -305,7 +390,10 @@ async function renderJsxPreview(absolutePath: string, title: string): Promise<st
   const virtualEntry = "__stuart_preview_entry__";
   const bundle = await buildBundle({
     absWorkingDir: dirname(absolutePath),
-    nodePaths: [join(workspaceRoot, "node_modules"), join(workspaceRoot, "apps", "web", "node_modules")],
+    nodePaths: [
+      join(previewWorkspaceRoot, "node_modules"),
+      join(previewWorkspaceRoot, "apps", "web", "node_modules")
+    ],
     entryPoints: shouldWrap ? [virtualEntry] : [absolutePath],
     outdir: "stuart-preview",
     bundle: true,
@@ -463,14 +551,20 @@ function escapeHtmlAttribute(value: string): string {
   return escapeHtml(value).replace(/\s+/g, "-").toLowerCase();
 }
 
-// Ensure child processes (codex app-server, sandbox) are cleaned up on exit
-async function shutdown() {
-  process.stdout.write("\n[stuart] shutting down...\n");
-  try { await server.close(); } catch { /* best effort */ }
-  process.exit(0);
-}
-process.on("SIGINT", () => void shutdown());
-process.on("SIGTERM", () => void shutdown());
-process.on("beforeExit", () => void shutdown());
+// Only auto-start when running as a standalone server (not imported by the desktop app).
+if (process.env.STUART_RUNTIME_MODE !== "desktop") {
+  let runningServer: RunningStuartWebServer | null = null;
 
-void main();
+  async function shutdown() {
+    process.stdout.write("\n[stuart] shutting down...\n");
+    try { await runningServer?.close(); } catch { /* best effort */ }
+    process.exit(0);
+  }
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+  process.on("beforeExit", () => void shutdown());
+
+  void main().then((server) => {
+    runningServer = server ?? null;
+  });
+}

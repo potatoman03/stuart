@@ -73,4 +73,28 @@ describe("interactive artifact detection", () => {
 
     expect(discovered.map((item) => item.relativePath)).toContain("bfs-dfs-visualiser.html");
   });
+
+  it("normalizes interactive-web-preview payloads that use entry instead of path", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "stuart-artifact-entry-"));
+    cleanupPaths.push(directory);
+    const htmlPath = join(directory, "tower-of-hanoi-visualization.html");
+    await writeFile(
+      htmlPath,
+      "<!doctype html><html><head><title>Tower of Hanoi Explorer</title></head><body><script>console.log('ok')</script></body></html>",
+      "utf8"
+    );
+
+    const parsed = tryParseArtifactJson(
+      JSON.stringify({
+        kind: "interactive-web-preview",
+        title: "Tower of Hanoi Explorer",
+        entry: "tower-of-hanoi-visualization.html",
+      }),
+      directory
+    );
+
+    expect(parsed?.kind).toBe("interactive");
+    expect((parsed?.data as { html?: string })?.html).toContain("<script>");
+    expect((parsed?.data as { path?: string })?.path).toBe("tower-of-hanoi-visualization.html");
+  });
 });

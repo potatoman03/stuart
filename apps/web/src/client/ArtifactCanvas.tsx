@@ -1,5 +1,4 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from "react";
-import mermaid from "mermaid";
 import type {
   ArtifactDraft,
   CitationRef,
@@ -12,6 +11,7 @@ import type {
   QuizQuestion,
   StudyArtifactKind,
 } from "@stuart/shared";
+import { apiUrl } from "./platform";
 
 /* ---- Source Name Cleaning ---- */
 
@@ -257,7 +257,7 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
                 type="button"
                 onClick={() => {
                   const a = document.createElement("a");
-                  a.href = `/api/study-artifacts/${artifactDbId}/download`;
+                  a.href = apiUrl(`/api/study-artifacts/${artifactDbId}/download`);
                   a.download = "";
                   a.click();
                 }}
@@ -319,7 +319,7 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
             <InteractiveCanvas
               html={typeof parsed.html === "string" ? parsed.html : ""}
               title={parsed.title}
-              previewUrl={artifactDbId ? `/api/study-artifacts/${artifactDbId}/preview` : undefined}
+              previewUrl={artifactDbId ? apiUrl(`/api/study-artifacts/${artifactDbId}/preview`) : undefined}
             />
           ) : kind.startsWith("document_") ? (
             <DocumentCanvas artifactDbId={artifactDbId} kind={kind} />
@@ -467,7 +467,7 @@ function MindMapCanvas({ nodes, onExplain, artifactDbId, onInlineAsk, inlineResp
 
   useEffect(() => {
     if (!artifactDbId) return;
-    fetch(`/api/study-artifacts/${artifactDbId}/node-notes`)
+    fetch(apiUrl(`/api/study-artifacts/${artifactDbId}/node-notes`))
       .then(r => r.ok ? r.json() : [])
       .then((notes: Array<{ nodeId: string; content: string }>) => {
         const map: Record<string, string> = {};
@@ -1006,7 +1006,7 @@ function MindMapCanvas({ nodes, onExplain, artifactDbId, onInlineAsk, inlineResp
               onBlur={() => {
                 if (artifactDbId && selectedNode) {
                   setNodeNotes(prev => ({ ...prev, [selectedNode.id]: editingNote }));
-                  fetch(`/api/study-artifacts/${artifactDbId}/node-notes/${selectedNode.id}`, {
+                  fetch(apiUrl(`/api/study-artifacts/${artifactDbId}/node-notes/${selectedNode.id}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ content: editingNote }),
@@ -1078,7 +1078,7 @@ function FlashcardsCanvas({
 
   useEffect(() => {
     if (!artifactDbId) return;
-    fetch(`/api/study-artifacts/${artifactDbId}/weak-cards`)
+      fetch(apiUrl(`/api/study-artifacts/${artifactDbId}/weak-cards`))
       .then(r => r.ok ? r.json() : [])
       .then((cards: Array<{ cardId: string; easeFactor: number }>) => setWeakCards(cards))
       .catch(() => {});
@@ -1201,7 +1201,7 @@ function FlashcardsCanvas({
             type="button"
             onClick={() => {
               const a = document.createElement("a");
-              a.href = `/api/study-artifacts/${artifactDbId}/export-anki`;
+              a.href = apiUrl(`/api/study-artifacts/${artifactDbId}/export-anki`);
               a.download = "flashcards.txt";
               a.click();
             }}
@@ -1251,7 +1251,7 @@ function FlashcardsCanvas({
 
     // Persist to API
     if (artifactDbId) {
-      fetch(`/api/study-artifacts/${artifactDbId}/card-performance/${activeCard.id}`, {
+      fetch(apiUrl(`/api/study-artifacts/${artifactDbId}/card-performance/${activeCard.id}`), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1625,7 +1625,7 @@ function QuizCanvas({
 
     // Persist quiz performance
     if (artifactDbId) {
-      fetch(`/api/study-artifacts/${artifactDbId}/quiz-performance`, {
+      fetch(apiUrl(`/api/study-artifacts/${artifactDbId}/quiz-performance`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1822,22 +1822,32 @@ function DiagramCanvas({ scene }: { scene: DiagramScene }) {
     const el = containerRef.current;
     el.innerHTML = "";
     setRenderError(false);
+    let cancelled = false;
 
-    // Use a unique ID each time to avoid collisions on re-renders
-    const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    async function renderDiagram() {
+      try {
+        const { default: mermaid } = await import("mermaid");
+        if (cancelled) {
+          return;
+        }
 
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: "neutral",
-      fontFamily: "Inter, system-ui, sans-serif",
-      securityLevel: "loose",
-    });
+        // Use a unique ID each time to avoid collisions on re-renders
+        const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Clean the mermaid source — trim whitespace, ensure no leading/trailing issues
-    const cleanedSource = scene.mermaid.trim();
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: "neutral",
+          fontFamily: "Inter, system-ui, sans-serif",
+          securityLevel: "loose",
+        });
 
-    mermaid.render(id, cleanedSource)
-      .then(({ svg }) => {
+        // Clean the mermaid source — trim whitespace, ensure no leading/trailing issues
+        const cleanedSource = scene.mermaid.trim();
+        const { svg } = await mermaid.render(id, cleanedSource);
+        if (cancelled) {
+          return;
+        }
+
         el.innerHTML = svg;
         // Make the SVG responsive
         const svgEl = el.querySelector("svg");
@@ -1846,13 +1856,22 @@ function DiagramCanvas({ scene }: { scene: DiagramScene }) {
           svgEl.style.maxWidth = "100%";
           svgEl.style.height = "auto";
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         console.error("Mermaid render error:", err);
+        if (cancelled) {
+          return;
+        }
         setRenderError(true);
         // Clear the container so the fallback shows cleanly
         el.innerHTML = "";
-      });
+      }
+    }
+
+    void renderDiagram();
+
+    return () => {
+      cancelled = true;
+    };
   }, [scene.mermaid]);
 
   return (
@@ -1998,7 +2017,7 @@ function MockExamCanvas({
     if (artifactDbId) {
       const timeTaken = Math.floor((Date.now() - startTimeRef.current) / 1000);
       const totalScore = Object.values(autoScores).reduce((s, v) => s + v, 0);
-      fetch(`/api/study-artifacts/${artifactDbId}/exam-attempts`, {
+      fetch(apiUrl(`/api/study-artifacts/${artifactDbId}/exam-attempts`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2008,7 +2027,7 @@ function MockExamCanvas({
       })
         .then(r => r.json())
         .then((attempt: { id: string }) => {
-          fetch(`/api/study-artifacts/${artifactDbId}/exam-attempts/${attempt.id}`, {
+          fetch(apiUrl(`/api/study-artifacts/${artifactDbId}/exam-attempts/${attempt.id}`), {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -2139,11 +2158,18 @@ function MockExamCanvas({
     <div className="mock-exam-canvas">
       {/* Timer */}
       <div className={`mock-exam-timer${timeRemaining < 300 ? " warning" : ""}`}>
-        <span>{title}</span>
-        <span>{String(minutes).padStart(2, "0")}:{String(seconds).padStart(2, "0")}</span>
-        <button className="accent-button compact" type="button" onClick={handleSubmit}>
-          Submit Exam
-        </button>
+        <div className="mock-exam-timer-copy">
+          <span className="mock-exam-timer-kicker">Timed mock exam</span>
+          <span className="mock-exam-timer-title">{title}</span>
+        </div>
+        <div className="mock-exam-timer-actions">
+          <span className="mock-exam-time-readout">
+            {String(minutes).padStart(2, "0")}:{String(seconds).padStart(2, "0")}
+          </span>
+          <button className="accent-button mock-exam-submit-btn" type="button" onClick={handleSubmit}>
+            Submit Exam
+          </button>
+        </div>
       </div>
 
       {/* Section nav */}
@@ -2242,14 +2268,14 @@ function DocumentCanvas({ artifactDbId, kind }: { artifactDbId?: string; kind: s
   }
 
   const ext = kind.replace("document_", "").toUpperCase();
-  const previewUrl = `/api/study-artifacts/${artifactDbId}/preview`;
+  const previewUrl = apiUrl(`/api/study-artifacts/${artifactDbId}/preview`);
 
   return (
     <div className="document-canvas">
       <div className="document-toolbar">
         <span className="document-type-badge">{ext}</span>
         <a
-          href={`/api/study-artifacts/${artifactDbId}/download`}
+          href={apiUrl(`/api/study-artifacts/${artifactDbId}/download`)}
           className="ghost-button compact"
           download
         >

@@ -27,6 +27,8 @@ import type {
 } from "@stuart/shared";
 import ArtifactCanvas from "./ArtifactCanvas";
 import { ALL_DEMOS } from "./DemoArtifacts";
+import type { DesktopCodexLoginState } from "./platform";
+import { apiUrl, getDesktopBridge, openExternalUrl } from "./platform";
 
 /* ---- Types ---- */
 
@@ -38,6 +40,14 @@ type DashboardPayload = {
   projects: ProjectRecord[];
   tasks: TaskSpec[];
   diagnostics: SystemDiagnostics;
+};
+
+type DesktopBridgeState = {
+  isDesktop: boolean;
+  isPackaged: boolean;
+  platform: string;
+  appVersion: string;
+  apiOrigin: string;
 };
 
 type SystemDiagnosticStatus = "ok" | "warn" | "error";
@@ -93,6 +103,20 @@ type AgentActivity = {
   source: "codex" | "worker";
 };
 
+type WorkspaceSetupStep = {
+  id: string;
+  label: string;
+  status: "pending" | "active" | "done";
+};
+
+type WorkspaceSetupState = {
+  taskId: string | null;
+  projectId: string | null;
+  title: string;
+  detail: string;
+  steps: WorkspaceSetupStep[];
+};
+
 /* ---- Constants ---- */
 
 const STUDY_TOOL_PROMPTS: Record<string, string> = {
@@ -115,6 +139,13 @@ const DEMO_KIND_ICONS: Record<string, string> = {
 };
 
 const DIAGNOSTICS_DISMISS_KEY = "stuart.dismissedDiagnostics.v1";
+const WORKSPACE_SETUP_STEP_ORDER: Array<{ id: string; label: string }> = [
+  { id: "folder", label: "Folder selected" },
+  { id: "workspace", label: "Creating the workspace" },
+  { id: "session", label: "Starting your first study session" },
+  { id: "staging", label: "Staging files for Stuart" },
+  { id: "reading", label: "Reading your materials" },
+];
 
 /* ---- Helpers ---- */
 
@@ -137,16 +168,25 @@ function fileExtension(rawPath: string): string {
   return match ? match[1]!.toUpperCase() : "DOC";
 }
 
+function buildWorkspaceSetupSteps(activeId: string, completedIds: string[] = []): WorkspaceSetupStep[] {
+  const completed = new Set(completedIds);
+  return WORKSPACE_SETUP_STEP_ORDER.map((step) => ({
+    ...step,
+    status: completed.has(step.id) ? "done" : step.id === activeId ? "active" : "pending",
+  }));
+}
+
 /* ---- API Helper ---- */
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const targetUrl = apiUrl(path);
   const method = (init?.method ?? "GET").toUpperCase();
   const maxAttempts = method === "GET" || method === "HEAD" ? 4 : 1;
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const response = await fetch(path, {
+      const response = await fetch(targetUrl, {
         ...init,
         headers: {
           "Content-Type": "application/json",
@@ -156,7 +196,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
       if (!response.ok) {
         const message = await response.text();
-        const error = new Error(message || `Request failed for ${path}`);
+        const error = new Error(message || `Request failed for ${targetUrl}`);
         const shouldRetry =
           attempt < maxAttempts &&
           (response.status >= 500 || response.status === 408 || response.status === 429);
@@ -186,7 +226,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     await new Promise((resolve) => window.setTimeout(resolve, attempt * 350));
   }
 
-  throw lastError instanceof Error ? lastError : new Error(`Request failed for ${path}`);
+  throw lastError instanceof Error ? lastError : new Error(`Request failed for ${targetUrl}`);
 }
 
 /* ================================================================
@@ -194,6 +234,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
    ================================================================ */
 
 function App() {
+  const desktopBridge = getDesktopBridge();
+  const desktopState = useMemo<DesktopBridgeState>(() => ({
+    isDesktop: Boolean(desktopBridge?.isDesktop),
+    isPackaged: Boolean(desktopBridge?.isPackaged),
+    platform: desktopBridge?.platform ?? "web",
+    appVersion: desktopBridge?.appVersion ?? "0.1.0",
+    apiOrigin:
+      desktopBridge?.apiOrigin ??
+      (window.location.origin === "null" ? "http://127.0.0.1:8787" : window.location.origin),
+  }), [desktopBridge]);
+
   /* ---- Core State ---- */
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [tasks, setTasks] = useState<TaskSpec[]>([]);
@@ -228,6 +279,8 @@ function App() {
   const [dismissedDiagnosticsFingerprint, setDismissedDiagnosticsFingerprint] = useState<string | null>(
     () => readDismissedDiagnosticsFingerprint()
   );
+  const [workspaceSetup, setWorkspaceSetup] = useState<WorkspaceSetupState | null>(null);
+  const workspaceSetupDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* ---- Study Artifacts State ---- */
   const [studyArtifacts, setStudyArtifacts] = useState<Record<string, StudyArtifactRecord[]>>({});
@@ -240,10 +293,25 @@ function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const sessionInactivityRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const clearWorkspaceSetup = useCallback((delayMs = 0) => {
+    if (workspaceSetupDismissTimerRef.current) {
+      clearTimeout(workspaceSetupDismissTimerRef.current);
+      workspaceSetupDismissTimerRef.current = null;
+    }
+    if (delayMs > 0) {
+      workspaceSetupDismissTimerRef.current = setTimeout(() => {
+        setWorkspaceSetup(null);
+        workspaceSetupDismissTimerRef.current = null;
+      }, delayMs);
+      return;
+    }
+    setWorkspaceSetup(null);
+  }, []);
+
   const startStudySession = useCallback(async (taskId: string, artifactId?: string) => {
     if (activeSessionId) return; // already in a session
     try {
-      const res = await fetch(`/api/tasks/${taskId}/study-sessions`, {
+      const res = await fetch(apiUrl(`/api/tasks/${taskId}/study-sessions`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ artifactIds: artifactId ? [artifactId] : [] }),
@@ -258,7 +326,7 @@ function App() {
   const endStudySession = useCallback(async () => {
     if (!activeSessionId) return;
     try {
-      await fetch(`/api/study-sessions/${activeSessionId}`, {
+      await fetch(apiUrl(`/api/study-sessions/${activeSessionId}`), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ endedAt: new Date().toISOString() }),
@@ -282,10 +350,10 @@ function App() {
     if (!activeSessionId) return;
     resetInactivityTimer();
     try {
-      const sessionRes = await fetch(`/api/study-sessions/${activeSessionId}`);
+      const sessionRes = await fetch(apiUrl(`/api/study-sessions/${activeSessionId}`));
       // We don't have a GET endpoint, so just PATCH with increments
       // Use a simple approach: increment by 1 each time
-      await fetch(`/api/study-sessions/${activeSessionId}`, {
+      await fetch(apiUrl(`/api/study-sessions/${activeSessionId}`), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -295,6 +363,14 @@ function App() {
       });
     } catch { /* non-critical */ }
   }, [activeSessionId, resetInactivityTimer]);
+
+  useEffect(() => {
+    return () => {
+      if (workspaceSetupDismissTimerRef.current) {
+        clearTimeout(workspaceSetupDismissTimerRef.current);
+      }
+    };
+  }, []);
 
   // Start session when artifact opens (flashcard/quiz/mock_exam)
   useEffect(() => {
@@ -317,6 +393,8 @@ function App() {
   /* ---- Inline AI Response State ---- */
   const [inlineResponse, setInlineResponse] = useState<string | null>(null);
   const [isInlineLoading, setIsInlineLoading] = useState(false);
+  const [desktopAuthPending, setDesktopAuthPending] = useState(false);
+  const [desktopCodexLogin, setDesktopCodexLogin] = useState<DesktopCodexLoginState | null>(null);
 
   /* ---- Context Compaction State ---- */
   const [isCompacting, setIsCompacting] = useState(false);
@@ -405,6 +483,14 @@ function App() {
   }, [selectedStudyArtifacts]);
 
   const isArtifactOpen = !!(openArtifact || openDemoArtifact);
+  const isDesktopWelcome =
+    desktopState.isDesktop &&
+    !selectedTask &&
+    projects.length === 0 &&
+    tasks.length === 0;
+  const codexCliCheck = diagnostics?.checks.find((check) => check.id === "codex-cli") ?? null;
+  const codexAuthCheck = diagnostics?.checks.find((check) => check.id === "codex-auth") ?? null;
+  const dockerCheck = diagnostics?.checks.find((check) => check.id === "docker") ?? null;
 
   const dismissDiagnostics = useCallback(() => {
     if (!diagnosticsFingerprint) {
@@ -460,12 +546,58 @@ function App() {
     } catch (caughtError) {
       const message = caughtError instanceof Error ? caughtError.message : "Failed to load workspace dashboard";
       if (message.includes("/api/dashboard") || message === "Failed to fetch") {
-        setError("The local Stuart API is not ready yet. Wait a second and refresh, or restart with `pnpm dev`.");
+        setError(
+          desktopState.isDesktop
+            ? "Stuart is still starting its local study runtime. Give it a second, then refresh the system check."
+            : "The local Stuart API is not ready yet. Wait a second and refresh, or restart with `pnpm dev`."
+        );
         return;
       }
       setError(message);
     }
-  }, [selectedTaskId, selectedProjectId, selectedRunId]);
+  }, [desktopState.isDesktop, selectedTaskId, selectedProjectId, selectedRunId]);
+
+  const refreshDesktopCodexLoginState = useCallback(async () => {
+    if (!desktopBridge?.getCodexLoginState) {
+      return;
+    }
+
+    try {
+      const nextState = await desktopBridge.getCodexLoginState();
+      setDesktopCodexLogin(nextState);
+    } catch {
+      // Ignore desktop login polling errors; diagnostics refresh remains the source of truth.
+    }
+  }, [desktopBridge]);
+
+  const openCodexHelp = useCallback(async () => {
+    await openExternalUrl("https://help.openai.com/en/articles/11381614-api-codex-cli-and-sign-in-with-chatgpt");
+  }, []);
+
+  const startDesktopCodexLogin = useCallback(async () => {
+    if (!desktopBridge?.startCodexLogin) {
+      await openCodexHelp();
+      return;
+    }
+
+    try {
+      setBusy("codex-login");
+      setDesktopAuthPending(true);
+      const opened = await desktopBridge.startCodexLogin();
+      if (!opened) {
+        setDesktopAuthPending(false);
+        await openCodexHelp();
+      } else {
+        await refreshDesktopCodexLoginState();
+      }
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Could not start ChatGPT sign-in");
+      setDesktopAuthPending(false);
+    } finally {
+      setBusy(null);
+      void refreshDashboard();
+    }
+  }, [desktopBridge, openCodexHelp, refreshDashboard, refreshDesktopCodexLoginState]);
 
   async function loadMessages(taskId: string) {
     try {
@@ -544,6 +676,9 @@ function App() {
   async function pickFolder(prompt: string): Promise<string | null> {
     try {
       setBusy("folder");
+      if (desktopBridge?.pickFolder) {
+        return await desktopBridge.pickFolder();
+      }
       const payload = await request<{ path: string | null }>("/api/dialogs/folder", {
         method: "POST",
         body: JSON.stringify({ prompt })
@@ -564,13 +699,52 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!desktopState.isDesktop) {
+      return;
+    }
+
+    void refreshDesktopCodexLoginState();
+  }, [desktopState.isDesktop, refreshDesktopCodexLoginState]);
+
+  useEffect(() => {
+    if (!desktopAuthPending) {
+      return;
+    }
+
+    if (codexAuthCheck?.status === "ok") {
+      setDesktopAuthPending(false);
+      return;
+    }
+
+    if (desktopCodexLogin?.status === "error") {
+      setDesktopAuthPending(false);
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshDashboard();
+      void refreshDesktopCodexLoginState();
+    }, 1500);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [
+    codexAuthCheck?.status,
+    desktopAuthPending,
+    desktopCodexLogin?.status,
+    refreshDashboard,
+    refreshDesktopCodexLoginState,
+  ]);
+
+  useEffect(() => {
     let disposed = false;
     let es: EventSource | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout>;
 
     function connect() {
       if (disposed) return;
-      es = new EventSource("/api/events");
+      es = new EventSource(apiUrl("/api/events"));
       es.onmessage = (event) => {
         const payload = JSON.parse(event.data) as WorkspaceEvent;
         void handleWorkspaceEvent(payload);
@@ -703,6 +877,16 @@ function App() {
         return;
 
       case "task.run":
+        setWorkspaceSetup((current) => {
+          if (!current || current.taskId !== event.taskId) {
+            return current;
+          }
+          return {
+            ...current,
+            detail: "Workspace staged. Stuart can answer right away while it warms the local index in the background.",
+            steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging"]),
+          };
+        });
         await refreshDashboard();
         if (event.taskRunId === selectedRunId || event.taskId === selectedTaskId) {
           await loadRunContext(event.taskRunId);
@@ -751,6 +935,16 @@ function App() {
         return;
 
       case "codex.turn.started":
+        setWorkspaceSetup((current) => {
+          if (!current || current.taskId !== event.taskId) {
+            return current;
+          }
+          return {
+            ...current,
+            detail: "Stuart has started reading your materials and is drafting the first overview now.",
+            steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging"]),
+          };
+        });
         setThinkingState({ taskId: event.taskId, label: "Stuart is thinking...", recentActions: [] });
         setToolLogByTask((cur) => ({ ...cur, [event.taskId]: [] }));
         setStreamingDelta(null);
@@ -758,6 +952,18 @@ function App() {
 
       case "codex.thinking": {
         const newLabel = event.label || "Analyzing your materials...";
+        setWorkspaceSetup((current) => {
+          if (!current || current.taskId !== event.taskId) {
+            return current;
+          }
+          return {
+            ...current,
+            detail: newLabel === "Stuart is thinking..."
+              ? current.detail
+              : newLabel,
+            steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging"]),
+          };
+        });
         setThinkingState((cur) => {
           const prev = cur?.taskId === event.taskId ? cur.recentActions : [];
           const updated = cur && cur.label !== newLabel && cur.label !== "Stuart is thinking..."
@@ -791,6 +997,18 @@ function App() {
         return;
 
       case "codex.message.completed":
+        setWorkspaceSetup((current) => {
+          if (!current || current.taskId !== event.taskId) {
+            return current;
+          }
+          return {
+            ...current,
+            title: "Workspace ready",
+            detail: "Your first overview is ready. Background indexing can keep warming while you keep studying.",
+            steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging", "reading"]),
+          };
+        });
+        clearWorkspaceSetup(1600);
         setThinkingState((cur) => (cur?.taskId === event.taskId ? null : cur));
         setStreamingDelta((cur) => (cur?.taskId === event.taskId ? null : cur));
         setToolLogByTask((cur) => ({ ...cur, [event.taskId]: [] }));
@@ -801,6 +1019,20 @@ function App() {
         return;
 
       case "codex.turn.completed":
+        setWorkspaceSetup((current) => {
+          if (!current || current.taskId !== event.taskId) {
+            return current;
+          }
+          return {
+            ...current,
+            title: event.status === "failed" ? "Workspace still open" : "Workspace ready",
+            detail: event.status === "failed"
+              ? (event.error ?? "The first pass hit a problem, but your workspace is still open and Stuart can keep working from the local files.")
+              : "Stuart finished the first pass over your materials.",
+            steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging", "reading"]),
+          };
+        });
+        clearWorkspaceSetup(event.status === "failed" ? 3_000 : 1600);
         setThinkingState((cur) => (cur?.taskId === event.taskId ? null : cur));
         setStreamingDelta((cur) => (cur?.taskId === event.taskId ? null : cur));
         setIsInlineLoading(false);
@@ -832,6 +1064,14 @@ function App() {
 
     try {
       setBusy("add-materials");
+      clearWorkspaceSetup();
+      setWorkspaceSetup({
+        taskId: null,
+        projectId: null,
+        title: "Preparing your workspace",
+        detail: "Nothing is being downloaded. Stuart is creating a local study workspace from this folder and will read the files in the background.",
+        steps: buildWorkspaceSetupSteps("workspace", ["folder"]),
+      });
       // Create or find project for this folder
       const existingProject = projects.find((p) => p.rootPath === path);
       let project: ProjectRecord;
@@ -849,6 +1089,13 @@ function App() {
       }
 
       setSelectedProjectId(project.id);
+      setWorkspaceSetup({
+        taskId: null,
+        projectId: project.id,
+        title: "Preparing your workspace",
+        detail: "Workspace created. Stuart is starting your first study session now.",
+        steps: buildWorkspaceSetupSteps("session", ["folder", "workspace"]),
+      });
 
       // Create a study session task automatically
       const taskTitle = `Study: ${inferProjectName(path)}`;
@@ -868,6 +1115,16 @@ function App() {
         } satisfies CreateTaskInput)
       });
 
+      setSelectedTaskId(created.id);
+      setSelectedRunId(null);
+      setWorkspaceSetup({
+        taskId: created.id,
+        projectId: created.projectId,
+        title: "Preparing your workspace",
+        detail: "Stuart is staging your files so Codex can start with a grounded first pass.",
+        steps: buildWorkspaceSetupSteps("staging", ["folder", "workspace", "session"]),
+      });
+
       // Send the initial ingest message
       setThinkingState({ taskId: created.id, label: "Analyzing your materials...", recentActions: [] });
 
@@ -885,6 +1142,22 @@ function App() {
 
       if (!result.startedTurn) {
         setThinkingState((cur) => (cur?.taskId === created.id ? null : cur));
+        setWorkspaceSetup({
+          taskId: created.id,
+          projectId: created.projectId,
+          title: "Workspace ready",
+          detail: "Your workspace is ready. Stuart did not need to start a longer first pass for this folder.",
+          steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging", "reading"]),
+        });
+        clearWorkspaceSetup(1600);
+      } else {
+        setWorkspaceSetup({
+          taskId: created.id,
+          projectId: created.projectId,
+          title: "Preparing your workspace",
+          detail: "Stuart has started the first reading pass. You can begin asking questions while background indexing warms up.",
+          steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging"]),
+        });
       }
 
       await refreshDashboard();
@@ -1028,6 +1301,10 @@ function App() {
         </div>
       ) : null}
 
+      {workspaceSetup ? (
+        <WorkspaceSetupIndicator progress={workspaceSetup} />
+      ) : null}
+
       {/* ---- Three-Column Layout ---- */}
       <div
         className={`workspace${studyToolsCollapsed ? " tools-collapsed" : ""}${libraryCollapsed ? " library-collapsed" : ""}${isArtifactOpen ? " artifact-open" : ""}`}
@@ -1140,7 +1417,12 @@ function App() {
               diagnosticsDismissed ? (
                 <DiagnosticsDismissedNotice compact onShow={restoreDiagnostics} />
               ) : (
-                <DiagnosticsCard diagnostics={diagnostics} compact onDismiss={dismissDiagnostics} />
+                <DiagnosticsCard
+                  diagnostics={diagnostics}
+                  compact
+                  surface={desktopState.isDesktop ? "desktop" : "developer"}
+                  onDismiss={dismissDiagnostics}
+                />
               )
             ) : null}
 
@@ -1253,6 +1535,24 @@ function App() {
                     onSelectTask={(taskId) => setSelectedTaskId(taskId)}
                     onAddWorkspace={() => handleAddStudyMaterials()}
                   />
+                ) : isDesktopWelcome ? (
+                  <DesktopOnboardingView
+                    diagnostics={diagnostics}
+                    desktopState={desktopState}
+                    loginState={desktopCodexLogin}
+                    isRefreshing={busy === "dashboard"}
+                    isSigningIn={busy === "codex-login" || desktopAuthPending}
+                    isChoosingFolder={busy === "add-materials" || busy === "folder"}
+                    canChooseFolder={Boolean(diagnostics?.requiredReady)}
+                    codexCliCheck={codexCliCheck}
+                    codexAuthCheck={codexAuthCheck}
+                    dockerCheck={dockerCheck}
+                    onChooseFolder={() => void handleAddStudyMaterials()}
+                    onRefresh={() => void refreshDashboard()}
+                    onStartCodexLogin={() => void startDesktopCodexLogin()}
+                    onOpenVerificationUri={(url) => void openExternalUrl(url)}
+                    onOpenCodexHelp={() => void openCodexHelp()}
+                  />
                 ) : (
                   /* ---- Onboarding: Welcome Screen ---- */
                   <div className="welcome-card">
@@ -1279,7 +1579,11 @@ function App() {
                       diagnosticsDismissed ? (
                         <DiagnosticsDismissedNotice onShow={restoreDiagnostics} />
                       ) : (
-                        <DiagnosticsCard diagnostics={diagnostics} onDismiss={dismissDiagnostics} />
+                        <DiagnosticsCard
+                          diagnostics={diagnostics}
+                          surface={desktopState.isDesktop ? "desktop" : "developer"}
+                          onDismiss={dismissDiagnostics}
+                        />
                       )
                     ) : null}
                     <div className="welcome-features">
@@ -1869,10 +2173,12 @@ function writeDismissedDiagnosticsFingerprint(fingerprint: string | null) {
 
 function DiagnosticsCard({
   diagnostics,
+  surface = "developer",
   compact = false,
   onDismiss,
 }: {
   diagnostics: SystemDiagnostics;
+  surface?: "developer" | "desktop";
   compact?: boolean;
   onDismiss?: () => void;
 }) {
@@ -1905,10 +2211,14 @@ function DiagnosticsCard({
       ) : null}
       <p className="diagnostics-summary">
         {requiredErrors > 0
-          ? "Fix the required checks below before expecting Stuart to boot cleanly."
+          ? (surface === "desktop"
+            ? "Stuart needs the required checks below before it can start your study workspace."
+            : "Fix the required checks below before expecting Stuart to boot cleanly.")
           : optionalWarnings > 0
-            ? "Stuart can start, but some optional capabilities are unavailable."
-            : "Core prerequisites look good."}
+            ? (surface === "desktop"
+              ? "Stuart can start now. The optional items below only unlock higher-fidelity extras."
+              : "Stuart can start, but some optional capabilities are unavailable.")
+            : (surface === "desktop" ? "Stuart is ready. You can connect your account and start studying." : "Core prerequisites look good.")}
       </p>
       <div className="diagnostics-list">
         {visibleChecks.map((check) => (
@@ -1922,12 +2232,12 @@ function DiagnosticsCard({
               <p>{check.summary}</p>
               {check.detail ? <span className="diagnostic-detail">{check.detail}</span> : null}
               {check.resolution ? <span className="diagnostic-resolution">{check.resolution}</span> : null}
-              {check.command ? <code className="diagnostic-command">{check.command}</code> : null}
+              {surface === "developer" && check.command ? <code className="diagnostic-command">{check.command}</code> : null}
             </div>
           </div>
         ))}
       </div>
-      {(requiredErrors > 0 || optionalWarnings > 0) ? (
+      {surface === "developer" && (requiredErrors > 0 || optionalWarnings > 0) ? (
         <div className="diagnostics-footer">
           <code>pnpm preflight</code>
           <span>Run this in the repo root for a full terminal report.</span>
@@ -1957,6 +2267,236 @@ function DiagnosticsDismissedNotice({
   );
 }
 
+function DesktopOnboardingView({
+  diagnostics,
+  desktopState,
+  loginState,
+  isRefreshing,
+  isSigningIn,
+  isChoosingFolder,
+  canChooseFolder,
+  codexCliCheck,
+  codexAuthCheck,
+  dockerCheck,
+  onChooseFolder,
+  onRefresh,
+  onStartCodexLogin,
+  onOpenVerificationUri,
+  onOpenCodexHelp,
+}: {
+  diagnostics: SystemDiagnostics | null;
+  desktopState: DesktopBridgeState;
+  loginState: DesktopCodexLoginState | null;
+  isRefreshing: boolean;
+  isSigningIn: boolean;
+  isChoosingFolder: boolean;
+  canChooseFolder: boolean;
+  codexCliCheck: SystemDiagnosticCheck | null;
+  codexAuthCheck: SystemDiagnosticCheck | null;
+  dockerCheck: SystemDiagnosticCheck | null;
+  onChooseFolder: () => void;
+  onRefresh: () => void;
+  onStartCodexLogin: () => void;
+  onOpenVerificationUri: (url: string) => void;
+  onOpenCodexHelp: () => void;
+}) {
+  const checks = diagnostics?.checks ?? [];
+  const { requiredErrors, optionalWarnings } = summarizeDiagnostics(checks);
+  const signInReady = codexCliCheck?.status === "ok";
+  const authReady = codexAuthCheck?.status === "ok";
+  const loginRecentLines = loginState?.recentLines ?? [];
+  const showLoginBox =
+    Boolean(loginState && loginState.status !== "idle") &&
+    (!authReady || loginRecentLines.length > 0);
+
+  return (
+    <div className="desktop-onboarding">
+      <section className="desktop-onboarding-hero">
+        <div className="desktop-onboarding-kicker-row">
+          <span className="desktop-onboarding-kicker">Stuart Desktop</span>
+          <span className="desktop-onboarding-version">
+            {desktopState.platform} · v{desktopState.appVersion}
+          </span>
+        </div>
+        <h1>Open the app. Sign in once. Pick your study folder.</h1>
+        <p>
+          Stuart runs locally on your machine, uses your ChatGPT account for Codex,
+          and turns a normal course folder into a guided study workspace.
+        </p>
+      </section>
+
+      <div className="desktop-onboarding-grid">
+        <article className={`desktop-step-card${diagnostics?.requiredReady ? " ready" : ""}`}>
+          <div className="desktop-step-meta">
+            <span className="desktop-step-index">01</span>
+            <span className={`desktop-step-status ${diagnostics?.overallStatus ?? "warn"}`}>
+              {diagnostics?.requiredReady ? "Ready" : requiredErrors > 0 ? "Action needed" : "Checking"}
+            </span>
+          </div>
+          <h2>System check</h2>
+          <p>
+            Stuart checks the built-in study engine, your ChatGPT connection,
+            local storage, and a few optional document extras.
+          </p>
+          <div className="desktop-check-list">
+            {checks.slice(0, 5).map((check) => (
+              <div key={check.id} className={`desktop-check-row ${check.status}`}>
+                <span>{check.label}</span>
+                <strong>{check.status === "ok" ? "Ready" : check.status === "warn" ? "Optional" : "Needs setup"}</strong>
+              </div>
+            ))}
+          </div>
+          <div className="desktop-step-actions">
+            <button
+              className="ghost-button compact"
+              type="button"
+              onClick={onRefresh}
+              disabled={isRefreshing}
+            >
+              Refresh checks
+            </button>
+            <span className="desktop-step-note">
+              {requiredErrors > 0
+                ? `${requiredErrors} required issue${requiredErrors === 1 ? "" : "s"} left`
+                : optionalWarnings > 0
+                  ? `${optionalWarnings} optional enhancement${optionalWarnings === 1 ? "" : "s"}`
+                  : "Everything required is ready"}
+            </span>
+          </div>
+        </article>
+
+        <article className={`desktop-step-card${authReady ? " ready" : ""}`}>
+          <div className="desktop-step-meta">
+            <span className="desktop-step-index">02</span>
+            <span className={`desktop-step-status ${authReady ? "ok" : signInReady ? "warn" : "error"}`}>
+              {authReady ? "Connected" : signInReady ? "Needs sign-in" : "Needs repair"}
+            </span>
+          </div>
+          <h2>Connect your ChatGPT account</h2>
+          <p>
+            Stuart uses your ChatGPT account to power Codex locally. You only need
+            to connect once, and Stuart will keep using that session afterward.
+          </p>
+          <div className="desktop-callout">
+            <strong>
+              {authReady
+                ? "Your ChatGPT account is already connected."
+                : loginState?.message ?? codexAuthCheck?.summary ?? "ChatGPT sign-in not detected yet."}
+            </strong>
+            {authReady ? null : (
+              <>
+                {codexAuthCheck?.detail ? <span>{codexAuthCheck.detail}</span> : null}
+                {!signInReady && codexCliCheck?.resolution ? <span>{codexCliCheck.resolution}</span> : null}
+              </>
+            )}
+          </div>
+          {showLoginBox ? (
+            <div className="desktop-login-status">
+              {loginState?.userCode ? (
+                <div className="desktop-login-code">
+                  <span>Verification code</span>
+                  <strong>{loginState.userCode}</strong>
+                </div>
+              ) : null}
+              {loginRecentLines.length > 0 ? (
+                <div className="desktop-login-transcript">
+                  {loginRecentLines.map((line, index) => (
+                    <p key={`${line}-${index}`}>{line}</p>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="desktop-step-actions">
+            {loginState?.verificationUri && !authReady ? (
+              <button
+                className="ghost-button compact"
+                type="button"
+                onClick={() => onOpenVerificationUri(loginState.verificationUri!)}
+              >
+                Open sign-in page
+              </button>
+            ) : null}
+            <button
+              className="accent-button"
+              type="button"
+              onClick={signInReady ? onStartCodexLogin : onOpenCodexHelp}
+              disabled={isSigningIn || authReady}
+            >
+              {authReady
+                ? "Connected"
+                : isSigningIn
+                  ? "Waiting for sign-in..."
+                  : signInReady
+                    ? "Connect ChatGPT"
+                    : "Repair setup"}
+            </button>
+            <button
+              className="ghost-button compact"
+              type="button"
+              onClick={onOpenCodexHelp}
+            >
+              Help
+            </button>
+          </div>
+        </article>
+
+        <article className={`desktop-step-card workspace${canChooseFolder ? " ready" : " locked"}`}>
+          <div className="desktop-step-meta">
+            <span className="desktop-step-index">03</span>
+            <span className={`desktop-step-status ${canChooseFolder ? "ok" : "warn"}`}>
+              {canChooseFolder ? "Ready" : "Waiting"}
+            </span>
+          </div>
+          <h2>Select your study folder</h2>
+          <p>
+            Pick any course folder with slides, notes, PDFs, assignments, or readings.
+            Stuart will read it in the background and you can start asking questions immediately.
+          </p>
+          <div className="desktop-folder-hints">
+            <span>Lecture slides</span>
+            <span>Assignments</span>
+            <span>Notes</span>
+            <span>Readings</span>
+          </div>
+          <div className="desktop-step-actions">
+            <button
+              className="accent-button"
+              type="button"
+              onClick={onChooseFolder}
+              disabled={!canChooseFolder || isChoosingFolder}
+            >
+              {isChoosingFolder ? "Opening folder picker..." : "Choose study folder"}
+            </button>
+            <span className="desktop-step-note">
+              {canChooseFolder
+                ? "You can start studying as soon as the folder is selected."
+                : "Finish the required setup above first."}
+            </span>
+          </div>
+        </article>
+      </div>
+
+      <div className="desktop-onboarding-footer">
+        <div className="desktop-onboarding-footer-card">
+          <span className="desktop-onboarding-footer-label">Optional enhancement</span>
+          <strong>Docker sandbox</strong>
+          <p>
+            {dockerCheck?.status === "ok"
+              ? "Available for scripted document generation and sandboxed exports."
+              : "Not required for normal studying. It only unlocks advanced scripted document generation."}
+          </p>
+        </div>
+        <div className="desktop-onboarding-footer-card">
+          <span className="desktop-onboarding-footer-label">Local runtime</span>
+          <strong>{desktopState.apiOrigin}</strong>
+          <p>Your workspace, study history, and artifacts stay on this machine.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ================================================================
    Dashboard View
    ================================================================ */
@@ -1979,14 +2519,14 @@ function DashboardView({
   // Fetch summaries + timelines for all projects
   useEffect(() => {
     for (const project of projects) {
-      fetch(`/api/projects/${project.id}/learning-summary`)
+      fetch(apiUrl(`/api/projects/${project.id}/learning-summary`))
         .then((r) => r.json())
         .then((data: ProjectLearningSummary) => {
           setSummaries((prev) => ({ ...prev, [project.id]: data }));
         })
         .catch(() => {});
 
-      fetch(`/api/projects/${project.id}/study-timeline?days=30`)
+      fetch(apiUrl(`/api/projects/${project.id}/study-timeline?days=30`))
         .then((r) => r.json())
         .then((data: StudyTimelineEntry[]) => {
           setTimelines((prev) => ({ ...prev, [project.id]: data }));
@@ -1999,7 +2539,7 @@ function DashboardView({
   useEffect(() => {
     for (const task of tasks) {
       if (curriculumFlags[task.id] !== undefined) continue;
-      fetch(`/api/tasks/${task.id}/curriculum`)
+      fetch(apiUrl(`/api/tasks/${task.id}/curriculum`))
         .then((r) => r.json())
         .then((data: { exists: boolean }) => {
           setCurriculumFlags((prev) => ({ ...prev, [task.id]: data.exists }));
@@ -2418,6 +2958,33 @@ function ThinkingBubble({ label, recentActions, activities }: { label: string; r
   );
 }
 
+function WorkspaceSetupIndicator({ progress }: { progress: WorkspaceSetupState }) {
+  const activeStep = progress.steps.find((step) => step.status === "active") ?? null;
+  return (
+    <aside className="workspace-setup-indicator" aria-live="polite">
+      <div className="workspace-setup-header">
+        <span className="workspace-setup-kicker">Workspace Setup</span>
+        <span className="workspace-setup-status">{activeStep ? "In progress" : "Ready"}</span>
+      </div>
+      <h3>{progress.title}</h3>
+      <p>{progress.detail}</p>
+      <div className="workspace-setup-steps">
+        {progress.steps.map((step) => (
+          <div key={step.id} className={`workspace-setup-step ${step.status}`}>
+            <span className="workspace-setup-step-dot" />
+            <span>{step.label}</span>
+          </div>
+        ))}
+      </div>
+      <div className="workspace-setup-footer">
+        {activeStep
+          ? "Stuart can start teaching before every file is fully indexed."
+          : "You can start asking questions immediately."}
+      </div>
+    </aside>
+  );
+}
+
 function EmptyState({ title, body }: { title: string; body: string }) {
   return (
     <div className="empty-state">
@@ -2428,18 +2995,26 @@ function EmptyState({ title, body }: { title: string; body: string }) {
 }
 
 function MarkdownMessage({ content }: { content: string }) {
-  // Clean citation paths inline in content before rendering
-  const cleanedContent = content.replace(
-    /\[([^\]]*)\]\(attachments\/[a-f0-9-]+[-/][^)]+\)/gi,
-    (match, linkText) => {
-      // If the link text itself is a path, clean it
-      const cleaned = cleanSourceName(linkText);
-      return `**${cleaned}**`;
-    }
-  ).replace(
-    /attachments\/[a-f0-9]+-[a-f0-9]+-[a-f0-9]+-[a-f0-9]+-[a-f0-9]+[-/][^\s)"\]]+/gi,
-    (match) => cleanSourceName(match)
-  );
+  const cleanedContent = content
+    // Normalize malformed markdown links like `[Lecture 1] (/Users/... )`
+    .replace(/\[([^\]]+)\]\s+\(((?:\/Users\/|attachments\/)[^)]+)\)/gi, "[$1]($2)")
+    // Replace local-path markdown links with clean source labels so they render as pills
+    .replace(
+      /\[([^\]]*)\]\(((?:\/Users\/|attachments\/)[^)]+)\)/gi,
+      (_match, linkText, href) => {
+        const cleaned = cleanSourceName(linkText) || cleanSourceName(href);
+        return `[${cleaned}](${href})`;
+      }
+    )
+    // Clean bare local staging paths that occasionally leak into prose
+    .replace(
+      /\/Users\/[^\s)"\]]+/gi,
+      (match) => cleanSourceName(match)
+    )
+    .replace(
+      /attachments\/[a-f0-9-]+[-/][^\s)"\]]+/gi,
+      (match) => cleanSourceName(match)
+    );
 
   return (
     <div className="markdown-message">

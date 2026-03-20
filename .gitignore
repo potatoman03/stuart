@@ -30,6 +30,13 @@ playwright-report
 # User / runtime data
 .stuart-data
 
+# Desktop release artifacts
+apps/desktop/release
+
+# Desktop icon build intermediates
+apps/desktop/build/.icon-build
+apps/desktop/build/icon.iconset
+
 # OS
 .DS_Store
 Thumbs.db
