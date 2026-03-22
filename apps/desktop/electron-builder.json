@@ -12,6 +12,13 @@
     "dist/**/*",
     "package.json"
   ],
+  "extraResources": [
+    {
+      "from": "codex-vendor",
+      "to": "codex-vendor",
+      "filter": ["**/*"]
+    }
+  ],
   "mac": {
     "category": "public.app-category.education",
     "icon": "build/icon.icns",

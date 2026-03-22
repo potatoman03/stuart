@@ -1,0 +1,1 @@
+export { StudyDocCanvas } from "./StudyDocCanvas";

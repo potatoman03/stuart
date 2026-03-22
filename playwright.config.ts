@@ -20,7 +20,7 @@ export default defineConfig({
       timeout: 120_000,
     },
     {
-      command: `STUART_UI_PORT=${uiPort} pnpm --filter @stuart/web dev:client`,
+      command: `STUART_UI_PORT=${uiPort} PORT=${serverPort} pnpm --filter @stuart/web dev:client`,
       url: `http://127.0.0.1:${uiPort}`,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,

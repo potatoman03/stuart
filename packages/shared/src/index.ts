@@ -508,7 +508,8 @@ export const DEFAULT_NETWORK_POLICY = "ask";
 
 export type StudyArtifactKind =
   | "mindmap" | "flashcards" | "quiz" | "diagram" | "custom" | "mock_exam" | "interactive"
-  | "document_docx" | "document_xlsx" | "document_pptx" | "document_pdf";
+  | "document_docx" | "document_xlsx" | "document_pptx" | "document_pdf"
+  | "study_doc";
 
 export type MindMapNode = { id: string; label: string; detail: string; citations: CitationRef[]; children?: MindMapNode[] };
 export type Flashcard = { id: string; front: string; back: string; cue: string; citations: CitationRef[] };
@@ -591,6 +592,14 @@ export type PdfDocumentPayload = {
   sections: PdfSection[];
 };
 
+export type TipTapJSONContent = {
+  type: string;
+  attrs?: Record<string, unknown>;
+  content?: TipTapJSONContent[];
+  marks?: Array<{ type: string; attrs?: Record<string, unknown> }>;
+  text?: string;
+};
+
 export type ArtifactDraft =
   | { kind: "mindmap"; title: string; nodes: MindMapNode[] }
   | { kind: "flashcards"; title: string; cards: Flashcard[] }
@@ -602,7 +611,8 @@ export type ArtifactDraft =
   | { kind: "document_docx"; title: string; document: DocxDocumentPayload }
   | { kind: "document_xlsx"; title: string; workbook: XlsxWorkbookPayload }
   | { kind: "document_pptx"; title: string; presentation: PptxPresentationPayload }
-  | { kind: "document_pdf"; title: string; document: PdfDocumentPayload };
+  | { kind: "document_pdf"; title: string; document: PdfDocumentPayload }
+  | { kind: "study_doc"; title: string; markdown: string };
 
 export type CitationRef = {
   sourceId: string;

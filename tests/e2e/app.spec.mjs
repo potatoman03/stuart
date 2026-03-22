@@ -200,7 +200,7 @@ test("quiz artifact scaffold opens and supports answer checking", async ({ page,
   await page.locator(".quiz-option-card").filter({
     hasText: "Assets = Liabilities + Equity",
   }).click();
-  await page.getByRole("button", { name: "Check" }).click();
+  await page.getByRole("button", { name: "Check", exact: true }).click();
   await expect(page.getByText("Correct!")).toBeVisible();
   await expect(page.getByRole("button", { name: "See Results" })).toBeVisible();
 });

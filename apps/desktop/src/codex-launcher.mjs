@@ -152,6 +152,20 @@ function resolveCodexBinary(target) {
     }
   }
 
+  // Check extraResources/codex-vendor (used by packaged desktop builds)
+  // In packaged Electron apps, extraResources are at process.resourcesPath
+  const resourcesPath = process.resourcesPath ?? path.resolve(__dirname, "..");
+  const extraResourceCandidate = path.join(resourcesPath, "codex-vendor", target.targetTriple, "codex", target.binaryName);
+  if (existsSync(extraResourceCandidate)) {
+    return extraResourceCandidate;
+  }
+
+  // Also check relative to __dirname for dev builds that copy codex-vendor
+  const devVendorCandidate = path.resolve(__dirname, "..", "codex-vendor", target.targetTriple, "codex", target.binaryName);
+  if (existsSync(devVendorCandidate)) {
+    return devVendorCandidate;
+  }
+
   throw new Error(`Could not locate the bundled Codex runtime for ${target.targetTriple}. Reinstall Stuart.`);
 }
 

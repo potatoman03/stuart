@@ -12,6 +12,56 @@ import type {
   StudyArtifactKind,
 } from "@stuart/shared";
 import { apiUrl } from "./platform";
+import { StudyDocCanvas } from "./study-doc";
+import katex from "katex";
+
+/** Render text with inline ($...$) and display ($$...$$) LaTeX rendered via KaTeX. */
+function LatexText({ text }: { text: string }) {
+  // First strip HTML, then render LaTeX
+  const cleaned = stripHtml(text);
+  const parts: Array<{ type: "text" | "math"; content: string; display: boolean }> = [];
+  let remaining = cleaned;
+
+  // Match $$...$$ (display) and $...$ (inline) — process display first
+  const regex = /\$\$([\s\S]+?)\$\$|\$([^$\n]+?)\$/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = regex.exec(remaining)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ type: "text", content: remaining.slice(lastIndex, match.index), display: false });
+    }
+    const isDisplay = match[1] !== undefined;
+    const latex = (match[1] ?? match[2] ?? "").trim();
+    parts.push({ type: "math", content: latex, display: isDisplay });
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < remaining.length) {
+    parts.push({ type: "text", content: remaining.slice(lastIndex), display: false });
+  }
+
+  if (parts.length === 0) return <>{cleaned}</>;
+
+  return (
+    <>
+      {parts.map((part, i) => {
+        if (part.type === "text") return <span key={i}>{part.content}</span>;
+        try {
+          const html = katex.renderToString(part.content, {
+            displayMode: part.display,
+            throwOnError: false,
+          });
+          return part.display
+            ? <div key={i} className="katex-display-inline" dangerouslySetInnerHTML={{ __html: html }} />
+            : <span key={i} dangerouslySetInnerHTML={{ __html: html }} />;
+        } catch {
+          return <code key={i}>{part.content}</code>;
+        }
+      })}
+    </>
+  );
+}
 
 /* ---- Source Name Cleaning ---- */
 
@@ -208,13 +258,15 @@ type ArtifactCanvasProps = {
   onClose: () => void;
   onExplain?: (message: string) => void;
   artifactDbId?: string;
+  taskId?: string;
   onDelete?: () => void;
   onInlineAsk?: (message: string) => void;
   inlineResponse?: string | null;
   isInlineLoading?: boolean;
+  onSavePayload?: (newPayload: string) => Promise<void> | void;
 };
 
-export default function ArtifactCanvas({ title, kind, payload, onClose, onExplain, artifactDbId, onDelete, onInlineAsk, inlineResponse, isInlineLoading }: ArtifactCanvasProps) {
+export default function ArtifactCanvas({ title, kind, payload, onClose, onExplain, artifactDbId, taskId, onDelete, onInlineAsk, inlineResponse, isInlineLoading, onSavePayload }: ArtifactCanvasProps) {
   let parsed: ArtifactDraft | null = null;
   try {
     parsed = JSON.parse(payload) as ArtifactDraft;
@@ -235,7 +287,7 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
   return (
     <div className="artifact-canvas-overlay">
       <div className="artifact-canvas-panel">
-        <div className="artifact-canvas-header">
+        {kind !== "study_doc" && <div className="artifact-canvas-header">
           <div>
             <span className={`kind-badge ${kind}`}>{kind}</span>
             <h2>{title}</h2>
@@ -287,8 +339,8 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
               &larr; Back to chat
             </button>
           </div>
-        </div>
-        <div className="artifact-canvas-body">
+        </div>}
+        <div className={`artifact-canvas-body${kind === "study_doc" ? " study-doc-body" : ""}`}>
           {!parsed ? (
             <div className="empty-state">
               <strong>Could not display this artifact</strong>
@@ -314,6 +366,17 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
               onInlineAsk={onInlineAsk}
               inlineResponse={inlineResponse}
               isInlineLoading={isInlineLoading}
+            />
+          ) : kind === "study_doc" ? (
+            <StudyDocCanvas
+              initialDoc={parsed?.kind === "study_doc" ? (parsed as any).doc : undefined}
+              initialMarkdown={parsed?.kind === "study_doc" ? (parsed as any).markdown : typeof parsed === "object" && parsed && "markdown" in parsed ? (parsed as any).markdown : undefined}
+              title={title}
+              artifactId={artifactDbId}
+              taskId={taskId}
+              onSavePayload={onSavePayload}
+              onDelete={onDelete}
+              onClose={onClose}
             />
           ) : kind === "interactive" && parsed.kind === "interactive" ? (
             <InteractiveCanvas
@@ -1188,7 +1251,7 @@ function FlashcardsCanvas({
             <ul>
               {weakCards.slice(0, 5).map(wc => {
                 const card = cards.find(c => c.id === wc.cardId);
-                return card ? <li key={wc.cardId}>{stripHtml(card.front)}</li> : null;
+                return card ? <li key={wc.cardId}><LatexText text={card.front} /></li> : null;
               })}
             </ul>
           </div>
@@ -1320,7 +1383,7 @@ function FlashcardsCanvas({
           {/* Front */}
           <div className="flashcard-flip-face flashcard-flip-front">
             <span className="flashcard-side-label">{isCloze ? "Fill in the blank" : "Question"}</span>
-            <p className="front-text">{isCloze ? renderCloze(clozeText, false) : stripHtml(currentCard.front)}</p>
+            <p className="front-text">{isCloze ? renderCloze(clozeText, false) : <LatexText text={currentCard.front} />}</p>
           </div>
           {/* Back */}
           <div className="flashcard-flip-face flashcard-flip-back">
@@ -1328,12 +1391,10 @@ function FlashcardsCanvas({
             <div className="back-text">
               {isCloze
                 ? <p>{renderCloze(clozeText, true)}</p>
-                : stripHtml(currentCard.back).split("\n").map((line, i) => (
-                    <p key={i}>{line || "\u00A0"}</p>
-                  ))
+                : <div><LatexText text={currentCard.back} /></div>
               }
             </div>
-            {currentCard.cue && <p className="cue-text">{stripHtml(currentCard.cue)}</p>}
+            {currentCard.cue && <p className="cue-text"><LatexText text={currentCard.cue} /></p>}
             {currentCard.citations.length > 0 && (
               <div style={{ marginTop: 12 }}>
                 <CitationPills citations={currentCard.citations} />
@@ -1673,7 +1734,7 @@ function QuizCanvas({
         <span className="quiz-question-number">
           Question {currentQ + 1} of {activeQuestions.length}
         </span>
-        <p className="quiz-question-text">{question.prompt}</p>
+        <p className="quiz-question-text"><LatexText text={question.prompt} /></p>
 
         {/* Options */}
         <div className="quiz-options-grid">
@@ -1710,7 +1771,7 @@ function QuizCanvas({
                 <span className="quiz-option-letter">
                   {String.fromCharCode(65 + oi)}
                 </span>
-                <span className="quiz-option-text">{option}</span>
+                <span className="quiz-option-text"><LatexText text={option} /></span>
               </button>
             );
           })}
@@ -1729,7 +1790,7 @@ function QuizCanvas({
                 className={`quiz-feedback ${isCorrect ? "correct" : "incorrect"}`}
               >
                 <strong>{isCorrect ? "Correct!" : "Not quite."}</strong>{" "}
-                {question.explanation}
+                <LatexText text={question.explanation ?? ""} />
                 {question.citations.length > 0 && (
                   <div style={{ marginTop: 8 }}>
                     <CitationPills citations={question.citations} />
@@ -2223,7 +2284,7 @@ function MockExamCanvas({
                   onClick={() => setAnswers(prev => ({ ...prev, [q.id]: opt }))}
                 >
                   <span className="quiz-option-letter">{String.fromCharCode(65 + oi)}</span>
-                  <span className="quiz-option-text">{opt}</span>
+                  <span className="quiz-option-text"><LatexText text={opt} /></span>
                 </button>
               ))}
             </div>

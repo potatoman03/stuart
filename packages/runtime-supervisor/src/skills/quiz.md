@@ -79,6 +79,16 @@ For MRQ questions:
 - Include "(Select all that apply)" in the prompt so the student knows.
 - `optionExplanations` must explain why each option is correct OR incorrect.
 
+## Self-containment rule (CRITICAL)
+
+Every question MUST be completely self-contained. A student must be able to answer the question using ONLY the information in the question prompt, their general course knowledge, and any data explicitly stated in the question.
+
+- If a question involves a specific equation, model, regression output, dataset, or numerical example from the workspace materials, you MUST reproduce the full equation/data inside the question prompt itself.
+- NEVER write "using the equation from...", "referring to the model above", "based on the healthcare expenditure model", or any reference to context outside the question.
+- Workspace-specific equations (e.g., `Y = 0.56X₁ + 0.16X₂ + 0.89X₃ + 0.23`) are NOT general knowledge. They are assignment-specific data. If you want to test on them, copy the full equation into the question: "Given the estimated model: Y = 0.56X₁ + 0.16X₂ + 0.89X₃ + 0.23, what is the predicted value of Y when X₁=2, X₂=3, X₃=1?"
+- Do NOT present assignment-specific models as if they are named, well-known formulas. An equation from a problem set is just "the given regression model", not "the healthcare expenditure model".
+- If you cannot make a question self-contained without it becoming too long, skip that question and test the concept differently.
+
 ## Grounding rules
 
 - Every question should have citations to the material that justifies the correct answer.
@@ -90,9 +100,9 @@ For MRQ questions:
 
 1. Determine the requested scope and difficulty.
 2. Search the workspace for the strongest teaching material and any past quiz or exam examples.
-3. Identify the concepts worth testing.
-4. Build questions that require real understanding.
-5. Write plausible distractors.
+3. **Plan coverage first**: list the 5-10 core concepts to test. Ensure no single slide or paragraph produces more than 2 questions. Spread across the scope.
+4. Build questions that require real understanding — ban "single fact lifted from one slide" questions unless intentionally easy tier.
+5. Write plausible distractors. If past quizzes exist, match their distractor style (numerical near-misses, conceptual confusions, etc.).
 6. Add concise teaching explanations.
 7. Return one valid JSON code block.
 

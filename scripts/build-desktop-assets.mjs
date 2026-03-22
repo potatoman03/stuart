@@ -103,4 +103,56 @@ await rm(desktopServerOutDir, { recursive: true, force: true });
 await cp(webClientDistDir, desktopClientOutDir, { recursive: true });
 await cp(webServerDistDir, desktopServerOutDir, { recursive: true });
 
+// Copy the platform-specific Codex binary to a well-known location
+// (pnpm's virtual store structure isn't followed by electron-builder)
+const codexVendorDir = join(desktopDir, "codex-vendor");
+await rm(codexVendorDir, { recursive: true, force: true });
+
+const platform = process.platform;
+const arch = process.arch;
+const targetMap = {
+  "darwin-arm64": { triple: "aarch64-apple-darwin", suffix: "-darwin-arm64" },
+  "darwin-x64": { triple: "x86_64-apple-darwin", suffix: "-darwin-x64" },
+  "linux-arm64": { triple: "aarch64-unknown-linux-musl", suffix: "-linux-arm64" },
+  "linux-x64": { triple: "x86_64-unknown-linux-musl", suffix: "-linux-x64" },
+  "win32-arm64": { triple: "aarch64-pc-windows-msvc", suffix: "-win32-arm64" },
+  "win32-x64": { triple: "x86_64-pc-windows-msvc", suffix: "-win32-x64" },
+};
+
+const target = targetMap[`${platform}-${arch}`];
+if (target) {
+  const binaryName = platform === "win32" ? "codex.exe" : "codex";
+  // Search pnpm store for the codex binary
+  const { readdirSync, existsSync } = await import("node:fs");
+  const pnpmStore = join(workspaceRoot, "node_modules", ".pnpm");
+  let codexBinaryPath = null;
+
+  if (existsSync(pnpmStore)) {
+    for (const entry of readdirSync(pnpmStore)) {
+      if (!entry.startsWith("@openai+codex@") || !entry.includes(target.suffix)) continue;
+      const candidate = join(pnpmStore, entry, "node_modules", "@openai", "codex", "vendor", target.triple, "codex", binaryName);
+      if (existsSync(candidate)) {
+        codexBinaryPath = candidate;
+        break;
+      }
+    }
+  }
+
+  if (codexBinaryPath) {
+    const vendorOutDir = join(codexVendorDir, target.triple, "codex");
+    await mkdir(vendorOutDir, { recursive: true });
+    await copyFile(codexBinaryPath, join(vendorOutDir, binaryName));
+    // Also copy the path/ directory if it exists (companion binaries)
+    const pathDir = join(dirname(dirname(codexBinaryPath)), "path");
+    if (existsSync(pathDir)) {
+      await cp(pathDir, join(codexVendorDir, target.triple, "path"), { recursive: true });
+    }
+    process.stdout.write(`Bundled Codex runtime for ${target.triple}.\n`);
+  } else {
+    process.stdout.write(`Warning: Codex runtime for ${target.triple} not found in pnpm store.\n`);
+  }
+} else {
+  process.stdout.write(`Warning: No Codex runtime target for ${platform}-${arch}.\n`);
+}
+
 process.stdout.write("Synced desktop app assets.\n");

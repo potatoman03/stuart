@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, useCallback, type CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import type {
   ApprovalRecord,
   ArtifactDraft,
@@ -126,6 +128,7 @@ const STUDY_TOOL_PROMPTS: Record<string, string> = {
   diagram: "Create a diagram to visualize the key concepts from my study materials.",
   mock_exam: "Create a mock exam based on the past papers in my study folder. Analyze the exam format and generate new questions in the same style.",
   interactive: "Build me an interactive visualisation or simulation to help me understand the current topic.",
+  study_doc: "Create a rich study document summarizing the current topic based on my materials.",
   custom: "Create a custom study artifact: "
 };
 
@@ -136,6 +139,7 @@ const DEMO_KIND_ICONS: Record<string, string> = {
   diagram: "Flow",
   mock_exam: "Exam",
   interactive: "App",
+  study_doc: "Doc",
 };
 
 const DIAGNOSTICS_DISMISS_KEY = "stuart.dismissedDiagnostics.v1";
@@ -271,6 +275,11 @@ function App() {
 
   /* ---- UI State ---- */
   const [composerDraft, setComposerDraft] = useState("");
+  const [composerImage, setComposerImage] = useState<string | null>(null);
+  const [composerFile, setComposerFile] = useState<{ name: string; size: number; dataBase64: string } | null>(null);
+  const [composerDragOver, setComposerDragOver] = useState(false);
+  const [serverHealth, setServerHealth] = useState<"ok" | "degraded" | "down">("ok");
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [thinkingState, setThinkingState] = useState<ThinkingState | null>(null);
@@ -455,6 +464,13 @@ function App() {
     streamingDelta && selectedTask && streamingDelta.taskId === selectedTask.id
   );
   const selectedStudyArtifacts = selectedTask ? studyArtifacts[selectedTask.id] ?? [] : [];
+
+  // Review data: weak topics + cards due
+  const [reviewData, setReviewData] = useState<{
+    weakTopics: Array<{ topic: string; totalAttempts: number; correctCount: number }>;
+    cardsDue: number;
+    loaded: boolean;
+  }>({ weakTopics: [], cardsDue: 0, loaded: false });
   const diagnosticsFingerprint = diagnostics ? buildDiagnosticsFingerprint(diagnostics) : null;
   const diagnosticsDismissed = Boolean(
     diagnosticsFingerprint && diagnosticsFingerprint === dismissedDiagnosticsFingerprint
@@ -463,6 +479,7 @@ function App() {
   // Group artifacts by kind
   const groupedArtifacts = useMemo(() => {
     const groups: Record<string, StudyArtifactRecord[]> = {
+      study_doc: [],
       flashcards: [],
       quiz: [],
       mindmap: [],
@@ -548,7 +565,7 @@ function App() {
       if (message.includes("/api/dashboard") || message === "Failed to fetch") {
         setError(
           desktopState.isDesktop
-            ? "Stuart is still starting its local study runtime. Give it a second, then refresh the system check."
+            ? "Stuart's local study runtime isn't responding."
             : "The local Stuart API is not ready yet. Wait a second and refresh, or restart with `pnpm dev`."
         );
         return;
@@ -696,6 +713,46 @@ function App() {
 
   useEffect(() => {
     void refreshDashboard().catch(() => {});
+  }, []);
+
+  // Fetch review data when project changes
+  useEffect(() => {
+    if (!selectedProject?.id) return;
+    let alive = true;
+    (async () => {
+      try {
+        const [weakRes, summaryRes] = await Promise.all([
+          fetch(apiUrl(`/api/projects/${selectedProject.id}/weak-topics`)).then((r) => r.ok ? r.json() : []),
+          fetch(apiUrl(`/api/projects/${selectedProject.id}/learning-summary`)).then((r) => r.ok ? r.json() : null),
+        ]);
+        if (alive) {
+          setReviewData({
+            weakTopics: weakRes as any[],
+            cardsDue: (summaryRes as any)?.cardsDue ?? 0,
+            loaded: true,
+          });
+        }
+      } catch {
+        if (alive) setReviewData({ weakTopics: [], cardsDue: 0, loaded: true });
+      }
+    })();
+    return () => { alive = false; };
+  }, [selectedProject?.id, openArtifact]); // refresh after closing an artifact (might have studied)
+
+  // Health polling — check server status every 15s
+  useEffect(() => {
+    let alive = true;
+    async function check() {
+      try {
+        const res = await fetch(apiUrl("/api/health"), { signal: AbortSignal.timeout(5000) });
+        if (alive) setServerHealth(res.ok ? "ok" : "degraded");
+      } catch {
+        if (alive) setServerHealth("down");
+      }
+    }
+    void check();
+    const timer = setInterval(() => void check(), 15_000);
+    return () => { alive = false; clearInterval(timer); };
   }, []);
 
   useEffect(() => {
@@ -1170,18 +1227,143 @@ function App() {
     }
   }
 
+  /* ---- Image attachment helpers ---- */
+  const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MB
+
+  function processImageFile(file: File) {
+    if (!file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      // If the image exceeds the size limit, resize it via canvas
+      if (file.size > MAX_IMAGE_BYTES) {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          // Scale down proportionally so the longest side is at most 1600px
+          const maxDim = 1600;
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            const scale = maxDim / Math.max(width, height);
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+          }
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, width, height);
+            setComposerImage(canvas.toDataURL("image/jpeg", 0.8));
+          }
+        };
+        img.src = dataUrl;
+      } else {
+        setComposerImage(dataUrl);
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+
+    if (file.type.startsWith("image/")) {
+      processImageFile(file);
+      return;
+    }
+
+    // Document file — read as base64 and attach
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      // Strip the data URL prefix to get raw base64
+      const base64 = dataUrl.split(",")[1] ?? "";
+      setComposerFile({ name: file.name, size: file.size, dataBase64: base64 });
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handleComposerPaste(e: React.ClipboardEvent) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item && item.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) processImageFile(file);
+        return;
+      }
+    }
+  }
+
+  function handleComposerDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setComposerDragOver(true);
+  }
+
+  function handleComposerDragLeave(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setComposerDragOver(false);
+  }
+
+  function handleComposerDrop(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setComposerDragOver(false);
+    const file = e.dataTransfer?.files?.[0];
+    if (!file) return;
+    if (file.type.startsWith("image/")) {
+      processImageFile(file);
+    } else {
+      // Document file
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const base64 = dataUrl.split(",")[1] ?? "";
+        setComposerFile({ name: file.name, size: file.size, dataBase64: base64 });
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+
   async function handleComposerSubmit(event: React.FormEvent) {
     event.preventDefault();
     const prompt = composerDraft.trim();
-    if (!prompt) return;
+    if (!prompt && !composerImage && !composerFile) return;
 
     if (selectedTask) {
       try {
         setBusy("message");
+
+        // If a document file is attached, stage it for Codex to read
+        if (composerFile) {
+          setThinkingState({ taskId: selectedTask.id, label: `Staging ${composerFile.name}...`, recentActions: [] });
+          await request(`/api/tasks/${selectedTask.id}/upload-file`, {
+            method: "POST",
+            body: JSON.stringify({ filename: composerFile.name, dataBase64: composerFile.dataBase64 }),
+          });
+        }
+
         setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking...", recentActions: [] });
+        const body: Record<string, string> = {};
+        if (prompt) {
+          body.content = composerFile
+            ? `${prompt}\n\n(Uploaded file: ${composerFile.name})`
+            : prompt;
+        } else if (composerFile) {
+          body.content = `I just uploaded ${composerFile.name}. Please read it and tell me what's in it.`;
+        } else {
+          body.content = "(see attached image)";
+        }
+        if (composerImage) body.imageBase64 = composerImage;
         const result = await request<SendMessageResponse>(
           `/api/tasks/${selectedTask.id}/messages`,
-          { method: "POST", body: JSON.stringify({ content: prompt }) }
+          { method: "POST", body: JSON.stringify(body) }
         );
         setMessagesByTask((cur) => ({
           ...cur,
@@ -1191,6 +1373,8 @@ function App() {
           setThinkingState((cur) => (cur?.taskId === selectedTask.id ? null : cur));
         }
         setComposerDraft("");
+        setComposerImage(null);
+        setComposerFile(null);
       } catch (caughtError) {
         setError(caughtError instanceof Error ? caughtError.message : "Failed to send message");
       } finally {
@@ -1282,9 +1466,37 @@ function App() {
       {error ? (
         <div className="error-banner">
           <span>{error}</span>
-          <button className="ghost-button compact" type="button" onClick={() => setError(null)}>
-            Dismiss
-          </button>
+          <div style={{ display: "flex", gap: 6 }}>
+            {desktopState.isDesktop && desktopBridge?.restartServer ? (
+              <button
+                className="ghost-button compact"
+                type="button"
+                onClick={() => {
+                  setError(null);
+                  setBusy("restarting");
+                  void desktopBridge!.restartServer().then(() => {
+                    setBusy(null);
+                    void refreshDashboard();
+                  }).catch(() => {
+                    setBusy(null);
+                    setError("Failed to restart the server. Try quitting and reopening Stuart.");
+                  });
+                }}
+              >
+                {busy === "restarting" ? "Restarting..." : "Restart Server"}
+              </button>
+            ) : null}
+            <button
+              className="ghost-button compact"
+              type="button"
+              onClick={() => { setError(null); void refreshDashboard(); }}
+            >
+              Retry
+            </button>
+            <button className="ghost-button compact" type="button" onClick={() => setError(null)}>
+              Dismiss
+            </button>
+          </div>
         </div>
       ) : null}
 
@@ -1326,6 +1538,14 @@ function App() {
                 <path d="m27.18 138.2c3.11 5.63 8.07 9.06 12.29 11.43-6.66-5.05-12.29-11.82-12.29-22.6 0-13.71 7.14-25.89 13.46-35.93 5.05-7.93 7.07-14.9 6.97-20.81-0.67-8.28-7.2-16.36-16.26-15.9-8.16 0.6-14.64 9.41-15.34 19.13-0.1 0.35-0.1 0.35-0.4 0-4.63-5.63-7.38-10.35-7.38-20.09 0.5-18.77 18.14-42.35 44.59-42.35 26.1 0 46.27 18.95 46.27 45.28 0 9.85-3.31 18.93-7.77 27.06-19.14 11.13-34.75 30.41-34.75 56.35 0 12.54 4.35 25.08 12.81 35.46-19.27-0.45-35.17-13.65-42.2-37.03z"/>
               </svg>
               <span className="brand-mark">Stuart</span>
+              <span
+                className={`server-health-dot ${serverHealth}`}
+                title={
+                  serverHealth === "ok" ? "Server running" :
+                  serverHealth === "degraded" ? "Server responding slowly" :
+                  "Server not responding"
+                }
+              />
             </div>
             <button
               className="ghost-button compact library-collapse-btn"
@@ -1655,8 +1875,53 @@ function App() {
 
           {/* Composer */}
           {selectedTask ? (
-            <form className="composer-shell" onSubmit={handleComposerSubmit}>
+            <form className={`composer-shell${composerDragOver ? " drag-over" : ""}`} onSubmit={handleComposerSubmit} onDragOver={handleComposerDragOver} onDragLeave={handleComposerDragLeave} onDrop={handleComposerDrop}>
               <div className="composer-frame">
+                {/* Drag overlay */}
+                {composerDragOver && (
+                  <div className="composer-drop-zone">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
+                      <circle cx="8.5" cy="8.5" r="1.5" />
+                      <polyline points="21 15 16 10 5 21" />
+                    </svg>
+                    <span>Drop file here</span>
+                  </div>
+                )}
+                {/* Image preview strip */}
+                {composerImage && !composerDragOver && (
+                  <div className="composer-image-preview">
+                    <img className="composer-image-thumb" src={composerImage} alt="Attached" />
+                    <button
+                      type="button"
+                      className="composer-image-remove"
+                      onClick={() => setComposerImage(null)}
+                      aria-label="Remove attached image"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <line x1="2" y1="2" x2="10" y2="10" />
+                        <line x1="10" y1="2" x2="2" y2="10" />
+                      </svg>
+                    </button>
+                  </div>
+                )}
+                {/* Document file preview */}
+                {composerFile && !composerDragOver && (
+                  <div className="composer-file-preview">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9 1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5z" />
+                      <polyline points="9 1 9 5 13 5" />
+                    </svg>
+                    <span className="composer-file-name">{composerFile.name}</span>
+                    <span className="composer-file-size">{(composerFile.size / 1024).toFixed(0)}KB</span>
+                    <button type="button" className="composer-image-remove" onClick={() => setComposerFile(null)} aria-label="Remove file">
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <line x1="2" y1="2" x2="10" y2="10" />
+                        <line x1="10" y1="2" x2="2" y2="10" />
+                      </svg>
+                    </button>
+                  </div>
+                )}
                 <textarea
                   value={composerDraft}
                   onChange={(e) => setComposerDraft(e.target.value)}
@@ -1667,14 +1932,35 @@ function App() {
                       void handleComposerSubmit(e);
                     }
                   }}
+                  onPaste={handleComposerPaste}
+                />
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*,.pdf,.docx,.doc,.xlsx,.xls,.pptx,.ppt,.md,.txt,.csv"
+                  style={{ display: "none" }}
+                  onChange={handleFileSelect}
                 />
                 <div className="composer-bottom">
-                  <div className="composer-tools" />
+                  <div className="composer-tools">
+                    <button
+                      type="button"
+                      className="composer-upload-btn"
+                      onClick={() => fileInputRef.current?.click()}
+                      aria-label="Attach file"
+                      title="Attach file, image, or document"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <line x1="8" y1="3" x2="8" y2="13" />
+                        <line x1="3" y1="8" x2="13" y2="8" />
+                      </svg>
+                    </button>
+                  </div>
                   <div className="composer-meta">
                     <button
                       className="send-button"
                       type="submit"
-                      disabled={busy === "message" || turnInFlight || !composerDraft.trim()}
+                      disabled={busy === "message" || turnInFlight || (!composerDraft.trim() && !composerImage)}
                       aria-label="Send message"
                     >
                       <svg
@@ -1776,6 +2062,43 @@ function App() {
                       <rect x="14" y="14" width="7" height="7" rx="1" />
                     </svg>
                     Diagram
+                  </button>
+                  <button
+                    className="quick-create-btn study_doc"
+                    type="button"
+                    onClick={() => {
+                      if (!selectedTask) return;
+                      void (async () => {
+                        try {
+                          const payload = JSON.stringify({
+                            kind: "study_doc",
+                            title: "Untitled Notes",
+                            markdown: "",
+                          });
+                          const artifact = await request<StudyArtifactRecord>(
+                            `/api/tasks/${selectedTask.id}/study-artifacts`,
+                            { method: "POST", body: JSON.stringify({ kind: "study_doc", title: "Untitled Notes", payload }) }
+                          );
+                          setStudyArtifacts((cur) => ({
+                            ...cur,
+                            [selectedTask.id]: [...(cur[selectedTask.id] ?? []), artifact],
+                          }));
+                          setOpenArtifact(artifact);
+                        } catch (err) {
+                          setError(err instanceof Error ? err.message : "Failed to create study doc");
+                        }
+                      })();
+                    }}
+                    disabled={busy === "message"}
+                  >
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                      <line x1="16" y1="13" x2="8" y2="13" />
+                      <line x1="16" y1="17" x2="8" y2="17" />
+                      <polyline points="10 9 9 9 8 9" />
+                    </svg>
+                    Study Doc
                   </button>
                   <button
                     className="quick-create-btn mock_exam"
@@ -1896,6 +2219,18 @@ function App() {
                 </div>
               ) : null}
 
+              {/* Review section */}
+              {reviewData.loaded && selectedTask && (reviewData.cardsDue > 0 || reviewData.weakTopics.length > 0 || selectedStudyArtifacts.some((a) => a.kind === "flashcards" || a.kind === "quiz")) ? (
+                <ReviewPanel
+                  taskId={selectedTask.id}
+                  artifacts={selectedStudyArtifacts}
+                  cardsDue={reviewData.cardsDue}
+                  weakTopics={reviewData.weakTopics}
+                  onOpenArtifact={(artifact) => setOpenArtifact(artifact)}
+                  onError={(msg) => setError(msg)}
+                />
+              ) : null}
+
               {/* Generated study artifacts */}
               {selectedStudyArtifacts.length > 0 ? (
                 <div className="tools-section">
@@ -1903,6 +2238,7 @@ function App() {
                   {Object.entries(groupedArtifacts).map(([kind, artifacts]) => {
                     if (artifacts.length === 0) return null;
                     const labels: Record<string, string> = {
+                      study_doc: "Study Docs",
                       flashcards: "Flashcards",
                       quiz: "Quizzes",
                       mindmap: "Mind Maps",
@@ -2014,6 +2350,22 @@ function App() {
                 if (selectedTaskId) void sendTaskMessage(selectedTaskId, message);
               }}
               artifactDbId={openArtifact?.id}
+              taskId={selectedTaskId ?? undefined}
+              onSavePayload={openArtifact ? async (newPayload: string) => {
+                try {
+                  await request(`/api/study-artifacts/${openArtifact.id}`, {
+                    method: "PATCH",
+                    body: JSON.stringify({ payload: newPayload }),
+                  });
+                  setStudyArtifacts((cur) => ({
+                    ...cur,
+                    [selectedTaskId!]: (cur[selectedTaskId!] ?? []).map((a) =>
+                      a.id === openArtifact.id ? { ...a, payload: newPayload } : a
+                    ),
+                  }));
+                  setOpenArtifact((cur) => cur ? { ...cur, payload: newPayload } : null);
+                } catch { /* save failed silently */ }
+              } : undefined}
               onInlineAsk={(message) => {
                 if (!selectedTaskId) return;
                 setInlineResponse(null);
@@ -2501,6 +2853,169 @@ function DesktopOnboardingView({
    Dashboard View
    ================================================================ */
 
+/* ================================================================
+   Review Panel — selectable decks for cross-deck flashcard + quiz review
+   ================================================================ */
+
+function ReviewPanel({
+  taskId,
+  artifacts,
+  cardsDue,
+  weakTopics,
+  onOpenArtifact,
+  onError,
+}: {
+  taskId: string;
+  artifacts: StudyArtifactRecord[];
+  cardsDue: number;
+  weakTopics: Array<{ topic: string; totalAttempts: number; correctCount: number }>;
+  onOpenArtifact: (artifact: StudyArtifactRecord) => void;
+  onError: (msg: string) => void;
+}) {
+  const flashcardDecks = artifacts.filter((a) => a.kind === "flashcards");
+  const quizDecks = artifacts.filter((a) => a.kind === "quiz");
+  const [expanded, setExpanded] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set([
+    ...flashcardDecks.map((a) => a.id),
+    ...quizDecks.map((a) => a.id),
+  ]));
+  const [mode, setMode] = useState<"cards" | "quiz">("cards");
+  const [loading, setLoading] = useState(false);
+
+  const toggleId = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const startReview = async () => {
+    setLoading(true);
+    try {
+      if (mode === "cards") {
+        const allCards = await request<Array<{
+          artifactId: string; artifactTitle: string; cardId: string;
+          front: string; back: string; cue?: string;
+          easeFactor: number; lastRating: string; reason: string;
+        }>>(`/api/tasks/${taskId}/review-cards`);
+
+        const filtered = allCards.filter((c) => selectedIds.has(c.artifactId));
+        if (filtered.length === 0) { onError("No weak or due cards in selected decks."); return; }
+
+        onOpenArtifact({
+          id: `review-cards-${Date.now()}`, taskId, kind: "flashcards",
+          title: `Review: ${filtered.length} weak/due cards`,
+          payload: JSON.stringify({
+            kind: "flashcards",
+            title: `Review: ${filtered.length} weak/due cards`,
+            cards: filtered.map((c) => ({ id: `${c.artifactId}__${c.cardId}`, front: c.front, back: c.back, cue: c.cue ?? "", citations: [] })),
+          }),
+          createdAt: new Date().toISOString(),
+        } as any);
+      } else {
+        const allQ = await request<Array<{
+          artifactId: string; artifactTitle: string; questionId: string;
+          prompt: string; options: string[]; answer: string; explanation: string; selectedAnswer: string;
+        }>>(`/api/tasks/${taskId}/review-questions`);
+
+        const filtered = allQ.filter((q) => selectedIds.has(q.artifactId));
+        if (filtered.length === 0) { onError("No wrong answers in selected quizzes."); return; }
+
+        onOpenArtifact({
+          id: `review-quiz-${Date.now()}`, taskId, kind: "quiz",
+          title: `Retry: ${filtered.length} wrong answers`,
+          payload: JSON.stringify({
+            kind: "quiz",
+            title: `Retry: ${filtered.length} wrong answers`,
+            questions: filtered.map((q) => ({ id: `${q.artifactId}__${q.questionId}`, prompt: q.prompt, options: q.options, answer: q.answer, explanation: q.explanation, optionExplanations: {}, citations: [] })),
+          }),
+          createdAt: new Date().toISOString(),
+        } as any);
+      }
+    } catch { onError("Could not load review data."); }
+    finally { setLoading(false); }
+  };
+
+  if (flashcardDecks.length === 0 && quizDecks.length === 0) return null;
+  const currentDecks = mode === "cards" ? flashcardDecks : quizDecks;
+
+  // Collapsed: single compact row
+  if (!expanded) {
+    return (
+      <button className="review-compact-bar" type="button" onClick={() => setExpanded(true)}>
+        <span className="review-compact-left">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+            <circle cx="8" cy="8" r="6.5" />
+            <polyline points="8 4.5 8 8 10.5 9.5" />
+          </svg>
+          {cardsDue > 0
+            ? <span><strong>{cardsDue}</strong> due</span>
+            : <span>Review</span>}
+          {weakTopics.length > 0 && (
+            <span className="review-compact-weak">{weakTopics.length} weak area{weakTopics.length !== 1 ? "s" : ""}</span>
+          )}
+        </span>
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+          <polyline points="3 5 6 8 9 5" />
+        </svg>
+      </button>
+    );
+  }
+
+  // Expanded
+  return (
+    <div className="tools-section review-section">
+      <div className="review-header-row">
+        <span className="tools-section-label">Review</span>
+        <button className="review-collapse-btn" type="button" onClick={() => setExpanded(false)} title="Collapse">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+            <polyline points="3 8 6 5 9 8" />
+          </svg>
+        </button>
+      </div>
+
+      {weakTopics.length > 0 && (
+        <div className="review-weak-topics">
+          {weakTopics.slice(0, 3).map((t) => {
+            const pct = t.totalAttempts > 0 ? Math.round((t.correctCount / t.totalAttempts) * 100) : 0;
+            return (
+              <div key={t.topic} className="review-weak-item">
+                <span className="review-weak-topic">{t.topic}</span>
+                <span className={`review-weak-pct${pct < 50 ? " low" : pct < 70 ? " mid" : ""}`}>{pct}%</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="review-mode-tabs">
+        <button className={`review-mode-tab${mode === "cards" ? " active" : ""}`} type="button" onClick={() => setMode("cards")}>
+          Cards ({flashcardDecks.length})
+        </button>
+        <button className={`review-mode-tab${mode === "quiz" ? " active" : ""}`} type="button" onClick={() => setMode("quiz")}>
+          Quiz ({quizDecks.length})
+        </button>
+      </div>
+
+      <div className="review-deck-list">
+        {currentDecks.map((deck) => (
+          <label key={deck.id} className="review-deck-item">
+            <input type="checkbox" checked={selectedIds.has(deck.id)} onChange={() => toggleId(deck.id)} />
+            <span className="review-deck-name">{deck.title || `Untitled`}</span>
+          </label>
+        ))}
+      </div>
+
+      <button className="review-practice-btn" type="button" onClick={() => void startReview()}
+        disabled={loading || !currentDecks.some((d) => selectedIds.has(d.id))}>
+        {loading ? "Loading..." : mode === "cards" ? "Review weak cards" : "Retry wrong answers"}
+      </button>
+    </div>
+  );
+}
+
 function DashboardView({
   projects,
   tasks,
@@ -2515,6 +3030,7 @@ function DashboardView({
   const [summaries, setSummaries] = useState<Record<string, ProjectLearningSummary>>({});
   const [timelines, setTimelines] = useState<Record<string, StudyTimelineEntry[]>>({});
   const [curriculumFlags, setCurriculumFlags] = useState<Record<string, boolean>>({});
+  const [dashWeakTopics, setDashWeakTopics] = useState<Record<string, Array<{ topic: string; totalAttempts: number; correctCount: number }>>>({});
 
   // Fetch summaries + timelines for all projects
   useEffect(() => {
@@ -2530,6 +3046,13 @@ function DashboardView({
         .then((r) => r.json())
         .then((data: StudyTimelineEntry[]) => {
           setTimelines((prev) => ({ ...prev, [project.id]: data }));
+        })
+        .catch(() => {});
+
+      fetch(apiUrl(`/api/projects/${project.id}/weak-topics`))
+        .then((r) => r.ok ? r.json() : [])
+        .then((data: Array<{ topic: string; totalAttempts: number; correctCount: number }>) => {
+          setDashWeakTopics((prev) => ({ ...prev, [project.id]: data }));
         })
         .catch(() => {});
     }
@@ -2636,6 +3159,44 @@ function DashboardView({
           </div>
         </div>
       </section>
+
+      {/* Review panel — aggregate weak areas across all workspaces */}
+      {(() => {
+        const allWeak = Object.entries(dashWeakTopics).flatMap(([pid, topics]) =>
+          topics.map((t) => ({ ...t, projectId: pid, projectName: projects.find((p) => p.id === pid)?.name ?? "" }))
+        );
+        const totalDue = Object.values(summaries).reduce((s, v) => s + (v.cardsDue ?? 0), 0);
+        if (allWeak.length === 0 && totalDue === 0) return null;
+        return (
+          <section className="dash-review-panel">
+            <div className="dash-review-header">
+              <span className="zen-section-label">Review</span>
+              {totalDue > 0 && (
+                <span className="dash-review-due-badge">{totalDue} card{totalDue !== 1 ? "s" : ""} due</span>
+              )}
+            </div>
+            {allWeak.length > 0 && (
+              <div className="dash-review-topics">
+                {allWeak.slice(0, 6).map((t) => {
+                  const pct = t.totalAttempts > 0 ? Math.round((t.correctCount / t.totalAttempts) * 100) : 0;
+                  return (
+                    <div key={`${t.projectId}-${t.topic}`} className="dash-review-topic-item">
+                      <div className="dash-review-topic-info">
+                        <span className="dash-review-topic-name">{t.topic}</span>
+                        <span className="dash-review-topic-source">{t.projectName}</span>
+                      </div>
+                      <div className="dash-review-topic-bar">
+                        <div className="dash-review-topic-fill" style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className={`dash-review-topic-pct${pct < 50 ? " low" : pct < 70 ? " mid" : ""}`}>{pct}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        );
+      })()}
 
       {/* Hero headline */}
       <div className="zen-hero">
@@ -2994,8 +3555,24 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+/**
+ * Normalize LaTeX delimiters so remark-math can detect them.
+ * Codex uses several formats:
+ *   \( ... \)  →  $ ... $     (standard LaTeX inline)
+ *   \[ ... \]  →  $$ ... $$   (standard LaTeX display)
+ *   bare \le, x_2 etc.        (no delimiters — harder, skip for now)
+ */
+function wrapBareLatex(text: string): string {
+  let result = text;
+  // Convert \( ... \) to $ ... $
+  result = result.replace(/\\\((.+?)\\\)/g, (_, inner) => `$${inner}$`);
+  // Convert \[ ... \] to $$ ... $$
+  result = result.replace(/\\\[(.+?)\\\]/gs, (_, inner) => `$$${inner}$$`);
+  return result;
+}
+
 function MarkdownMessage({ content }: { content: string }) {
-  const cleanedContent = content
+  const cleanedContent = wrapBareLatex(content)
     // Normalize malformed markdown links like `[Lecture 1] (/Users/... )`
     .replace(/\[([^\]]+)\]\s+\(((?:\/Users\/|attachments\/)[^)]+)\)/gi, "[$1]($2)")
     // Replace local-path markdown links with clean source labels so they render as pills
@@ -3019,7 +3596,8 @@ function MarkdownMessage({ content }: { content: string }) {
   return (
     <div className="markdown-message">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
         components={{
           a: ({ children, href }) => {
             const normalizedHref = href?.trim() ?? "";

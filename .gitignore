@@ -32,6 +32,7 @@ playwright-report
 
 # Desktop release artifacts
 apps/desktop/release
+apps/desktop/codex-vendor
 
 # Desktop icon build intermediates
 apps/desktop/build/.icon-build

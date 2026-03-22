@@ -198,6 +198,69 @@ function updateLoadingWindow(window: BrowserWindow | null, state: LoadingWindowS
   });
 }
 
+async function stopEmbeddedWebServer() {
+  if (!runningWebServer) return;
+  try {
+    await runningWebServer.close();
+  } catch { /* best effort */ }
+  runningWebServer = null;
+}
+
+async function restartEmbeddedWebServer() {
+  await stopEmbeddedWebServer();
+  await startEmbeddedWebServer();
+  // Update the preload env so the renderer picks up the (potentially new) port
+  process.env.STUART_API_ORIGIN = apiOrigin;
+  // Reload the main window to reconnect
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.loadURL(apiOrigin);
+  }
+}
+
+let healthWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+
+function startHealthWatchdog() {
+  if (healthWatchdogTimer || isDevelopment()) return;
+
+  healthWatchdogTimer = setInterval(async () => {
+    // Don't check if we're already restarting or no server was ever started
+    if (!runningWebServer && !apiOrigin) return;
+
+    try {
+      const res = await fetch(`${apiOrigin}/api/health`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (res.ok) return; // healthy
+    } catch {
+      // Server not responding
+    }
+
+    // Check if the child process is still alive
+    const child = runningWebServer?.child;
+    if (child && child.exitCode === null) {
+      // Process alive but not responding — might be blocked. Give it one more chance.
+      try {
+        const retry = await fetch(`${apiOrigin}/api/health`, {
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (retry.ok) return;
+      } catch { /* still dead */ }
+    }
+
+    // Server is down — restart it
+    process.stderr.write("[stuart] Health watchdog: server not responding. Restarting...\n");
+    try {
+      await restartEmbeddedWebServer();
+      process.stderr.write("[stuart] Health watchdog: server restarted successfully.\n");
+    } catch (err) {
+      process.stderr.write(`[stuart] Health watchdog: restart failed: ${err}\n`);
+    }
+  }, 30_000);
+
+  // Don't let the watchdog keep the process alive on quit
+  healthWatchdogTimer.unref();
+}
+
 async function startEmbeddedWebServer(onProgress?: (state: LoadingWindowState) => void) {
   if (runningWebServer || isDevelopment()) {
     return runningWebServer;
@@ -491,6 +554,9 @@ async function boot() {
   // Set API origin AFTER the server starts so the dynamic port is reflected.
   process.env.STUART_API_ORIGIN = apiOrigin;
 
+  // Start the health watchdog to auto-restart the server if it crashes
+  startHealthWatchdog();
+
   updateLoadingWindow(loadingWindow, {
     title: "Opening your workspace",
     detail: "The study engine is ready. Stuart is loading the app interface now.",
@@ -527,6 +593,12 @@ ipcMain.handle("stuart:pick-folder", async () => {
   return result.canceled ? null : (result.filePaths[0] ?? null);
 });
 
+ipcMain.handle("stuart:show-in-folder", async (_event, filePath: string) => {
+  if (!filePath || typeof filePath !== "string") return false;
+  shell.showItemInFolder(filePath);
+  return true;
+});
+
 ipcMain.handle("stuart:open-external", async (_event, url: string) => {
   if (!url || typeof url !== "string") {
     return false;
@@ -544,6 +616,15 @@ ipcMain.handle("stuart:get-codex-login-state", async () => {
   return codexLoginState;
 });
 
+ipcMain.handle("stuart:restart-server", async () => {
+  try {
+    await restartEmbeddedWebServer();
+    return true;
+  } catch {
+    return false;
+  }
+});
+
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
@@ -551,6 +632,10 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  if (healthWatchdogTimer) {
+    clearInterval(healthWatchdogTimer);
+    healthWatchdogTimer = null;
+  }
   if (codexLoginChild && codexLoginChild.exitCode === null) {
     codexLoginChild.kill("SIGTERM");
     codexLoginChild = null;

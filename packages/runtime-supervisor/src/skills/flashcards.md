@@ -38,6 +38,15 @@ The deck must be grounded in the workspace material, pedagogically strong, and v
 }
 ```
 
+## Self-containment rule (CRITICAL)
+
+Every flashcard MUST be self-contained. The front (question) side must provide all information needed to answer it.
+
+- If a card tests a specific equation, model, or dataset from the workspace, reproduce the relevant data on the front of the card.
+- NEVER write "What does the healthcare expenditure model predict?" when that model is just an assignment-specific regression. Instead write: "Given the model: Y = 0.56X₁ + 0.16X₂ + 0.89X₃ + 0.23, what is the marginal effect of X₁?"
+- Do NOT present workspace-specific equations as named, well-known formulas.
+- The back (answer) should also be independently understandable without needing to see other cards.
+
 ## Grounding rules
 
 - Every card should have at least one citation unless the workspace truly provides no attributable support.
@@ -66,6 +75,11 @@ The deck must be grounded in the workspace material, pedagogically strong, and v
 - Use plain text only. No HTML.
 - Avoid "What does this file teach?" style prompts.
 - Avoid cards that merely restate a heading without the underlying concept.
+- No paraphrase duplicates: if two cards test the same underlying fact from different angles, keep only the stronger one.
+
+### Novelty check
+
+If the student already has flashcard decks for this task, check the existing deck titles and avoid generating a deck that substantially overlaps with an existing one. If overlap is unavoidable, focus on concepts not yet covered.
 
 ### Good card coverage
 

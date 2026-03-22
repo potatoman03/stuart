@@ -96,7 +96,7 @@ export class StuartHarness {
 export function createStuartHarnessApp(options: StuartHarnessAppOptions): express.Express {
   const app = express();
 
-  app.use(express.json());
+  app.use(express.json({ limit: "5mb" }));
   app.use("/api", createStuartApiRouter(options));
   options.configureApp?.(app, options.harness);
 
@@ -273,8 +273,11 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       return;
     }
 
+    const imageBase64 =
+      typeof request.body?.imageBase64 === "string" ? request.body.imageBase64 : undefined;
+
     const taskId = firstParam(request.params.taskId);
-    const result = await runtime.sendTaskMessage(taskId, content);
+    const result = await runtime.sendTaskMessage(taskId, content, { imageBase64 });
     if (result.preparedRun) {
       broadcastEvent(eventClients, {
         type: "task.run",
@@ -458,6 +461,18 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     response.json(artifact satisfies StudyArtifactRecord);
   });
 
+  // ---- Quick Inline Completion (for study doc slash commands) ----
+
+  router.post("/quick-complete", asyncRoute(async (request, response) => {
+    const { prompt, fallback } = request.body ?? {};
+    if (!prompt || typeof prompt !== "string") {
+      response.status(400).send("prompt is required.");
+      return;
+    }
+    const result = await runtime.quickComplete(prompt, fallback ?? "");
+    response.json({ result });
+  }));
+
   router.post("/tasks/:taskId/study-artifacts", (request, response) => {
     const { kind, title, payload } = request.body ?? {};
     if (!kind || !title || !payload) {
@@ -538,6 +553,145 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       runtime.db.getWeakCards(artifactId) satisfies CardPerformanceRecord[]
     );
   });
+
+  // Aggregate weak/due cards across ALL flashcard decks for a task
+  router.get("/tasks/:taskId/review-cards", (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const artifacts = runtime.db.listStudyArtifacts(taskId).filter((a) => a.kind === "flashcards");
+    const reviewCards: Array<{
+      artifactId: string;
+      artifactTitle: string;
+      cardId: string;
+      front: string;
+      back: string;
+      cue?: string;
+      easeFactor: number;
+      lastRating: string;
+      nextReviewDate: string;
+      reason: "due" | "weak";
+    }> = [];
+
+    for (const artifact of artifacts) {
+      let parsed: { cards?: Array<{ id: string; front: string; back: string; cue?: string }> };
+      try { parsed = JSON.parse(artifact.payload); } catch { continue; }
+      if (!parsed.cards) continue;
+
+      const dueCards = runtime.db.getCardsForReview(artifact.id);
+      const weakCards = runtime.db.getWeakCards(artifact.id);
+      const dueIds = new Set(dueCards.map((c) => c.cardId));
+      const allPerfMap = new Map(
+        [...dueCards, ...weakCards].map((c) => [c.cardId, c])
+      );
+
+      for (const card of parsed.cards) {
+        const perf = allPerfMap.get(card.id);
+        if (!perf) continue;
+        const reason = dueIds.has(card.id) ? "due" as const : "weak" as const;
+        reviewCards.push({
+          artifactId: artifact.id,
+          artifactTitle: artifact.title,
+          cardId: card.id,
+          front: card.front,
+          back: card.back,
+          cue: card.cue,
+          easeFactor: perf.easeFactor,
+          lastRating: perf.lastRating ?? "",
+          nextReviewDate: perf.nextReviewDate ?? "",
+          reason,
+        });
+      }
+    }
+
+    // Sort: due first, then by ease factor ascending (weakest first)
+    reviewCards.sort((a, b) => {
+      if (a.reason !== b.reason) return a.reason === "due" ? -1 : 1;
+      return a.easeFactor - b.easeFactor;
+    });
+
+    response.json(reviewCards);
+  });
+
+  // Aggregate wrong quiz answers across ALL quizzes for a task
+  router.get("/tasks/:taskId/review-questions", (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const artifacts = runtime.db.listStudyArtifacts(taskId).filter((a) => a.kind === "quiz");
+    const reviewQuestions: Array<{
+      artifactId: string;
+      artifactTitle: string;
+      questionId: string;
+      prompt: string;
+      options: string[];
+      answer: string;
+      explanation: string;
+      selectedAnswer: string;
+    }> = [];
+
+    for (const artifact of artifacts) {
+      let parsed: { questions?: Array<{ id: string; prompt: string; options: string[]; answer: string; explanation?: string }> };
+      try { parsed = JSON.parse(artifact.payload); } catch { continue; }
+      if (!parsed.questions) continue;
+
+      const perfRecords = runtime.db.listQuizPerformance(artifact.id);
+      const wrongIds = new Set(perfRecords.filter((p) => !p.isCorrect).map((p) => p.questionId));
+      const perfMap = new Map(perfRecords.map((p) => [p.questionId, p]));
+
+      for (const q of parsed.questions) {
+        if (!wrongIds.has(q.id)) continue;
+        const perf = perfMap.get(q.id);
+        reviewQuestions.push({
+          artifactId: artifact.id,
+          artifactTitle: artifact.title,
+          questionId: q.id,
+          prompt: q.prompt,
+          options: q.options,
+          answer: q.answer,
+          explanation: q.explanation ?? "",
+          selectedAnswer: perf?.selectedAnswer ?? "",
+        });
+      }
+    }
+
+    response.json(reviewQuestions);
+  });
+
+  // Upload a file to the task's staging area (transient by default).
+  // Codex can read it during the turn. Pass ?persist=true to also copy to project root.
+  router.post("/tasks/:taskId/upload-file", asyncRoute(async (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const { filename, dataBase64 } = request.body ?? {};
+    const persist = request.query.persist === "true";
+    if (!filename || !dataBase64) {
+      response.status(400).send("filename and dataBase64 are required.");
+      return;
+    }
+    const task = runtime.db.getTask(taskId);
+    if (!task) { response.status(404).send("Task not found."); return; }
+
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+
+    // Write to staging so Codex can read it during the turn
+    const latestRun = runtime.listTaskRuns(taskId)[0];
+    const stagingDir = latestRun?.stagingPath ?? join(runtime.dataDir, "staging", taskId);
+    const destPath = join(stagingDir, "uploads", filename);
+    await mkdir(join(stagingDir, "uploads"), { recursive: true });
+    const buffer = Buffer.from(dataBase64, "base64");
+    await writeFile(destPath, buffer);
+
+    // Optionally persist to project root
+    let persistedPath: string | undefined;
+    if (persist) {
+      const project = runtime.db.getProject(task.projectId);
+      if (project?.rootPath) {
+        persistedPath = join(project.rootPath, filename);
+        await mkdir(project.rootPath, { recursive: true });
+        await writeFile(persistedPath, buffer);
+        void runtime.buildTaskIngestionIndex(taskId, { force: true }).catch(() => {});
+      }
+    }
+
+    response.json({ path: destPath, size: buffer.length, persisted: persistedPath });
+  }));
 
   router.post("/study-artifacts/:id/export-anki", (request, response) => {
     const artifactId = firstParam(request.params.id);

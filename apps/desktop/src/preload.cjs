@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld("stuartDesktop", {
   apiOrigin: process.env.STUART_API_ORIGIN || "http://127.0.0.1:8787",
   pickFolder: () => ipcRenderer.invoke("stuart:pick-folder"),
   openExternal: (url) => ipcRenderer.invoke("stuart:open-external", url),
+  showInFolder: (filePath) => ipcRenderer.invoke("stuart:show-in-folder", filePath),
   startCodexLogin: () => ipcRenderer.invoke("stuart:start-codex-login"),
   getCodexLoginState: () => ipcRenderer.invoke("stuart:get-codex-login-state"),
+  restartServer: () => ipcRenderer.invoke("stuart:restart-server"),
 });

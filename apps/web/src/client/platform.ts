@@ -17,6 +17,8 @@ export type StuartDesktopBridge = {
   openExternal: (url: string) => Promise<boolean>;
   startCodexLogin: () => Promise<boolean>;
   getCodexLoginState: () => Promise<DesktopCodexLoginState>;
+  restartServer: () => Promise<boolean>;
+  showInFolder: (filePath: string) => Promise<boolean>;
 };
 
 declare global {

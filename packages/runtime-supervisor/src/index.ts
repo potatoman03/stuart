@@ -87,6 +87,7 @@ interface SendTaskMessageResult {
 
 interface SendTaskMessageOptions {
   retryCount?: number;
+  imageBase64?: string;
 }
 
 interface PermissionGap {
@@ -124,6 +125,8 @@ interface ActiveTurnState {
   memoryExtraction?: boolean;
   /** Quiz validation context — if set, this turn is checking quiz accuracy */
   quizValidation?: { artifactId: string; originalPayload: string };
+  /** If set, resolves a quickComplete promise when the turn finishes */
+  quickCompleteResolve?: (text: string) => void;
 }
 
 interface ResolvedWorkspaceFile extends WorkspaceFileRecord {
@@ -602,6 +605,56 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
   }
 
   /**
+   * Run a quick ephemeral Codex completion and return the result text.
+   * Uses gpt-5.4-mini at low effort for fast inline results (slash commands, etc.).
+   * Times out after 15 seconds and returns the fallback.
+   */
+  async quickComplete(prompt: string, fallback: string = ""): Promise<string> {
+    try {
+      await this.codex.ensureReady();
+      const thread = await this.codex.request<{ thread: { id: string } }>("thread/start", {
+        cwd: this.dataDir,
+        approvalPolicy: "never",
+        model: "gpt-5.4-mini",
+        personality: "pragmatic",
+        ephemeral: true,
+      });
+
+      const turn = await this.codex.request<{ turn: { id: string } }>("turn/start", {
+        threadId: thread.thread.id,
+        cwd: this.dataDir,
+        approvalPolicy: "never",
+        effort: "low",
+        input: [{ type: "text" as const, text: prompt, text_elements: [] }],
+      });
+
+      // Wait for the turn to complete via a promise
+      const result = await new Promise<string>((resolve) => {
+        const timeout = setTimeout(() => resolve(fallback), 15_000);
+        this.turns.set(turn.turn.id, {
+          taskId: "",
+          threadId: thread.thread.id,
+          turnId: turn.turn.id,
+          lastActivityAt: Date.now(),
+          kind: "worker",
+          assistantText: "",
+          thinkingLabel: "",
+          startedEmitted: false,
+          memoryExtraction: true, // prevents storing as chat message
+          quickCompleteResolve: (text: string) => {
+            clearTimeout(timeout);
+            resolve(text);
+          },
+        });
+      });
+
+      return result.trim() || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /**
    * Ensure a document artifact has its binary file rendered on disk.
    * Renders on-demand if the file is missing. Returns the file path or null.
    */
@@ -893,7 +946,16 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
         type: "text" as const,
         text: trimmed,
         text_elements: []
-      }
+      },
+      // Include image as multimodal input if provided
+      ...(options.imageBase64
+        ? [
+            {
+              type: "image" as const,
+              url: options.imageBase64,
+            }
+          ]
+        : [])
     ];
     const turn = await this.codex.request<{ turn: { id: string } }>("turn/start", {
       threadId,
@@ -2094,8 +2156,8 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
           return;
         }
 
-        // Memory extraction turns: capture text but don't store as a chat message
-        if (state?.memoryExtraction) {
+        // Internal helper turns: capture text but don't store as a chat message
+        if (state?.memoryExtraction || state?.quizValidation) {
           state.assistantText = params.item.text;
           return;
         }
@@ -2150,11 +2212,19 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                   userMessage: undefined,
                   memoryExtraction: undefined,
                   quizValidation: undefined,
+                  quickCompleteResolve: undefined,
                 }
               : null;
           })();
 
         if (!state) {
+          return;
+        }
+
+        // Quick-complete turns: resolve the promise and clean up
+        if (state.quickCompleteResolve) {
+          state.quickCompleteResolve(state.assistantText);
+          this.turns.delete(state.turnId);
           return;
         }
 
@@ -3292,8 +3362,37 @@ function buildCurriculumContext(projectRootPath: string): string {
 function buildStudentMemoryContext(db: LocalDatabase | undefined, projectId: string): string {
   if (!db) return "";
   try {
-    const memories = db.queryStudentMemories(projectId, 12);
-    if (memories.length === 0) return "";
+    const rawMemories = db.queryStudentMemories(projectId, 40);
+    if (rawMemories.length === 0) return "";
+
+    const limits: Record<string, number> = {
+      preference: 2,
+      progress: 2,
+      goal: 2,
+      fact: 2,
+      context: 1,
+    };
+    const counts = new Map<string, number>();
+    const categoryOrder = ["preference", "progress", "goal", "fact", "context"];
+    const memories = [...rawMemories]
+      .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
+      .filter((memory) => {
+        const current = counts.get(memory.category) ?? 0;
+        const limit = limits[memory.category] ?? 1;
+        if (current >= limit) {
+          return false;
+        }
+        counts.set(memory.category, current + 1);
+        return true;
+      })
+      .sort((left, right) => {
+        const categoryDelta =
+          categoryOrder.indexOf(left.category) - categoryOrder.indexOf(right.category);
+        if (categoryDelta !== 0) {
+          return categoryDelta;
+        }
+        return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+      });
 
     const lines = memories.map((m) => {
       const age = Math.floor((Date.now() - new Date(m.createdAt).getTime()) / 86400000);
@@ -3404,6 +3503,12 @@ Stuart automatically remembers important facts about you across sessions — you
 
 ## Capabilities
 You can generate study artifacts (flashcards, quizzes, mind maps, diagrams, mock exams, interactive apps, PDF/DOCX/XLSX/PPTX documents). When asked to create one, you will receive detailed formatting instructions in the context. The artifact itself is the primary deliverable. Always output artifacts as a single JSON code block with a "kind" and "title" field, and never stop at a prose description plus a filename mention.
+
+## Artifact self-containment (CRITICAL)
+When generating any artifact (quiz, flashcard, mock exam, etc.), every question or card MUST be independently answerable. If a question references a specific equation, model, dataset, or numerical example from the student's materials, you MUST reproduce the full data inside the question text itself. Never assume the student has another document open. Never refer to "the model" or "the equation" without stating it in full. Workspace-specific data (regression coefficients, sample datasets, assignment equations) is NOT general knowledge — always present it as "given data" in the question, never as a named formula.
+
+## Math notation (CRITICAL)
+ALL mathematical expressions — in chat responses, flashcards, quizzes, mock exams, study docs, and any other output — MUST be wrapped in LaTeX delimiters. Use dollar signs for inline math and double dollar signs for display math. Never output bare math notation like c^T x or x_1 + x_2 — always wrap it in single dollar signs for inline or double dollar signs for display. This applies to variables, equations, inequalities, subscripts, superscripts, Greek letters, operators, and any mathematical symbol. Stuart's renderer uses KaTeX and can only render math inside dollar-sign delimiters.
 
 You can also research new topics, fetch content from URLs and repos, and build structured curricula with saved source files — detailed instructions will be provided when the student asks for this.${memoryContext}${legacyMemoryContext}${buildCurriculumContext(project.rootPath)}${perfSnapshot}`;
 }
@@ -3915,7 +4020,7 @@ function summarizeThinkingDelta(value: string): string {
   return compact.length > 140 ? `${compact.slice(0, 137).trimEnd()}...` : compact;
 }
 
-const ARTIFACT_PATTERN = /\b(flashcards?|quiz|mind\s*map|mindmap|diagram|mock[\s_-]*exam|interactive)\b/i;
+const ARTIFACT_PATTERN = /\b(flashcards?|quiz|mind\s*map|mindmap|diagram|mock[\s_-]*exam|interactive|study[\s_-]*doc|notes)\b/i;
 
 export function tryParseArtifactJson(
   text: string,
@@ -3987,6 +4092,11 @@ export function tryParseArtifactJson(
       presentation: "document_pptx",
       document_pdf: "document_pdf",
       pdf_document: "document_pdf",
+      study_doc: "study_doc",
+      "study doc": "study_doc",
+      "study document": "study_doc",
+      "notes document": "study_doc",
+      notes: "study_doc",
     };
 
     const kind = kindMap[rawKind.toLowerCase()] ?? null;

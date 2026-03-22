@@ -160,6 +160,15 @@ export const STUDY_SKILLS: Skill[] = [
     priority: 78,
   },
   {
+    id: "study-doc",
+    match: (message) =>
+      artifactRequest(message, /\b(study\s*doc(?:ument)?|write\s*notes|create\s*notes|note[- ]taking|study\s*notes|rich\s*document|editable\s*doc)\b/i)
+      || politeArtifactRequest(message, /\b(study\s*doc(?:ument)?|study\s*notes|rich\s*document|editable\s*doc|note[- ]taking)\b/i)
+      || terseArtifactRequest(message, /\b(study\s*doc(?:ument)?|study\s*notes|rich\s*document|editable\s*doc|note[- ]taking)\b/i),
+    prompt: loadSkillFile("study-doc.md"),
+    priority: 83,
+  },
+  {
     id: "mock-exam",
     match: (message) =>
       artifactRequest(message, /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i)
