@@ -19,6 +19,8 @@ export type StuartDesktopBridge = {
   getCodexLoginState: () => Promise<DesktopCodexLoginState>;
   restartServer: () => Promise<boolean>;
   showInFolder: (filePath: string) => Promise<boolean>;
+  encryptToken: (plaintext: string) => Promise<{ encrypted: string | null; fallback: string | null }>;
+  decryptToken: (encryptedBase64: string) => Promise<string>;
 };
 
 declare global {

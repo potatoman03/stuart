@@ -635,6 +635,31 @@ ipcMain.handle("stuart:restart-server", async () => {
   }
 });
 
+ipcMain.handle("stuart:encrypt-token", async (_event, plaintext: string) => {
+  if (!plaintext || typeof plaintext !== "string") return { encrypted: null, fallback: null };
+  try {
+    const { safeStorage } = await import("electron");
+    if (!safeStorage.isEncryptionAvailable()) {
+      return { encrypted: null, fallback: plaintext };
+    }
+    const buffer = safeStorage.encryptString(plaintext);
+    return { encrypted: buffer.toString("base64"), fallback: null };
+  } catch {
+    return { encrypted: null, fallback: plaintext };
+  }
+});
+
+ipcMain.handle("stuart:decrypt-token", async (_event, encryptedBase64: string) => {
+  if (!encryptedBase64 || typeof encryptedBase64 !== "string") return "";
+  try {
+    const { safeStorage } = await import("electron");
+    const buffer = Buffer.from(encryptedBase64, "base64");
+    return safeStorage.decryptString(buffer);
+  } catch {
+    return "";
+  }
+});
+
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();

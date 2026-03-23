@@ -220,7 +220,57 @@ export class StuartRuntime {
         if (filtered) {
           process.stderr.write(filtered);
         }
-      }
+      },
+      onRateLimitsUpdated: (snapshot, account) => {
+        try {
+          this.db.insertUsageSnapshot({
+            primaryUsedPercent: snapshot.primary?.usedPercent ?? null,
+            primaryResetsAt: snapshot.primary?.resetsAt != null
+              ? new Date(snapshot.primary.resetsAt * 1000).toISOString()
+              : null,
+            primaryWindowMins: snapshot.primary?.windowDurationMins ?? null,
+            secondaryUsedPercent: snapshot.secondary?.usedPercent ?? null,
+            secondaryResetsAt: snapshot.secondary?.resetsAt != null
+              ? new Date(snapshot.secondary.resetsAt * 1000).toISOString()
+              : null,
+            secondaryWindowMins: snapshot.secondary?.windowDurationMins ?? null,
+            hasCredits: snapshot.credits?.hasCredits ?? null,
+            creditsUnlimited: snapshot.credits?.unlimited ?? null,
+            creditsBalance: snapshot.credits?.balance ?? null,
+            planType: snapshot.planType ?? account?.planType ?? null,
+            email: account?.email ?? null,
+            source: "rpc",
+          });
+        } catch (err) {
+          process.stderr.write(`[stuart] failed to store usage snapshot: ${String(err)}\n`);
+        }
+      },
+      onTokenUsageUpdated: (payload) => {
+        try {
+          const usage = payload.tokenUsage.last;
+          if (!usage) return;
+          // Correlate with active turn to find taskId
+          let taskId: string | undefined;
+          for (const turn of this.turns.values()) {
+            if (turn.threadId === payload.threadId) {
+              taskId = turn.taskId;
+              break;
+            }
+          }
+          this.db.insertTurnMetrics({
+            taskId: taskId ?? null,
+            threadId: payload.threadId,
+            turnId: payload.turnId ?? null,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            cachedInputTokens: usage.cachedInputTokens ?? 0,
+            reasoningTokens: usage.reasoningOutputTokens ?? 0,
+            totalTokens: usage.totalTokens,
+          });
+        } catch (err) {
+          process.stderr.write(`[stuart] failed to store turn metrics: ${String(err)}\n`);
+        }
+      },
     });
   }
 
@@ -2788,6 +2838,10 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
         }
 
         this.turns.delete(params.turn.id);
+
+        // Refresh rate limits after each completed turn
+        void this.codex.refreshRateLimits();
+
         return;
       }
 
@@ -3657,8 +3711,8 @@ export function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec
 - When your knowledge conflicts with the workspace evidence, default to the workspace evidence. The student's course materials are the authority for course-specific claims.
 - Diagnose what the student is probably trying to understand, not just the literal wording of the question.
 - If neither the workspace nor your domain knowledge covers the question, say so honestly.
-- Cite sources by name. Prefer lecture slides, chapters, notes, and study guides over code/config files.
-- Synthesize concepts clearly instead of listing files or pasting raw excerpts.
+- When citing a source file, use the format **【short name】** with bold lenticular brackets — e.g. **【CA2 Instructions】**, **【L3 - Process Scheduling】**, **【Guide to Readings】**. Use a short, clean display name: strip folder paths, course codes, dates, and file extensions. Never include the full file path. Never use markdown link syntax like [text](path) for file references.
+- Synthesize concepts clearly instead of listing files or pasting raw excerpts. When summarising what files cover a topic, list them compactly: **【L3】** **【L4】** **【L5】**, not a run-on chain of linked paths.
 - When the student references a specific chapter, lecture, week, or worksheet, search for matching filenames first (e.g. "Lecture 01", "Chapter 1") before exploring broadly.
 - If the question is broad, give the student the clean mental model first, then the most important supporting details.
 

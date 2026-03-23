@@ -802,7 +802,9 @@ export type StudentMemorySourceKind =
   | "quiz_result"
   | "card_review"
   | "session_end"
-  | "migration";
+  | "migration"
+  | "canvas_grade"
+  | "canvas_assignment";
 
 export type StudentMemoryRecord = {
   id: string;
@@ -889,3 +891,100 @@ export function extractTopic(title: string, cue?: string): string {
   if (cue) return cue.trim().toLowerCase();
   return topic || "general";
 }
+
+/* ---- Canvas LMS Integration ---- */
+
+export type CanvasConnectionRecord = {
+  id: string;
+  label: string;
+  baseUrl: string;
+  userDisplayName: string | null;
+  userId: string | null;
+  isActive: boolean;
+  lastVerifiedAt: string | null;
+  lastSyncAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CreateCanvasConnectionInput = {
+  label: string;
+  baseUrl: string;
+  token: string;
+};
+
+export type CanvasCourseMappingRecord = {
+  id: string;
+  connectionId: string;
+  canvasCourseId: string;
+  canvasCourseName: string;
+  canvasCourseCode: string | null;
+  canvasTermName: string | null;
+  projectId: string | null;
+  syncEnabled: boolean;
+  lastSyncedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CanvasSyncedFileRecord = {
+  id: string;
+  courseMappingId: string;
+  canvasFileId: string;
+  canvasFolderPath: string | null;
+  filename: string;
+  contentType: string | null;
+  size: number | null;
+  canvasUpdatedAt: string;
+  localPath: string;
+  downloadStatus: "pending" | "downloaded" | "failed" | "skipped";
+  lastDownloadedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CanvasAssignmentRecord = {
+  id: string;
+  courseMappingId: string;
+  canvasAssignmentId: string;
+  title: string;
+  description: string | null;
+  dueAt: string | null;
+  pointsPossible: number | null;
+  submissionScore: number | null;
+  submissionGrade: string | null;
+  submissionSubmittedAt: string | null;
+  assignmentGroupName: string | null;
+  canvasUpdatedAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CanvasModuleRecord = {
+  id: string;
+  courseMappingId: string;
+  canvasModuleId: string;
+  name: string;
+  position: number;
+  itemsJson: string;
+  canvasUpdatedAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CanvasSyncProgress = {
+  connectionId: string;
+  courseMappingId: string;
+  phase: "files" | "assignments" | "modules" | "grades";
+  current: number;
+  total: number;
+  detail: string;
+};
+
+export type CanvasCourseInfo = {
+  id: string;
+  name: string;
+  courseCode: string | null;
+  termName: string | null;
+  currentScore: number | null;
+};

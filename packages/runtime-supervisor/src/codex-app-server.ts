@@ -39,11 +39,55 @@ type SocketLike = {
   addEventListener(type: string, listener: (event: unknown) => void): void;
 };
 
+// ─── Usage / rate-limit types ──────────────────────────────────────
+
+export interface RateLimitBucket {
+  usedPercent: number;
+  resetsAt?: number;
+  windowDurationMins?: number;
+}
+
+export interface RateLimitSnapshot {
+  primary?: RateLimitBucket;
+  secondary?: RateLimitBucket;
+  credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  planType?: string;
+}
+
+export interface AccountInfo {
+  type: string;
+  email?: string;
+  planType?: string;
+}
+
+export interface TokenUsagePayload {
+  threadId: string;
+  turnId?: string;
+  tokenUsage: {
+    last?: {
+      inputTokens: number;
+      outputTokens: number;
+      cachedInputTokens?: number;
+      reasoningOutputTokens?: number;
+      totalTokens: number;
+    };
+    total?: {
+      inputTokens: number;
+      outputTokens: number;
+      cachedInputTokens?: number;
+      reasoningOutputTokens?: number;
+      totalTokens: number;
+    };
+  };
+}
+
 interface CodexAppServerClientOptions {
   binaryPath?: string;
   onNotification: (notification: JsonRpcNotification) => void;
   onServerRequest: (request: JsonRpcRequest) => Promise<unknown> | unknown;
   onStderr?: (chunk: string) => void;
+  onRateLimitsUpdated?: (snapshot: RateLimitSnapshot, account?: AccountInfo) => void;
+  onTokenUsageUpdated?: (payload: TokenUsagePayload) => void;
 }
 
 export class CodexAppServerClient {
@@ -54,12 +98,15 @@ export class CodexAppServerClient {
   private readonly onNotification: CodexAppServerClientOptions["onNotification"];
   private readonly onServerRequest: CodexAppServerClientOptions["onServerRequest"];
   private readonly onStderr?: CodexAppServerClientOptions["onStderr"];
+  private readonly onRateLimitsUpdated?: CodexAppServerClientOptions["onRateLimitsUpdated"];
+  private readonly onTokenUsageUpdated?: CodexAppServerClientOptions["onTokenUsageUpdated"];
   private child?: ChildProcess;
   private socket?: SocketLike;
   private readyPromise?: Promise<void>;
   private requestCounter = 0;
   private lastActivityAt = Date.now();
   private reconnecting = false;
+  private accountInfo?: AccountInfo;
 
   constructor(options: CodexAppServerClientOptions) {
     const command = resolveCodexCommandConfig(options.binaryPath);
@@ -69,6 +116,8 @@ export class CodexAppServerClient {
     this.onNotification = options.onNotification;
     this.onServerRequest = options.onServerRequest;
     this.onStderr = options.onStderr;
+    this.onRateLimitsUpdated = options.onRateLimitsUpdated;
+    this.onTokenUsageUpdated = options.onTokenUsageUpdated;
   }
 
   /** Track that we received activity from the server. */
@@ -261,6 +310,48 @@ export class CodexAppServerClient {
       jsonrpc: "2.0",
       method: "initialized"
     });
+
+    // Fetch initial account info and rate limits (non-blocking)
+    void this.fetchInitialUsageState();
+  }
+
+  /** Fetch account info and rate limits right after initialization. */
+  private async fetchInitialUsageState(): Promise<void> {
+    try {
+      const accountResult = await this.requestInternal<{
+        account?: AccountInfo | null;
+      }>("account/read");
+      if (accountResult?.account) {
+        this.accountInfo = accountResult.account;
+      }
+    } catch {
+      // Non-fatal — account info may not be available
+    }
+
+    try {
+      const rateLimitsResult = await this.requestInternal<{
+        rateLimits?: RateLimitSnapshot;
+      }>("account/rateLimits/read");
+      if (rateLimitsResult?.rateLimits && this.onRateLimitsUpdated) {
+        this.onRateLimitsUpdated(rateLimitsResult.rateLimits, this.accountInfo);
+      }
+    } catch {
+      // Non-fatal — rate limits may not be available
+    }
+  }
+
+  /** Refresh rate limits (e.g. after a turn completes). */
+  async refreshRateLimits(): Promise<void> {
+    try {
+      const result = await this.requestInternal<{
+        rateLimits?: RateLimitSnapshot;
+      }>("account/rateLimits/read");
+      if (result?.rateLimits && this.onRateLimitsUpdated) {
+        this.onRateLimitsUpdated(result.rateLimits, this.accountInfo);
+      }
+    } catch {
+      // Non-fatal
+    }
   }
 
   private send(message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse): void {
@@ -303,6 +394,19 @@ export class CodexAppServerClient {
     }
 
     if ("method" in parsed) {
+      // Intercept usage-related server notifications
+      if (parsed.method === "account/rateLimits/updated" && this.onRateLimitsUpdated) {
+        const params = parsed.params as { rateLimits?: RateLimitSnapshot } | undefined;
+        if (params?.rateLimits) {
+          this.onRateLimitsUpdated(params.rateLimits, this.accountInfo);
+        }
+      }
+      if (parsed.method === "thread/tokenUsage/updated" && this.onTokenUsageUpdated) {
+        const params = parsed.params as TokenUsagePayload | undefined;
+        if (params) {
+          this.onTokenUsageUpdated(params);
+        }
+      }
       this.onNotification(parsed);
       return;
     }

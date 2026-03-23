@@ -12,4 +12,6 @@ contextBridge.exposeInMainWorld("stuartDesktop", {
   startCodexLogin: () => ipcRenderer.invoke("stuart:start-codex-login"),
   getCodexLoginState: () => ipcRenderer.invoke("stuart:get-codex-login-state"),
   restartServer: () => ipcRenderer.invoke("stuart:restart-server"),
+  encryptToken: (plaintext) => ipcRenderer.invoke("stuart:encrypt-token", plaintext),
+  decryptToken: (encryptedBase64) => ipcRenderer.invoke("stuart:decrypt-token", encryptedBase64),
 });

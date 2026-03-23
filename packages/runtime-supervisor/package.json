@@ -9,6 +9,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./canvas-client": {
+      "types": "./dist/canvas-client.d.ts",
+      "default": "./dist/canvas-client.js"
+    },
+    "./canvas-sync": {
+      "types": "./dist/canvas-sync.d.ts",
+      "default": "./dist/canvas-sync.js"
     }
   },
   "scripts": {

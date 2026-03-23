@@ -9,6 +9,7 @@ const releaseDir = join(desktopDir, "release");
 const packageJson = JSON.parse(readFileSync(join(desktopDir, "package.json"), "utf8"));
 const version = packageJson.version ?? "0.1.0";
 const mode = process.argv[2] ?? "dir";
+const DEFAULT_NOTARY_KEYCHAIN_PROFILE = "stuart-notary";
 
 function run(command, args, options = {}) {
   execFileSync(command, args, {
@@ -42,17 +43,57 @@ function hasDeveloperIdIdentity() {
   return /Developer ID Application:/i.test(output);
 }
 
-function hasNotarizationCredentials() {
+function hasUsableKeychainProfile(profile) {
+  if (!profile) {
+    return false;
+  }
+
+  try {
+    runCapture(
+      "xcrun",
+      ["notarytool", "history", "--keychain-profile", profile, "--output-format", "json"],
+      { timeout: 15_000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveNotarizationCredentials() {
   const env = process.env;
-  return Boolean(
-    (env.APPLE_API_KEY && env.APPLE_API_KEY_ID && env.APPLE_API_ISSUER) ||
-    (env.APPLE_ID && env.APPLE_APP_SPECIFIC_PASSWORD && env.APPLE_TEAM_ID) ||
-    env.APPLE_KEYCHAIN_PROFILE
-  );
+
+  if (env.APPLE_API_KEY && env.APPLE_API_KEY_ID && env.APPLE_API_ISSUER) {
+    return { type: "app-store-connect-api-key" };
+  }
+
+  if (env.APPLE_ID && env.APPLE_APP_SPECIFIC_PASSWORD && env.APPLE_TEAM_ID) {
+    return { type: "apple-id" };
+  }
+
+  const explicitProfile = env.APPLE_KEYCHAIN_PROFILE?.trim() || env.STUART_NOTARY_PROFILE?.trim();
+  if (explicitProfile) {
+    return {
+      type: "keychain-profile",
+      profile: explicitProfile,
+      source: env.APPLE_KEYCHAIN_PROFILE?.trim() ? "APPLE_KEYCHAIN_PROFILE" : "STUART_NOTARY_PROFILE",
+    };
+  }
+
+  if (mode === "mac" && hasUsableKeychainProfile(DEFAULT_NOTARY_KEYCHAIN_PROFILE)) {
+    return {
+      type: "keychain-profile",
+      profile: DEFAULT_NOTARY_KEYCHAIN_PROFILE,
+      source: "default",
+    };
+  }
+
+  return null;
 }
 
 function resolveBuilderArgs() {
   const args = ["exec", "electron-builder", "--config", "electron-builder.json"];
+  const notarization = resolveNotarizationCredentials();
 
   if (mode === "mac") {
     args.push("--mac", "dmg", "zip", "--publish", "never");
@@ -71,11 +112,19 @@ function resolveBuilderArgs() {
     args.push("-c.mac.identity=-");
   }
 
-  if (hasNotarizationCredentials()) {
-    process.stdout.write(`Apple notarization credentials detected. Enabling notarization.\n`);
+  if (notarization?.type === "keychain-profile") {
+    process.env.APPLE_KEYCHAIN_PROFILE = notarization.profile;
+    process.stdout.write(
+      `Apple notarization credentials detected via keychain profile ${notarization.profile} (${notarization.source}). Enabling notarization.\n`,
+    );
+    args.push("-c.mac.notarize=true");
+  } else if (notarization) {
+    process.stdout.write(`Apple notarization credentials detected (${notarization.type}). Enabling notarization.\n`);
     args.push("-c.mac.notarize=true");
   } else {
-    process.stdout.write(`No Apple notarization credentials detected. Skipping notarization.\n`);
+    process.stdout.write(
+      `No Apple notarization credentials detected. Skipping notarization. If you use a notarytool keychain profile, rerun with APPLE_KEYCHAIN_PROFILE=<profile> (for example APPLE_KEYCHAIN_PROFILE=${DEFAULT_NOTARY_KEYCHAIN_PROFILE}).\n`,
+    );
   }
 
   return args;

@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState, useCallback, type CSSProperties } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback, type CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import { renderMermaidSvg } from "./study-doc/rendering";
 import type {
   ApprovalRecord,
   ArtifactDraft,
@@ -408,6 +409,9 @@ function App() {
   /* ---- Context Compaction State ---- */
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactionMessage, setCompactionMessage] = useState<string | null>(null);
+
+  /* ---- Canvas Settings State ---- */
+  const [showCanvasSettings, setShowCanvasSettings] = useState(false);
 
   /* ---- Artifact Resize State ---- */
   const [artifactPaneWidth, setArtifactPaneWidth] = useState(600);
@@ -1458,6 +1462,22 @@ function App() {
     }
   }
 
+  async function deleteProject(projectId: string, projectName: string) {
+    const confirmed = window.confirm(`Remove workspace "${projectName}" and all its study sessions?`);
+    if (!confirmed) return;
+    try {
+      setBusy(`delete-project-${projectId}`);
+      await request<void>(`/api/projects/${projectId}`, { method: "DELETE" });
+      setSelectedTaskId(null);
+      setSelectedRunId(null);
+      await refreshDashboard();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Something went wrong");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   /* ================================================================
      RENDER
      ================================================================ */
@@ -1550,6 +1570,14 @@ function App() {
               />
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "2px" }}>
+              <button
+                className="theme-toggle-btn"
+                type="button"
+                onClick={() => setShowCanvasSettings((v) => !v)}
+                title="Canvas LMS Settings"
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 18 }}>settings</span>
+              </button>
               <button
                 className="theme-toggle-btn"
                 type="button"
@@ -1762,7 +1790,17 @@ function App() {
           </div>
         </aside>
 
-        {/* ======== CENTER: Chat ======== */}
+        {/* ======== CENTER: Chat or Canvas Settings ======== */}
+        {showCanvasSettings ? (
+          <CanvasSettingsPanel
+            onClose={() => setShowCanvasSettings(false)}
+            pickFolder={pickFolder}
+            onTaskCreated={(taskId) => {
+              setShowCanvasSettings(false);
+              refreshDashboard().then(() => setSelectedTaskId(taskId));
+            }}
+          />
+        ) : (
         <section className="chat-panel">
           {libraryCollapsed && (
             <button
@@ -1786,6 +1824,8 @@ function App() {
                     tasks={tasks}
                     onSelectTask={(taskId) => setSelectedTaskId(taskId)}
                     onAddWorkspace={() => handleAddStudyMaterials()}
+                    onDeleteProject={deleteProject}
+                    onOpenCanvas={() => setShowCanvasSettings(true)}
                   />
                 ) : isDesktopWelcome ? (
                   <DesktopOnboardingView
@@ -1860,6 +1900,35 @@ function App() {
                 )
               ) : (
                 <>
+                  {/* Get Started prompt for new sessions */}
+                  {visibleMessages.length === 0 && !isStreaming && selectedTask && (
+                    <div className="session-welcome">
+                      <div className="session-welcome-icon">
+                        <span className="material-symbols-outlined" style={{ fontSize: 36, color: "var(--accent)" }}>auto_stories</span>
+                      </div>
+                      <h2 className="session-welcome-title">{selectedTask.title?.replace(/^Study:\s*/, "") || "Study Session"}</h2>
+                      <p className="session-welcome-sub">Stuart has indexed your materials and is ready to help you study.</p>
+                      <div className="session-welcome-actions">
+                        <button type="button" className="session-welcome-btn" onClick={() => { setComposerDraft("Give me an overview of all the materials in this workspace. What topics are covered and what should I focus on first?"); }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: 18 }}>explore</span>
+                          Overview my materials
+                        </button>
+                        <button type="button" className="session-welcome-btn" onClick={() => { setComposerDraft("Create flashcards from my study materials, focusing on the most important concepts."); }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: 18 }}>style</span>
+                          Generate flashcards
+                        </button>
+                        <button type="button" className="session-welcome-btn" onClick={() => { setComposerDraft("Create a quiz to test my understanding of the key concepts in these materials."); }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: 18 }}>quiz</span>
+                          Quiz me
+                        </button>
+                        <button type="button" className="session-welcome-btn" onClick={() => { setComposerDraft("Create a mind map showing how the main topics in my materials connect to each other."); }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: 18 }}>hub</span>
+                          Mind map
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Messages */}
                   {visibleMessages.map((message) => (
                     <ChatBubble key={message.id} message={message} />
@@ -2017,6 +2086,7 @@ function App() {
             </form>
           ) : null}
         </section>
+        )}
 
         {/* ======== RIGHT SIDEBAR: Study Tools ======== */}
         {!studyToolsCollapsed ? (
@@ -2331,6 +2401,7 @@ function App() {
                 </div>
               ) : null}
             </div>
+            <UsagePanel />
           </aside>
         ) : (
           <button
@@ -2876,6 +2947,140 @@ function DesktopOnboardingView({
    ================================================================ */
 
 /* ================================================================
+   Usage Panel — compact Codex usage tracking
+   ================================================================ */
+
+type UsageSnapshot = {
+  primaryUsedPercent: number;
+  primaryResetsAt: string;
+  primaryWindowMins: number;
+  secondaryUsedPercent: number;
+  secondaryResetsAt: string;
+  secondaryWindowMins: number;
+  hasCredits: boolean;
+  creditsUnlimited: boolean;
+  creditsBalance: string;
+  planType: string;
+  email: string;
+  capturedAt: string;
+};
+
+function usageBarColor(pct: number): string {
+  if (pct > 95) return "usage-bar-danger";
+  if (pct >= 80) return "usage-bar-warning";
+  return "usage-bar-ok";
+}
+
+function formatResetsIn(isoDate: string): string {
+  const diff = new Date(isoDate).getTime() - Date.now();
+  if (diff <= 0) return "now";
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  const rem = mins % 60;
+  if (hrs < 24) return rem > 0 ? `${hrs}h ${rem}m` : `${hrs}h`;
+  const days = Math.floor(hrs / 24);
+  const remHrs = hrs % 24;
+  return remHrs > 0 ? `${days}d ${remHrs}h` : `${days}d`;
+}
+
+function formatUpdatedAgo(isoDate: string): string {
+  const diff = Date.now() - new Date(isoDate).getTime();
+  if (diff < 60000) return "just now";
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ago`;
+}
+
+function UsagePanel() {
+  const [snapshot, setSnapshot] = useState<UsageSnapshot | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function fetchUsage() {
+      try {
+        const res = await fetch(apiUrl("/api/usage/codex"));
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled && data?.snapshot) {
+          setSnapshot(data.snapshot);
+          setLoaded(true);
+        }
+      } catch {
+        // silently ignore — panel just won't show
+      }
+    }
+
+    void fetchUsage();
+    const timer = setInterval(fetchUsage, 120_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, []);
+
+  if (!loaded || !snapshot) return null;
+
+  const planLabel = snapshot.planType
+    ? snapshot.planType.charAt(0).toUpperCase() + snapshot.planType.slice(1)
+    : "Free";
+
+  return (
+    <div className="usage-wrapper">
+      {/* Compact trigger — always visible */}
+      <div className="usage-trigger">
+        <span className="usage-plan-badge">{planLabel}</span>
+        <div className="usage-trigger-bars">
+          <div className="usage-trigger-bar">
+            <div className={`usage-trigger-fill ${usageBarColor(snapshot.primaryUsedPercent)}`} style={{ width: `${Math.min(snapshot.primaryUsedPercent, 100)}%` }} />
+          </div>
+          <div className="usage-trigger-bar">
+            <div className={`usage-trigger-fill ${usageBarColor(snapshot.secondaryUsedPercent)}`} style={{ width: `${Math.min(snapshot.secondaryUsedPercent, 100)}%` }} />
+          </div>
+        </div>
+        <span className="usage-trigger-pct">{snapshot.primaryUsedPercent}%</span>
+      </div>
+
+      {/* Expanded panel — shown on hover */}
+      <div className="usage-panel">
+        <div className="usage-header">
+          <span className="usage-plan-badge">{planLabel}</span>
+          <span className="usage-updated">{formatUpdatedAgo(snapshot.capturedAt)}</span>
+        </div>
+
+        <div className="usage-meter">
+          <div className="usage-meter-label">
+            <span>Rate limit</span>
+            <span className="usage-meter-value">{snapshot.primaryUsedPercent}%</span>
+          </div>
+          <div className="usage-bar-track">
+            <div className={`usage-bar-fill ${usageBarColor(snapshot.primaryUsedPercent)}`} style={{ width: `${Math.min(snapshot.primaryUsedPercent, 100)}%` }} />
+          </div>
+          <span className="usage-resets">resets in {formatResetsIn(snapshot.primaryResetsAt)}</span>
+        </div>
+
+        <div className="usage-meter">
+          <div className="usage-meter-label">
+            <span>Weekly</span>
+            <span className="usage-meter-value">{snapshot.secondaryUsedPercent}%</span>
+          </div>
+          <div className="usage-bar-track">
+            <div className={`usage-bar-fill ${usageBarColor(snapshot.secondaryUsedPercent)}`} style={{ width: `${Math.min(snapshot.secondaryUsedPercent, 100)}%` }} />
+          </div>
+          <span className="usage-resets">resets in {formatResetsIn(snapshot.secondaryResetsAt)}</span>
+        </div>
+
+        {snapshot.hasCredits ? (
+          <div className="usage-credits">
+            {snapshot.creditsUnlimited ? "Unlimited credits" : `$${snapshot.creditsBalance} credits`}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================
    Review Panel — selectable decks for cross-deck flashcard + quiz review
    ================================================================ */
 
@@ -3038,16 +3243,696 @@ function ReviewPanel({
   );
 }
 
+/* ================================================================
+   Canvas LMS Settings Panel
+   ================================================================ */
+
+type CanvasConnection = {
+  id: string;
+  label: string;
+  baseUrl: string;
+  userDisplayName?: string | null;
+  userId?: string | null;
+  isActive: boolean;
+  lastVerifiedAt?: string | null;
+  lastSyncAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type CanvasCourse = {
+  id: string;
+  name: string;
+  courseCode: string;
+  termName?: string | null;
+  currentScore?: number | null;
+};
+
+type CanvasSyncProgress = {
+  connectionId: string;
+  phase: string;
+  detail: string;
+  percent: number;
+};
+
+type CanvasFileInfo = {
+  id: string;
+  name: string;
+  folderPath: string;
+  contentType: string;
+  size: number;
+  updatedAt: string;
+};
+
+function CanvasSettingsPanel({ onClose, pickFolder, onTaskCreated }: { onClose: () => void; pickFolder: (prompt: string) => Promise<string | null>; onTaskCreated: (taskId: string) => void }) {
+  const [connections, setConnections] = useState<CanvasConnection[]>([]);
+  const [loadingConnections, setLoadingConnections] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  // Connection form
+  const [showForm, setShowForm] = useState(false);
+  const [formUrl, setFormUrl] = useState("");
+  const [formToken, setFormToken] = useState("");
+  const [formLabel, setFormLabel] = useState("");
+  const [formBusy, setFormBusy] = useState(false);
+
+  // Course picker
+  const [coursePickerConnectionId, setCoursePickerConnectionId] = useState<string | null>(null);
+  const [courses, setCourses] = useState<CanvasCourse[]>([]);
+  const [loadingCourses, setLoadingCourses] = useState(false);
+
+  // File browser (step between course selection and download)
+  const [fileBrowserCourseId, setFileBrowserCourseId] = useState<string | null>(null);
+  const [fileBrowserCourseName, setFileBrowserCourseName] = useState("");
+  const [canvasFiles, setCanvasFiles] = useState<CanvasFileInfo[]>([]);
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
+  const [loadingFiles, setLoadingFiles] = useState(false);
+  const [downloadFolder, setDownloadFolder] = useState("");
+  const [downloading, setDownloading] = useState(false);
+
+  // Sync progress
+  const [syncProgress, setSyncProgress] = useState<CanvasSyncProgress | null>(null);
+  const [syncingConnectionId, setSyncingConnectionId] = useState<string | null>(null);
+
+  // Show help
+  const [showTokenHelp, setShowTokenHelp] = useState(false);
+
+  // Load connections on mount
+  useEffect(() => {
+    void loadConnections();
+  }, []);
+
+  // Listen for SSE sync events
+  useEffect(() => {
+    const evtSource = new EventSource(apiUrl("/api/events"));
+    const handleMessage = (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "canvas.sync.progress") {
+          setSyncProgress({
+            connectionId: data.connectionId,
+            phase: data.phase ?? "Syncing",
+            detail: data.detail ?? "",
+            percent: data.percent ?? 0,
+          });
+        } else if (data.type === "canvas.sync.completed") {
+          setSyncProgress(null);
+          setSyncingConnectionId(null);
+          setSuccess("Sync completed successfully.");
+          void loadConnections();
+        }
+      } catch { /* ignore parse errors */ }
+    };
+    evtSource.addEventListener("message", handleMessage);
+    return () => {
+      evtSource.removeEventListener("message", handleMessage);
+      evtSource.close();
+    };
+  }, []);
+
+  async function loadConnections() {
+    setLoadingConnections(true);
+    setError(null);
+    try {
+      const data = await request<CanvasConnection[]>("/api/canvas/connections");
+      setConnections(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setConnections([]);
+      // Not an error if the endpoint doesn't exist yet
+      if (err instanceof Error && !err.message.includes("404")) {
+        setError(err.message);
+      }
+    } finally {
+      setLoadingConnections(false);
+    }
+  }
+
+  async function handleConnect(e: React.FormEvent) {
+    e.preventDefault();
+    setFormBusy(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      await request<CanvasConnection>("/api/canvas/connections", {
+        method: "POST",
+        body: JSON.stringify({
+          baseUrl: formUrl.replace(/\/+$/, ""),
+          token: formToken,
+          label: formLabel || formUrl.replace(/https?:\/\//, "").replace(/\/.*$/, ""),
+        }),
+      });
+      setSuccess("Canvas account connected successfully!");
+      setFormUrl("");
+      setFormToken("");
+      setFormLabel("");
+      setShowForm(false);
+      void loadConnections();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Connection failed");
+    } finally {
+      setFormBusy(false);
+    }
+  }
+
+  async function handleRemove(id: string) {
+    setError(null);
+    try {
+      await request(`/api/canvas/connections/${id}`, { method: "DELETE" });
+      setConnections((prev) => prev.filter((c) => c.id !== id));
+      if (coursePickerConnectionId === id) {
+        setCoursePickerConnectionId(null);
+        setCourses([]);
+      }
+      setSuccess("Connection removed.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to remove connection");
+    }
+  }
+
+  async function handleSync(id: string) {
+    setError(null);
+    setSyncingConnectionId(id);
+    setSyncProgress({ connectionId: id, phase: "Starting", detail: "Initiating sync...", percent: 0 });
+    try {
+      await request(`/api/canvas/connections/${id}/sync`, { method: "POST" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Sync failed");
+      setSyncProgress(null);
+      setSyncingConnectionId(null);
+    }
+  }
+
+  async function handleLoadCourses(connectionId: string) {
+    setCoursePickerConnectionId(connectionId);
+    setLoadingCourses(true);
+    setFileBrowserCourseId(null);
+    setCanvasFiles([]);
+    setSelectedFileIds(new Set());
+    setError(null);
+    try {
+      const data = await request<CanvasCourse[]>(
+        `/api/canvas/connections/${connectionId}/courses`
+      );
+      setCourses(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load courses");
+      setCourses([]);
+    } finally {
+      setLoadingCourses(false);
+    }
+  }
+
+  async function handleBrowseFiles(courseId: string, courseName: string) {
+    setFileBrowserCourseId(courseId);
+    setFileBrowserCourseName(courseName);
+    setLoadingFiles(true);
+    setCanvasFiles([]);
+    setSelectedFileIds(new Set());
+    try {
+      const data = await request<{ files: CanvasFileInfo[] }>(
+        `/api/canvas/connections/${coursePickerConnectionId}/courses/${courseId}/files`
+      );
+      setCanvasFiles(data.files ?? []);
+      // Auto-select all files
+      setSelectedFileIds(new Set((data.files ?? []).map((f) => f.id)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load files");
+    } finally {
+      setLoadingFiles(false);
+    }
+  }
+
+  async function handleDownloadAndImport() {
+    if (!fileBrowserCourseId || !coursePickerConnectionId || selectedFileIds.size === 0 || !downloadFolder) return;
+    setDownloading(true);
+    setError(null);
+    try {
+      const result = await request<{ project: { id: string }; task: { id: string }; downloadedCount: number }>(
+        `/api/canvas/connections/${coursePickerConnectionId}/courses/${fileBrowserCourseId}/download`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            fileIds: Array.from(selectedFileIds),
+            destinationFolder: downloadFolder,
+            courseName: fileBrowserCourseName,
+          }),
+        }
+      );
+      setFileBrowserCourseId(null);
+      setCanvasFiles([]);
+      setSelectedFileIds(new Set());
+      setDownloadFolder("");
+      onClose();
+      // Navigate to the new task
+      if (result.task?.id) {
+        onTaskCreated(result.task.id);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Download failed");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  function groupFilesByFolder(files: CanvasFileInfo[]): Record<string, CanvasFileInfo[]> {
+    const groups: Record<string, CanvasFileInfo[]> = {};
+    for (const f of files) {
+      const key = f.folderPath || "";
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(f);
+    }
+    return groups;
+  }
+
+  function formatFileSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function getFileIcon(contentType: string): string {
+    if (contentType.includes("pdf")) return "picture_as_pdf";
+    if (contentType.includes("word") || contentType.includes("docx")) return "description";
+    if (contentType.includes("presentation") || contentType.includes("pptx")) return "slideshow";
+    if (contentType.includes("spreadsheet") || contentType.includes("xlsx")) return "table_chart";
+    if (contentType.startsWith("image/")) return "image";
+    return "draft";
+  }
+
+  function getFileColor(contentType: string): string {
+    if (contentType.includes("pdf")) return "#DC2626";
+    if (contentType.includes("word") || contentType.includes("docx")) return "#2563EB";
+    if (contentType.includes("presentation") || contentType.includes("pptx")) return "#EA580C";
+    if (contentType.includes("spreadsheet") || contentType.includes("xlsx")) return "#16A34A";
+    if (contentType.startsWith("image/")) return "#7C3AED";
+    return "#6B7280";
+  }
+
+  function toggleFile(id: string) {
+    setSelectedFileIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  /* ---------- Full-page file browser overlay ---------- */
+  if (fileBrowserCourseId) {
+    const selectedSize = canvasFiles.filter((f) => selectedFileIds.has(f.id)).reduce((s, f) => s + f.size, 0);
+    return (
+      <div className="canvas-fb-overlay">
+        {/* Top bar */}
+        <div className="canvas-fb-topbar">
+          <button
+            className="canvas-fb-back"
+            type="button"
+            onClick={() => { setFileBrowserCourseId(null); setCanvasFiles([]); setSelectedFileIds(new Set()); setDownloadFolder(""); }}
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 18 }}>arrow_back</span>
+            Back to courses
+          </button>
+          <div className="canvas-fb-title">
+            <span className="material-symbols-outlined" style={{ fontSize: 20, color: "var(--accent)" }}>school</span>
+            <h2>{fileBrowserCourseName}</h2>
+          </div>
+          <button className="ghost-button compact" type="button" onClick={onClose} title="Close">
+            <span className="material-symbols-outlined" style={{ fontSize: 20 }}>close</span>
+          </button>
+        </div>
+
+        {/* Destination folder bar */}
+        <div className="canvas-fb-dest">
+          <span className="material-symbols-outlined" style={{ fontSize: 18 }}>folder_open</span>
+          <span className="canvas-fb-dest-label">Save to:</span>
+          <span className="canvas-fb-dest-path">{downloadFolder || "No folder selected"}</span>
+          <button
+            className="secondary-button compact"
+            type="button"
+            onClick={async () => {
+              const picked = await pickFolder("Choose where to save course files");
+              if (picked) setDownloadFolder(picked);
+            }}
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>drive_file_move</span>
+            Choose Folder
+          </button>
+        </div>
+
+        {/* Summary / selection bar */}
+        <div className="canvas-fb-summary">
+          <span className="canvas-fb-summary-count">{selectedFileIds.size} of {canvasFiles.length} files selected</span>
+          <span className="canvas-fb-summary-size">{formatFileSize(selectedSize)}</span>
+          <div className="canvas-fb-summary-actions">
+            <button className="ghost-button compact" type="button" onClick={() => setSelectedFileIds(new Set(canvasFiles.map((f) => f.id)))}>Select All</button>
+            <button className="ghost-button compact" type="button" onClick={() => setSelectedFileIds(new Set())}>Deselect All</button>
+          </div>
+        </div>
+
+        {/* File list */}
+        <div className="canvas-fb-filelist">
+          {loadingFiles ? (
+            <div className="canvas-fb-loading">
+              <span className="material-symbols-outlined" style={{ fontSize: 32, animation: "spin 1s linear infinite" }}>progress_activity</span>
+              <p>Loading files...</p>
+            </div>
+          ) : canvasFiles.length === 0 ? (
+            <div className="canvas-fb-loading">
+              <span className="material-symbols-outlined" style={{ fontSize: 32, color: "var(--ink-faint)" }}>folder_off</span>
+              <p>No files found in this course.</p>
+            </div>
+          ) : (
+            Object.entries(groupFilesByFolder(canvasFiles)).map(([folder, files]) => (
+              <div key={folder} className="canvas-fb-folder-group">
+                <div className="canvas-fb-folder-header">
+                  <input
+                    type="checkbox"
+                    checked={files.every((f) => selectedFileIds.has(f.id))}
+                    ref={(el) => { if (el) el.indeterminate = files.some((f) => selectedFileIds.has(f.id)) && !files.every((f) => selectedFileIds.has(f.id)); }}
+                    onChange={() => {
+                      const allSelected = files.every((f) => selectedFileIds.has(f.id));
+                      setSelectedFileIds((prev) => {
+                        const next = new Set(prev);
+                        for (const f of files) { allSelected ? next.delete(f.id) : next.add(f.id); }
+                        return next;
+                      });
+                    }}
+                  />
+                  <span className="material-symbols-outlined" style={{ fontSize: 16 }}>folder</span>
+                  <span>{folder || "Root"}</span>
+                  <span className="canvas-fb-folder-count">{files.length} files</span>
+                </div>
+                {files.map((file) => (
+                  <label key={file.id} className={`canvas-fb-file ${selectedFileIds.has(file.id) ? "selected" : ""}`}>
+                    <input type="checkbox" checked={selectedFileIds.has(file.id)} onChange={() => toggleFile(file.id)} />
+                    <span className="material-symbols-outlined canvas-fb-file-icon" style={{ color: getFileColor(file.contentType) }}>
+                      {getFileIcon(file.contentType)}
+                    </span>
+                    <span className="canvas-fb-file-name">{file.name}</span>
+                    <span className="canvas-fb-file-size">{formatFileSize(file.size)}</span>
+                  </label>
+                ))}
+              </div>
+            ))
+          )}
+        </div>
+
+        {/* Bottom action bar */}
+        <div className="canvas-fb-actionbar">
+          {error && <span className="canvas-fb-error">{error}</span>}
+          {success && <span className="canvas-fb-success">{success}</span>}
+          <button
+            className="accent-button"
+            type="button"
+            disabled={selectedFileIds.size === 0 || !downloadFolder || downloading}
+            onClick={() => void handleDownloadAndImport()}
+          >
+            {downloading ? (
+              <>
+                <span className="material-symbols-outlined" style={{ fontSize: 16, animation: "spin 1s linear infinite" }}>progress_activity</span>
+                Downloading...
+              </>
+            ) : (
+              <>
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>download</span>
+                Download & Import {selectedFileIds.size > 0 ? `(${selectedFileIds.size} files)` : ""}
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <section className="chat-panel canvas-settings-panel">
+      <div className="canvas-settings-header">
+        <div>
+          <span className="material-symbols-outlined" style={{ fontSize: 22, verticalAlign: "middle", marginRight: 8, color: "var(--accent)" }}>
+            integration_instructions
+          </span>
+          <strong style={{ fontSize: 16 }}>Canvas Integration</strong>
+        </div>
+        <button className="ghost-button compact" type="button" onClick={onClose} title="Close settings">
+          <span className="material-symbols-outlined" style={{ fontSize: 20 }}>close</span>
+        </button>
+      </div>
+
+      <div className="canvas-settings-body">
+        {/* Status messages */}
+        {error && (
+          <div className="canvas-alert canvas-alert-error">
+            <span className="material-symbols-outlined" style={{ fontSize: 18 }}>error</span>
+            <span>{error}</span>
+            <button className="ghost-button compact" type="button" onClick={() => setError(null)} style={{ marginLeft: "auto", padding: 2 }}>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+            </button>
+          </div>
+        )}
+        {success && (
+          <div className="canvas-alert canvas-alert-success">
+            <span className="material-symbols-outlined" style={{ fontSize: 18 }}>check_circle</span>
+            <span>{success}</span>
+            <button className="ghost-button compact" type="button" onClick={() => setSuccess(null)} style={{ marginLeft: "auto", padding: 2 }}>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+            </button>
+          </div>
+        )}
+
+        {/* Sync progress */}
+        {syncProgress && (
+          <div className="canvas-sync-progress">
+            <div className="canvas-sync-progress-header">
+              <span className="material-symbols-outlined" style={{ fontSize: 18, animation: "spin 1s linear infinite" }}>sync</span>
+              <strong>{syncProgress.phase}</strong>
+            </div>
+            <div className="canvas-sync-progress-bar">
+              <div className="canvas-sync-progress-fill" style={{ width: `${Math.min(100, syncProgress.percent)}%` }} />
+            </div>
+            <span className="canvas-help-text">{syncProgress.detail}</span>
+          </div>
+        )}
+
+        {/* Loading state */}
+        {loadingConnections ? (
+          <div style={{ textAlign: "center", padding: 40, color: "var(--ink-muted)" }}>
+            <span className="material-symbols-outlined" style={{ fontSize: 32, animation: "spin 1s linear infinite" }}>progress_activity</span>
+            <p style={{ marginTop: 8 }}>Loading connections...</p>
+          </div>
+        ) : (
+          <>
+            {/* Existing connections */}
+            {connections.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <h3 style={{ fontSize: 13, fontWeight: 600, color: "var(--ink-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  Connected Accounts
+                </h3>
+                {connections.map((conn) => (
+                  <div key={conn.id} className="canvas-connection-card">
+                    <div className="canvas-connection-card-header">
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span className={`canvas-status-dot ${conn.isActive ? "active" : "failed"}`} />
+                        <strong>{conn.label || "Canvas Account"}</strong>
+                      </div>
+                      <button
+                        className="ghost-button compact destructive-text"
+                        type="button"
+                        onClick={() => handleRemove(conn.id)}
+                        title="Remove connection"
+                      >
+                        <span className="material-symbols-outlined" style={{ fontSize: 16 }}>delete</span>
+                      </button>
+                    </div>
+                    <div className="canvas-connection-card-details">
+                      <span className="canvas-help-text">{conn.baseUrl}</span>
+                      {conn.userDisplayName && <span className="canvas-help-text">User: {conn.userDisplayName}</span>}
+                      {conn.lastVerifiedAt && (
+                        <span className="canvas-help-text">Verified: {formatDate(conn.lastVerifiedAt)}</span>
+                      )}
+                      {conn.lastSyncAt && (
+                        <span className="canvas-help-text">Last synced: {formatDate(conn.lastSyncAt)}</span>
+                      )}
+                    </div>
+                    <div className="canvas-connection-card-actions">
+                      <button
+                        className="accent-button compact"
+                        type="button"
+                        onClick={() => handleSync(conn.id)}
+                        disabled={syncingConnectionId === conn.id}
+                      >
+                        <span className="material-symbols-outlined" style={{ fontSize: 16 }}>sync</span>
+                        {syncingConnectionId === conn.id ? "Syncing..." : "Sync Now"}
+                      </button>
+                      <button
+                        className="secondary-button compact"
+                        type="button"
+                        onClick={() => handleLoadCourses(conn.id)}
+                      >
+                        <span className="material-symbols-outlined" style={{ fontSize: 16 }}>school</span>
+                        Import Courses
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Course picker */}
+            {coursePickerConnectionId && (
+              <div className="canvas-course-picker">
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <h3 style={{ fontSize: 13, fontWeight: 600, color: "var(--ink-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    Select a Course
+                  </h3>
+                  <button
+                    className="ghost-button compact"
+                    type="button"
+                    onClick={() => { setCoursePickerConnectionId(null); setCourses([]); }}
+                  >
+                    <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+                  </button>
+                </div>
+                {loadingCourses ? (
+                  <div style={{ textAlign: "center", padding: 24, color: "var(--ink-muted)" }}>
+                    <span className="material-symbols-outlined" style={{ fontSize: 24, animation: "spin 1s linear infinite" }}>progress_activity</span>
+                    <p style={{ marginTop: 8 }}>Loading courses...</p>
+                  </div>
+                ) : courses.length === 0 ? (
+                  <p className="canvas-help-text" style={{ padding: "16px 0" }}>No courses found for this account.</p>
+                ) : (
+                  <div className="canvas-course-list">
+                    {courses.map((course) => (
+                      <button key={course.id} className="canvas-course-item" type="button" onClick={() => void handleBrowseFiles(course.id, course.name)}>
+                        <div className="canvas-course-item-details">
+                          <strong>{course.name}</strong>
+                          <span className="canvas-help-text">
+                            {course.courseCode}
+                            {course.termName ? ` \u00b7 ${course.termName}` : ""}
+                            {course.currentScore != null ? ` \u00b7 ${course.currentScore}%` : ""}
+                          </span>
+                        </div>
+                        <span className="material-symbols-outlined" style={{ fontSize: 18, color: "var(--ink-muted)" }}>chevron_right</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Add connection button or form */}
+            {!showForm ? (
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setShowForm(true)}
+                style={{ alignSelf: "flex-start" }}
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 18 }}>add</span>
+                {connections.length > 0 ? "Add Another Account" : "Connect Canvas"}
+              </button>
+            ) : (
+              <form className="canvas-connection-form" onSubmit={(e) => void handleConnect(e)}>
+                <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>Connect Canvas Account</h3>
+
+                <label className="canvas-form-label">
+                  Canvas URL
+                  <input
+                    type="url"
+                    className="canvas-form-input"
+                    placeholder="https://canvas.university.edu"
+                    value={formUrl}
+                    onChange={(e) => setFormUrl(e.target.value)}
+                    required
+                    autoFocus
+                  />
+                </label>
+
+                <label className="canvas-form-label">
+                  Access Token
+                  <input
+                    type="password"
+                    className="canvas-form-input"
+                    placeholder="paste your personal access token"
+                    value={formToken}
+                    onChange={(e) => setFormToken(e.target.value)}
+                    required
+                  />
+                </label>
+
+                <label className="canvas-form-label">
+                  Label <span className="canvas-help-text">(optional)</span>
+                  <input
+                    type="text"
+                    className="canvas-form-input"
+                    placeholder="My University"
+                    value={formLabel}
+                    onChange={(e) => setFormLabel(e.target.value)}
+                  />
+                </label>
+
+                <button
+                  type="button"
+                  className="ghost-button compact"
+                  onClick={() => setShowTokenHelp((v) => !v)}
+                  style={{ alignSelf: "flex-start", fontSize: 12, gap: 4 }}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 16 }}>help</span>
+                  How to get your token
+                </button>
+
+                {showTokenHelp && (
+                  <div className="canvas-token-help">
+                    <ol>
+                      <li>Log in to your Canvas LMS</li>
+                      <li>Go to <strong>Account</strong> &rarr; <strong>Settings</strong></li>
+                      <li>Scroll to <strong>Approved Integrations</strong></li>
+                      <li>Click <strong>+ New Access Token</strong></li>
+                      <li>Enter a purpose (e.g. &quot;Stuart&quot;) and generate</li>
+                      <li>Copy the token and paste it above</li>
+                    </ol>
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                  <button
+                    className="accent-button"
+                    type="submit"
+                    disabled={formBusy || !formUrl || !formToken}
+                  >
+                    {formBusy ? "Connecting..." : "Connect"}
+                  </button>
+                  <button
+                    className="ghost-button"
+                    type="button"
+                    onClick={() => { setShowForm(false); setError(null); }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function DashboardView({
   projects,
   tasks,
   onSelectTask,
   onAddWorkspace,
+  onDeleteProject,
+  onOpenCanvas,
 }: {
   projects: ProjectRecord[];
   tasks: TaskSpec[];
   onSelectTask: (taskId: string) => void;
   onAddWorkspace: () => void;
+  onDeleteProject: (projectId: string, projectName: string) => void;
+  onOpenCanvas: () => void;
 }) {
   const [summaries, setSummaries] = useState<Record<string, ProjectLearningSummary>>({});
   const [timelines, setTimelines] = useState<Record<string, StudyTimelineEntry[]>>({});
@@ -3235,51 +4120,60 @@ function DashboardView({
           const accuracy = summary ? Math.round(summary.overallAccuracy * 100) : 0;
 
           return (
-            <button
-              key={project.id}
-              type="button"
-              className={`zen-workspace-card${isFeatured ? " featured" : ""}`}
-              onClick={() => firstTask && onSelectTask(firstTask.id)}
-              disabled={!firstTask}
-            >
-              <div className="zen-card-header">
-                <div className="zen-card-badges">
-                  <span className={`zen-card-tag ${hasCurriculum ? "curriculum" : "research"}`}>
-                    {hasCurriculum ? "Curriculum" : "Research"}
-                  </span>
-                  {summary?.lastStudiedAt && (
-                    <span className="zen-card-meta">Last active {formatTimeAgo(summary.lastStudiedAt)}</span>
-                  )}
-                </div>
-                <div className="zen-card-icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--zen-primary)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                    {hasCurriculum ? (
-                      <><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" /><path d="M8 7h6" /><path d="M8 11h8" /></>
-                    ) : (
-                      <><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>
+            <div key={project.id} className={`zen-workspace-card${isFeatured ? " featured" : ""}`}>
+              <button
+                type="button"
+                className="zen-card-body"
+                onClick={() => firstTask && onSelectTask(firstTask.id)}
+                disabled={!firstTask}
+              >
+                <div className="zen-card-header">
+                  <div className="zen-card-badges">
+                    <span className={`zen-card-tag ${hasCurriculum ? "curriculum" : "research"}`}>
+                      {hasCurriculum ? "Curriculum" : "Research"}
+                    </span>
+                    {summary?.lastStudiedAt && (
+                      <span className="zen-card-meta">Last active {formatTimeAgo(summary.lastStudiedAt)}</span>
                     )}
-                  </svg>
-                </div>
-              </div>
-
-              <h3 className={`zen-card-name${isFeatured ? " featured" : ""}`}>{project.name}</h3>
-
-              {isFeatured && firstTask && (
-                <p className="zen-card-desc">{firstTask.objective?.slice(0, 80) || "Study workspace"}</p>
-              )}
-
-              <div className="zen-card-footer">
-                {summary && summary.cardsDue > 0 && (
-                  <span className="zen-card-due">{summary.cardsDue} due</span>
-                )}
-                <div className="zen-card-progress-row">
-                  <span className="zen-card-accuracy">{accuracy}%</span>
-                  <div className="zen-progress-track">
-                    <div className="zen-progress-fill" style={{ width: `${accuracy}%` }} />
+                  </div>
+                  <div className="zen-card-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--zen-primary)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                      {hasCurriculum ? (
+                        <><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" /><path d="M8 7h6" /><path d="M8 11h8" /></>
+                      ) : (
+                        <><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>
+                      )}
+                    </svg>
                   </div>
                 </div>
-              </div>
-            </button>
+
+                <h3 className={`zen-card-name${isFeatured ? " featured" : ""}`}>{project.name}</h3>
+
+                {isFeatured && firstTask && (
+                  <p className="zen-card-desc">{firstTask.objective?.slice(0, 80) || "Study workspace"}</p>
+                )}
+
+                <div className="zen-card-footer">
+                  {summary && summary.cardsDue > 0 && (
+                    <span className="zen-card-due">{summary.cardsDue} due</span>
+                  )}
+                  <div className="zen-card-progress-row">
+                    <span className="zen-card-accuracy">{accuracy}%</span>
+                    <div className="zen-progress-track">
+                      <div className="zen-progress-fill" style={{ width: `${accuracy}%` }} />
+                    </div>
+                  </div>
+                </div>
+              </button>
+              <button
+                type="button"
+                className="zen-card-delete"
+                title="Remove workspace"
+                onClick={(e) => { e.stopPropagation(); onDeleteProject(project.id, project.name); }}
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+              </button>
+            </div>
           );
         })}
 
@@ -3293,7 +4187,16 @@ function DashboardView({
             </svg>
           </div>
           <span className="zen-add-title">New Workspace</span>
-          <span className="zen-add-desc">Start curating a new idea.</span>
+          <span className="zen-add-desc">Add a local study folder.</span>
+        </button>
+
+        {/* Canvas import card */}
+        <button type="button" className="zen-add-card canvas-import" onClick={onOpenCanvas}>
+          <div className="zen-add-icon">
+            <span className="material-symbols-outlined" style={{ fontSize: 24, color: "var(--accent)" }}>school</span>
+          </div>
+          <span className="zen-add-title">Import from Canvas</span>
+          <span className="zen-add-desc">Pull course files from your LMS.</span>
         </button>
       </section>
     </div>
@@ -3651,79 +4554,187 @@ function wrapBareLatex(text: string): string {
   return result;
 }
 
+/**
+ * Clean up file references that Codex outputs in various broken formats.
+ * Codex often outputs `[Label](path/to/file.pptx)` with spaces in the path
+ * which markdown parsers (especially inside GFM tables) render as literal text.
+ *
+ * Strategy: replace `[label](path)` with a clean inline tag `«label»` that we
+ * post-process in the React component into styled pills.
+ */
+const FILE_REF_MARKER = "\u00ab"; // «
+const FILE_REF_END = "\u00bb";    // »
+
+function cleanFileReferences(text: string): string {
+  let result = text;
+
+  // 1. Decode URL-encoded strings globally
+  result = result.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
+    try { return decodeURIComponent(m); } catch { return m; }
+  });
+
+  // 2. Convert [label](path) file references to «label::ext» markers.
+  //    Paths can contain nested parens like `CA2 Materials (Inquiry Essay)/file.pdf`
+  //    so we match greedily and find the LAST `)` that ends the reference.
+  result = result.replace(
+    /\[([^\]]+)\]\s*\(([\s\S]+?\.\w{2,5}\s*)\)/g,
+    (_match, label: string, path: string) => {
+      if (/^https?:\/\//i.test(path.trim())) return _match;
+      const cleanLabel = cleanSourceName(label) || cleanSourceName(path);
+      const ext = fileExtension(path.trim());
+      return `${FILE_REF_MARKER}${cleanLabel}::${ext}${FILE_REF_END}`;
+    }
+  );
+
+  // 2b. Catch any remaining [label](path) without file extension (e.g. folder references)
+  result = result.replace(
+    /\[([^\]]+)\]\s*\(\s*([^)]+?)\s*\)/g,
+    (_match, label: string, path: string) => {
+      if (/^https?:\/\//i.test(path.trim())) return _match;
+      // Only convert if path looks like a workspace path (has a slash)
+      if (!path.includes("/") && !path.includes("\\")) return _match;
+      const cleanLabel = cleanSourceName(label) || cleanSourceName(path);
+      return `${FILE_REF_MARKER}${cleanLabel}::DOC${FILE_REF_END}`;
+    }
+  );
+
+  // 3. Clean up separators between file markers: ` ; ` or `, ` between » and «
+  result = result.replace(
+    new RegExp(`${FILE_REF_END}\\s*[;,]\\s*${FILE_REF_MARKER}`, "g"),
+    `${FILE_REF_END} ${FILE_REF_MARKER}`
+  );
+
+  // 4. Clean bare /Users/... paths
+  result = result.replace(/\/Users\/[^\s)"\]]+/gi, (m) => cleanSourceName(m));
+
+  // 5. Clean bare attachments/uuid/... paths
+  result = result.replace(/attachments\/[a-f0-9-]+[-/][^\s)"\]]+/gi, (m) => cleanSourceName(m));
+
+  // 6. Convert 【name】 lenticular bracket citations (new Codex format) to markers
+  //    Strip surrounding bold ** if present: **【name】** → marker
+  result = result.replace(
+    /\*{0,2}【([^】]+)】\*{0,2}/g,
+    (_match, name: string) => `${FILE_REF_MARKER}${name}::DOC${FILE_REF_END}`
+  );
+
+  return result;
+}
+
+function InlineMermaid({ code }: { code: string }) {
+  const [svg, setSvg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    renderMermaidSvg(code).then((result) => {
+      if (cancelled) return;
+      if (result.error) setError(result.error);
+      else setSvg(result.svg);
+    });
+    return () => { cancelled = true; };
+  }, [code]);
+
+  if (error) return <pre className="mermaid-inline-error"><code>{code}</code></pre>;
+  if (!svg) return <div className="mermaid-inline-loading"><span className="material-symbols-outlined" style={{ fontSize: 16, animation: "spin 1s linear infinite" }}>progress_activity</span></div>;
+  return <div className="mermaid-inline" dangerouslySetInnerHTML={{ __html: svg }} />;
+}
+
 function MarkdownMessage({ content }: { content: string }) {
-  const cleanedContent = wrapBareLatex(content)
-    // Normalize malformed markdown links like `[Lecture 1] (/Users/... )`
-    .replace(/\[([^\]]+)\]\s+\(((?:\/Users\/|attachments\/)[^)]+)\)/gi, "[$1]($2)")
-    // Replace local-path markdown links with clean source labels so they render as pills
-    .replace(
-      /\[([^\]]*)\]\(((?:\/Users\/|attachments\/)[^)]+)\)/gi,
-      (_match, linkText, href) => {
-        const cleaned = cleanSourceName(linkText) || cleanSourceName(href);
-        return `[${cleaned}](${href})`;
+  const cleanedContent = cleanFileReferences(wrapBareLatex(content));
+
+  // Process children to replace «label::EXT» markers with styled pills
+  function processFileMarkers(node: React.ReactNode): React.ReactNode {
+    if (typeof node === "string") {
+      const re = new RegExp(`${FILE_REF_MARKER}([^${FILE_REF_END}]+)${FILE_REF_END}`, "g");
+      if (!re.test(node)) return node;
+      re.lastIndex = 0;
+      const parts: React.ReactNode[] = [];
+      let lastIdx = 0;
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(node)) !== null) {
+        if (match.index > lastIdx) parts.push(node.slice(lastIdx, match.index));
+        const [label, ext] = match[1].split("::");
+        const icon = ext === "PDF" ? "picture_as_pdf" : ext === "PPTX" || ext === "PPT" ? "slideshow" : ext === "DOCX" || ext === "DOC" ? "description" : ext === "XLSX" || ext === "XLS" ? "table_chart" : ext === "ZIP" ? "folder_zip" : "draft";
+        parts.push(
+          <span key={match.index} className="citation-pill">
+            <span className="material-symbols-outlined" style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
+            {label}
+          </span>
+        );
+        lastIdx = re.lastIndex;
       }
-    )
-    // Clean bare local staging paths that occasionally leak into prose
-    .replace(
-      /\/Users\/[^\s)"\]]+/gi,
-      (match) => cleanSourceName(match)
-    )
-    .replace(
-      /attachments\/[a-f0-9-]+[-/][^\s)"\]]+/gi,
-      (match) => cleanSourceName(match)
-    );
+      if (lastIdx < node.length) parts.push(node.slice(lastIdx));
+      return parts.length === 1 ? parts[0] : <>{parts}</>;
+    }
+    if (Array.isArray(node)) return node.map((c, i) => <React.Fragment key={i}>{processFileMarkers(c)}</React.Fragment>);
+    if (node && typeof node === "object" && "props" in (node as any)) {
+      const el = node as React.ReactElement;
+      if (el.props.children) {
+        return React.cloneElement(el, {}, processFileMarkers(el.props.children));
+      }
+    }
+    return node;
+  }
+
+  // Wrapper that applies file marker processing to any element's children
+  function withFileMarkers(Tag: string) {
+    return ({ children, ...props }: any) => {
+      const processed = processFileMarkers(children);
+      return React.createElement(Tag, props, processed);
+    };
+  }
 
   return (
     <div className="markdown-message">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[remarkMath, remarkGfm]}
         rehypePlugins={[rehypeKatex]}
         components={{
           a: ({ children, href }) => {
             const normalizedHref = href?.trim() ?? "";
-            if (!normalizedHref) {
-              return <span>{children}</span>;
-            }
+            if (!normalizedHref) return <span>{children}</span>;
             if (isExternalLink(normalizedHref)) {
               return (
-                <a
-                  href={normalizedHref}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="message-link external"
-                >
+                <a href={normalizedHref} target="_blank" rel="noreferrer" className="message-link external">
                   {children}
                 </a>
               );
             }
-            // For workspace links, show as citation pill with clean name
             const displayName = cleanSourceName(normalizedHref);
+            const ext = fileExtension(normalizedHref);
+            const icon = ext === "PDF" ? "picture_as_pdf" : ext === "PPTX" || ext === "PPT" ? "slideshow" : ext === "DOCX" || ext === "DOC" ? "description" : ext === "XLSX" || ext === "XLS" ? "table_chart" : ext === "ZIP" ? "folder_zip" : "draft";
             return (
               <span className="citation-pill" title={normalizedHref}>
-                <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8" />
-                </svg>
-                {displayName || children}
+                <span className="material-symbols-outlined" style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
+                {children || displayName}
               </span>
             );
           },
-          p: ({ children }) => <p>{children}</p>,
-          ul: ({ children }) => <ul>{children}</ul>,
-          ol: ({ children }) => <ol>{children}</ol>,
-          li: ({ children }) => <li>{children}</li>,
-          strong: ({ children }) => <strong>{children}</strong>,
-          em: ({ children }) => <em>{children}</em>,
-          code: ({ children, className }) =>
-            className ? (
-              <code className={className}>{children}</code>
-            ) : (
-              <code>{children}</code>
-            ),
-          pre: ({ children }) => <pre>{children}</pre>,
-          h1: ({ children }) => <h1>{children}</h1>,
-          h2: ({ children }) => <h2>{children}</h2>,
-          h3: ({ children }) => <h3>{children}</h3>,
-          blockquote: ({ children }) => <blockquote>{children}</blockquote>
+          p: withFileMarkers("p"),
+          td: withFileMarkers("td"),
+          th: withFileMarkers("th"),
+          li: withFileMarkers("li"),
+          strong: withFileMarkers("strong"),
+          em: withFileMarkers("em"),
+          code: ({ children, className }) => {
+            if (className === "language-mermaid") {
+              const text = String(children).replace(/\n$/, "");
+              return <InlineMermaid code={text} />;
+            }
+            return className ? <code className={className}>{children}</code> : <code>{children}</code>;
+          },
+          pre: ({ children }) => {
+            // If the child is an InlineMermaid, don't wrap in <pre>
+            const child = React.Children.toArray(children)[0];
+            if (child && typeof child === "object" && "type" in (child as any) && (child as any).type === InlineMermaid) {
+              return <>{children}</>;
+            }
+            return <pre>{children}</pre>;
+          },
+          h1: withFileMarkers("h1"),
+          h2: withFileMarkers("h2"),
+          h3: withFileMarkers("h3"),
+          blockquote: withFileMarkers("blockquote"),
         }}
       >
         {cleanedContent}

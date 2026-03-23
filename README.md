@@ -125,6 +125,12 @@ What works today:
 - research and curriculum builder: web search, repo cloning, article fetching, curated source files saved to workspace, phased learning plans
 - auto-reindex after research turns so new materials are immediately available for study artifacts
 - generated files (documents, research sources) sync to the project root folder
+- Canvas LMS integration: connect with a personal access token, browse course files and module items, selectively download and auto-create study workspaces with zip extraction
+- Codex usage tracking: live rate limit meters (5h + weekly windows), credits balance, per-turn token metrics via app-server RPC
+- inline mermaid diagram rendering in chat messages
+- styled citation pills for file references with type-specific icons
+- workspace and session management: delete from dashboard, session welcome with quick-start prompts
+- dark mode with full coverage across all panels and components
 - web UI and Electron desktop shell
 
 What Stuart is not trying to be:
@@ -285,6 +291,19 @@ pnpm --filter @stuart/desktop package:mac
 
 Output: `apps/desktop/release/Stuart-{version}-arm64.dmg` (macOS DMG + zip).
 
+Notarization:
+
+- Stuart packaging supports Apple notarization through any of these:
+  - `APPLE_API_KEY` + `APPLE_API_KEY_ID` + `APPLE_API_ISSUER`
+  - `APPLE_ID` + `APPLE_APP_SPECIFIC_PASSWORD` + `APPLE_TEAM_ID`
+  - `APPLE_KEYCHAIN_PROFILE`
+- On this repo, the packager also probes the conventional `stuart-notary` keychain profile automatically for mac builds.
+- If you want to force the profile explicitly, run:
+
+```bash
+APPLE_KEYCHAIN_PROFILE=stuart-notary pnpm --filter @stuart/desktop package:mac
+```
+
 The packaged app bundles the Codex runtime, the web server, and all study skills. The server runs in a separate forked process so the UI stays responsive during heavy ingestion.
 
 Other useful entry points:
@@ -318,6 +337,7 @@ Codex integration:
 - Skill matching uses priority-based regex with intent detection. Detailed skill prompts are injected as turn context when matched.
 - Stale turn watchdog: if no Codex activity for 5 minutes with turns in-flight, auto-reconnects and retries the last message.
 - On shutdown, Stuart cleans up child `codex app-server` processes (SIGINT/SIGTERM handlers).
+- Usage tracking: Stuart calls `account/rateLimits/read` on connection init and after each turn, and listens for `account/rateLimits/updated` and `thread/tokenUsage/updated` notifications. Snapshots are stored in SQLite and exposed via `/api/usage/codex`.
 
 Retrieval:
 
@@ -363,6 +383,14 @@ Quiz quality:
 - MRQ (multiple response questions) supported alongside single-answer MCQ.
 - Post-generation checking agent validates every answer via an ephemeral `gpt-5.4-mini` call.
 - Incorrect answers are fixed in-place before the student sees them.
+
+Canvas LMS integration:
+
+- Students connect their Canvas account via a personal access token (Account > Settings > Approved Integrations > New Access Token).
+- Full-page file browser shows all course files from both the Files section and Module items, grouped by folder with per-folder select/deselect.
+- Selected files are downloaded to a chosen local folder with automatic zip extraction, and a Stuart workspace + study session is created.
+- Canvas client at [packages/runtime-supervisor/src/canvas-client.ts](./packages/runtime-supervisor/src/canvas-client.ts), sync orchestrator at [packages/runtime-supervisor/src/canvas-sync.ts](./packages/runtime-supervisor/src/canvas-sync.ts).
+- API routes and file browser UI integrated into the main app with an "Import from Canvas" card on the dashboard.
 
 Dependency surfaces:
 
@@ -423,7 +451,7 @@ Current dedicated test areas include:
 - The runtime is still mid-pivot toward a cleaner workspace-first model.
 - Retrieval is much better than the earlier snippet-only path, but it is still FTS-backed support rather than full semantic search.
 - Native document fidelity depends on the optional local tools listed above.
-- Desktop packaging is working. The app has a custom icon but is not yet code-signed or notarized (requires an Apple Developer account).
+- Desktop packaging supports Developer ID signing and notarization, but release automation and notarized distribution are still manual.
 
 ## Philosophy
 

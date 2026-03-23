@@ -1251,6 +1251,498 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     response.json(updated satisfies StudySessionRecord);
   });
 
+  // ---- Canvas LMS Integration ----
+
+  // Create a new Canvas connection
+  router.post("/canvas/connections", asyncRoute(async (request, response) => {
+    const { label, baseUrl, token } = request.body ?? {};
+    if (!label || !baseUrl || !token) {
+      response.status(400).send("label, baseUrl, and token are required.");
+      return;
+    }
+
+    // Validate the token by calling Canvas API
+    // @ts-ignore -- canvas-client subpath export is added by a parallel build
+    const { CanvasApiClient } = await import("@stuart/runtime-supervisor/canvas-client");
+    const client = new CanvasApiClient(baseUrl, token);
+    let user: any;
+    try {
+      user = await client.validateConnection();
+    } catch (err: any) {
+      if (err.isUnauthorized) {
+        response.status(401).send("Invalid Canvas token. Please generate a new one.");
+        return;
+      }
+      response.status(502).send(`Cannot reach Canvas at ${baseUrl}: ${err.message}`);
+      return;
+    }
+
+    // Store the connection (token stored as plaintext for now - desktop app will encrypt via IPC)
+    const connection = (runtime.db as any).createCanvasConnection({
+      label,
+      baseUrl: baseUrl.replace(/\/+$/, ""),
+      token,
+    });
+    // Update with the validated user info
+    (runtime.db as any).updateCanvasConnection(connection.id, {
+      userDisplayName: user.name,
+      userId: String(user.id),
+      lastVerifiedAt: new Date().toISOString(),
+    });
+
+    response.status(201).json(connection);
+  }));
+
+  // List all connections (without tokens)
+  router.get("/canvas/connections", (_request, response) => {
+    response.json((runtime.db as any).listCanvasConnections());
+  });
+
+  // Get a single connection
+  router.get("/canvas/connections/:id", (request, response) => {
+    const connection = (runtime.db as any).getCanvasConnection(firstParam(request.params.id));
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    // Strip token before sending to client
+    const { tokenEncrypted, tokenPlaintext, ...safe } = connection as any;
+    response.json(safe);
+  });
+
+  // Delete a connection
+  router.delete("/canvas/connections/:id", (request, response) => {
+    (runtime.db as any).deleteCanvasConnection(firstParam(request.params.id));
+    response.json({ deleted: true });
+  });
+
+  // Verify a connection
+  router.post("/canvas/connections/:id/verify", asyncRoute(async (request, response) => {
+    const connection = (runtime.db as any).getCanvasConnection(firstParam(request.params.id));
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    const token = (connection as any).tokenPlaintext || (connection as any).tokenEncrypted;
+    if (!token) {
+      response.status(400).send("No token stored for this connection.");
+      return;
+    }
+    // @ts-ignore -- canvas-client subpath export is added by a parallel build
+    const { CanvasApiClient } = await import("@stuart/runtime-supervisor/canvas-client");
+    const client = new CanvasApiClient(connection.baseUrl, token);
+    try {
+      const user = await client.validateConnection();
+      (runtime.db as any).updateCanvasConnection(connection.id, {
+        lastVerifiedAt: new Date().toISOString(),
+        userDisplayName: user.name,
+        isActive: true,
+      });
+      response.json({ valid: true, userName: user.name });
+    } catch {
+      (runtime.db as any).updateCanvasConnection(connection.id, { isActive: false });
+      response.json({ valid: false });
+    }
+  }));
+
+  // Fetch courses from Canvas (live API call)
+  router.get("/canvas/connections/:id/courses", asyncRoute(async (request, response) => {
+    const connection = (runtime.db as any).getCanvasConnection(firstParam(request.params.id));
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    const token = (connection as any).tokenPlaintext || (connection as any).tokenEncrypted;
+    // @ts-ignore -- canvas-client subpath export is added by a parallel build
+    const { CanvasApiClient } = await import("@stuart/runtime-supervisor/canvas-client");
+    const client = new CanvasApiClient(connection.baseUrl, token);
+    const courses = await client.listActiveCourses();
+    response.json(courses.map((c: any) => ({
+      id: String(c.id),
+      name: c.name,
+      courseCode: c.course_code,
+      termName: c.term?.name ?? null,
+      currentScore: c.enrollments?.[0]?.computed_current_score ?? null,
+    })));
+  }));
+
+  // List files for a specific course (live API call — fetches files + folders, builds tree)
+  router.get("/canvas/connections/:id/courses/:courseId/files", asyncRoute(async (request, response) => {
+    const connection = (runtime.db as any).getCanvasConnection(firstParam(request.params.id));
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    const token = (connection as any).tokenPlaintext || (connection as any).tokenEncrypted;
+    const courseId = firstParam(request.params.courseId);
+
+    // @ts-ignore -- canvas-client subpath export is added by a parallel build
+    const { CanvasApiClient } = await import("@stuart/runtime-supervisor/canvas-client");
+    const client = new CanvasApiClient(connection.baseUrl, token);
+
+    // Fetch regular files + folders AND module files in parallel
+    const [files, folders, moduleFiles] = await Promise.all([
+      client.listCourseFiles(courseId).catch(() => [] as any[]),
+      client.listCourseFolders(courseId).catch(() => [] as any[]),
+      client.listModuleFiles(courseId).catch(() => [] as any[]),
+    ]);
+
+    // Build folder id -> full path map
+    const folderMap = new Map<number, string>();
+    for (const f of folders) {
+      // full_name is like "course files/Lecture Notes/Week 1"
+      // Strip the leading "course files" prefix
+      const parts = (f.full_name || "").split("/");
+      if (parts[0] === "course files") parts.shift();
+      folderMap.set(f.id, parts.join("/") || "");
+    }
+
+    // Merge files from Files section and Modules, deduplicating by file ID
+    const seenIds = new Set<number>();
+    const allFiles: any[] = [];
+    for (const f of files) {
+      if (!seenIds.has(f.id)) {
+        seenIds.add(f.id);
+        allFiles.push(f);
+      }
+    }
+    for (const f of moduleFiles) {
+      if (!seenIds.has(f.id)) {
+        seenIds.add(f.id);
+        allFiles.push(f);
+      }
+    }
+
+    const result = allFiles.map((f: any) => ({
+      id: String(f.id),
+      name: f.display_name || f.filename,
+      folderPath: folderMap.get(f.folder_id) || "",
+      contentType: f["content-type"] || "application/octet-stream",
+      size: f.size || 0,
+      updatedAt: f.updated_at || "",
+      url: f.url || "",
+    }));
+
+    response.json({ files: result });
+  }));
+
+  // Download selected files to a destination folder, create project + task, trigger ingestion
+  router.post("/canvas/connections/:id/courses/:courseId/download", asyncRoute(async (request, response) => {
+    const connectionId = firstParam(request.params.id);
+    const connection = (runtime.db as any).getCanvasConnection(connectionId);
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    const token = (connection as any).tokenPlaintext || (connection as any).tokenEncrypted;
+    if (!token) {
+      response.status(400).send("No token available.");
+      return;
+    }
+
+    const { fileIds, destinationFolder, courseName } = request.body ?? {};
+    if (!Array.isArray(fileIds) || fileIds.length === 0 || !destinationFolder) {
+      response.status(400).send("fileIds array and destinationFolder are required.");
+      return;
+    }
+
+    const courseId = firstParam(request.params.courseId);
+
+    // @ts-ignore -- canvas-client subpath export is added by a parallel build
+    const { CanvasApiClient } = await import("@stuart/runtime-supervisor/canvas-client");
+    const client = new CanvasApiClient(connection.baseUrl, token);
+
+    const { join } = await import("node:path");
+    const { mkdir } = await import("node:fs/promises");
+
+    // Fetch file list + folders + module files to get urls and paths
+    const [regularFiles, folders, moduleFiles] = await Promise.all([
+      client.listCourseFiles(courseId).catch(() => [] as any[]),
+      client.listCourseFolders(courseId).catch(() => [] as any[]),
+      client.listModuleFiles(courseId).catch(() => [] as any[]),
+    ]);
+
+    const folderMap = new Map<number, string>();
+    for (const f of folders) {
+      const parts = (f.full_name || "").split("/");
+      if (parts[0] === "course files") parts.shift();
+      folderMap.set(f.id, parts.join("/") || "");
+    }
+
+    // Merge and deduplicate by file ID
+    const seenIds = new Set<number>();
+    const allFiles: any[] = [];
+    for (const f of regularFiles) {
+      if (!seenIds.has(f.id)) { seenIds.add(f.id); allFiles.push(f); }
+    }
+    for (const f of moduleFiles) {
+      if (!seenIds.has(f.id)) { seenIds.add(f.id); allFiles.push(f); }
+    }
+
+    const fileIdSet = new Set(fileIds.map(String));
+    const filesToDownload = allFiles.filter((f: any) => fileIdSet.has(String(f.id)));
+
+    // Ensure destination exists
+    await mkdir(destinationFolder, { recursive: true });
+
+    // Download files preserving folder structure
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const { basename } = await import("node:path");
+    const execFileAsync = promisify(execFile);
+    let downloadedCount = 0;
+    for (const file of filesToDownload) {
+      const folderPath = (file.folder_id != null ? folderMap.get(file.folder_id as number) : undefined) || "";
+      const destDir = folderPath ? join(destinationFolder, folderPath) : destinationFolder;
+      const fileName = file.display_name || file.filename;
+      const destPath = join(destDir, fileName);
+      try {
+        await client.downloadFile(file.url, destPath);
+        downloadedCount++;
+
+        // Auto-extract zip files
+        if (fileName.toLowerCase().endsWith(".zip")) {
+          const extractDir = join(destDir, basename(fileName, ".zip"));
+          await mkdir(extractDir, { recursive: true });
+          try {
+            await execFileAsync("unzip", ["-o", "-q", destPath, "-d", extractDir]);
+          } catch {
+            // unzip failed — keep the zip, skip extraction
+          }
+        }
+
+        broadcastEvent(eventClients, {
+          type: "canvas.sync.progress",
+          connectionId,
+          phase: "Downloading",
+          detail: fileName,
+          percent: Math.round((downloadedCount / filesToDownload.length) * 100),
+        } as any);
+      } catch {
+        // Continue with next file on failure
+      }
+    }
+
+    // Create a Stuart project + study session so the workspace is immediately usable
+    const projectName = courseName || `Canvas Course ${courseId}`;
+    const project = runtime.createProject({
+      name: projectName,
+      rootPath: destinationFolder,
+    });
+    broadcastEvent(eventClients, { type: "project.created", projectId: project.id });
+
+    const task = runtime.createTask({
+      projectId: project.id,
+      title: `Study: ${projectName}`,
+      objective: "Help me study and understand the materials in this folder.",
+      attachments: [{ id: crypto.randomUUID(), hostPath: destinationFolder, mode: "reference" as const }],
+      browserEnabled: false,
+      authMode: "chatgpt",
+    } as CreateTaskInput);
+    broadcastEvent(eventClients, { type: "task.created", taskId: task.id });
+
+    // Trigger ingestion in background
+    void runtime.buildTaskIngestionIndex(task.id, { force: true }).catch(() => {});
+
+    response.json({
+      project,
+      task,
+      downloadedCount,
+      totalRequested: filesToDownload.length,
+    });
+  }));
+
+  // Map courses to Stuart projects
+  router.post("/canvas/connections/:id/courses/map", asyncRoute(async (request, response) => {
+    const connectionId = firstParam(request.params.id);
+    const connection = (runtime.db as any).getCanvasConnection(connectionId);
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    const { courses } = request.body ?? {};
+    if (!Array.isArray(courses)) {
+      response.status(400).send("courses array is required.");
+      return;
+    }
+
+    const { join } = await import("node:path");
+    const { homedir } = await import("node:os");
+    const { mkdir } = await import("node:fs/promises");
+
+    const mappings = [];
+    for (const course of courses) {
+      const { canvasCourseId, canvasCourseName, canvasCourseCode, canvasTermName, projectId, rootPath: customRootPath } = course;
+
+      // Just create the download folder — no project or task yet.
+      // The student will "Add study materials" from this folder when they're ready.
+      const rootPath = customRootPath || join(homedir(), "Stuart", "Canvas", canvasCourseCode || canvasCourseName || canvasCourseId);
+      await mkdir(rootPath, { recursive: true });
+
+      const mapping = (runtime.db as any).upsertCanvasCourseMapping({
+        connectionId,
+        canvasCourseId: String(canvasCourseId),
+        canvasCourseName,
+        canvasCourseCode: canvasCourseCode ?? null,
+        canvasTermName: canvasTermName ?? null,
+        projectId: null, // no project yet — just a download target
+        rootPath,
+      });
+      mappings.push(mapping);
+    }
+
+    response.json(mappings);
+  }));
+
+  // List course mappings
+  router.get("/canvas/course-mappings", (request, response) => {
+    const connectionId = typeof request.query.connectionId === "string" ? request.query.connectionId : undefined;
+    if (connectionId) {
+      response.json((runtime.db as any).listCanvasCourseMappings(connectionId));
+    } else {
+      // List all mappings across all connections
+      const connections = (runtime.db as any).listCanvasConnections();
+      const all = connections.flatMap((c: any) => (runtime.db as any).listCanvasCourseMappings(c.id));
+      response.json(all);
+    }
+  });
+
+  // Trigger sync for a course mapping
+  // Sync all courses for a connection
+  router.post("/canvas/connections/:id/sync", asyncRoute(async (request, response) => {
+    const connectionId = firstParam(request.params.id);
+    const mappings = (runtime.db as any).listCanvasCourseMappings(connectionId);
+    if (!mappings || mappings.length === 0) {
+      response.status(400).send("No courses mapped for this connection. Import courses first.");
+      return;
+    }
+    const connection = (runtime.db as any).getCanvasConnection(connectionId);
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    const token = connection.tokenPlaintext;
+    if (!token) {
+      response.status(400).send("No token available.");
+      return;
+    }
+    // @ts-ignore
+    const { CanvasSyncOrchestrator } = await import("@stuart/runtime-supervisor/canvas-sync");
+    const orchestrator = new CanvasSyncOrchestrator(runtime.db, (progress: any) => {
+      broadcastEvent(eventClients, { type: "canvas.sync.progress" as any, ...progress });
+    });
+    // Sync all mappings in background
+    void (async () => {
+      for (const mapping of mappings) {
+        if (!mapping.syncEnabled || !mapping.projectId) continue;
+        try {
+          await orchestrator.syncCourse({ ...connection, token } as any, mapping);
+        } catch { /* continue with next */ }
+      }
+      broadcastEvent(eventClients, { type: "canvas.sync.completed", connectionId } as any);
+      // Trigger re-ingestion for all linked projects
+      for (const mapping of mappings) {
+        if (!mapping.projectId) continue;
+        const tasks = runtime.db.listTasks().filter((t: any) => t.projectId === mapping.projectId);
+        if (tasks[0]) {
+          void runtime.buildTaskIngestionIndex(tasks[0].id, { force: true }).catch(() => {});
+        }
+      }
+    })().catch(() => {});
+    response.json({ started: true, courseCount: mappings.length });
+  }));
+
+  router.post("/canvas/course-mappings/:id/sync", asyncRoute(async (request, response) => {
+    const mappingId = firstParam(request.params.id);
+    const mapping = (runtime.db as any).getCanvasCourseMapping(mappingId);
+    if (!mapping) {
+      response.status(404).send("Course mapping not found.");
+      return;
+    }
+    const connection = (runtime.db as any).getCanvasConnection(mapping.connectionId);
+    if (!connection) {
+      response.status(404).send("Connection not found.");
+      return;
+    }
+    const token = (connection as any).tokenPlaintext || (connection as any).tokenEncrypted;
+    if (!token) {
+      response.status(400).send("No token available.");
+      return;
+    }
+
+    // @ts-ignore -- canvas-sync subpath export is added by a parallel build
+    const { CanvasSyncOrchestrator } = await import("@stuart/runtime-supervisor/canvas-sync");
+    const orchestrator = new CanvasSyncOrchestrator(runtime.db, (progress: any) => {
+      broadcastEvent(eventClients, {
+        type: "canvas.sync.progress",
+        ...progress,
+      } as any);
+    });
+
+    // Run sync in background
+    void orchestrator.syncCourse(
+      { ...connection, token } as any,
+      mapping,
+    ).then(() => {
+      broadcastEvent(eventClients, {
+        type: "canvas.sync.completed",
+        connectionId: connection.id,
+        courseMappingId: mappingId,
+      } as any);
+      // Trigger re-ingestion for the linked project
+      if (mapping.projectId) {
+        const tasks = runtime.db.listTasks().filter((t: any) => t.projectId === mapping.projectId);
+        const task = tasks[0];
+        if (task) {
+          void runtime.buildTaskIngestionIndex(task.id, { force: true }).catch(() => {});
+        }
+      }
+    }).catch((err: unknown) => {
+      broadcastEvent(eventClients, {
+        type: "canvas.sync.error",
+        connectionId: connection.id,
+        error: err instanceof Error ? err.message : String(err),
+      } as any);
+    });
+
+    response.json({ started: true });
+  }));
+
+  // List synced files for a mapping
+  router.get("/canvas/course-mappings/:id/files", (request, response) => {
+    response.json((runtime.db as any).listCanvasSyncedFiles(firstParam(request.params.id)));
+  });
+
+  // List assignments for a mapping
+  router.get("/canvas/course-mappings/:id/assignments", (request, response) => {
+    response.json((runtime.db as any).listCanvasAssignments(firstParam(request.params.id)));
+  });
+
+  // List modules for a mapping
+  router.get("/canvas/course-mappings/:id/modules", (request, response) => {
+    response.json((runtime.db as any).listCanvasModules(firstParam(request.params.id)));
+  });
+
+  // ─── Codex usage tracking ──────────────────────────────────────────
+
+  router.get("/usage/codex", (_request, response) => {
+    const latest = runtime.db.getLatestUsageSnapshot();
+    response.json({ snapshot: latest });
+  });
+
+  router.get("/usage/codex/history", (request, response) => {
+    const hours = Number(request.query.hours) || 24;
+    const history = runtime.db.getUsageHistory(hours);
+    response.json({ history, hours });
+  });
+
+  router.get("/usage/codex/turns", (request, response) => {
+    const taskId = typeof request.query.taskId === "string" ? request.query.taskId : undefined;
+    const limit = Number(request.query.limit) || 50;
+    const turns = runtime.db.getTurnMetrics(taskId, limit);
+    response.json({ turns });
+  });
+
   return router;
 }
 
