@@ -190,12 +190,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
+      const headers = new Headers(init?.headers ?? {});
+      if (!(init?.body instanceof FormData) && !(init?.body instanceof Blob) && !headers.has("Content-Type")) {
+        headers.set("Content-Type", "application/json");
+      }
       const response = await fetch(targetUrl, {
         ...init,
-        headers: {
-          "Content-Type": "application/json",
-          ...(init?.headers ?? {})
-        }
+        headers
       });
 
       if (!response.ok) {
@@ -245,8 +246,9 @@ function App() {
     platform: desktopBridge?.platform ?? "web",
     appVersion: desktopBridge?.appVersion ?? "0.1.0",
     apiOrigin:
-      desktopBridge?.apiOrigin ??
-      (window.location.origin === "null" ? "http://127.0.0.1:8787" : window.location.origin),
+      window.location.origin !== "null"
+        ? window.location.origin
+        : (desktopBridge?.apiOrigin ?? "http://127.0.0.1:8787"),
   }), [desktopBridge]);
 
   /* ---- Core State ---- */
@@ -272,11 +274,27 @@ function App() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [studyToolsCollapsed, setStudyToolsCollapsed] = useState(false);
   const [libraryCollapsed, setLibraryCollapsed] = useState(false);
+  const [artifactFilter, setArtifactFilter] = useState<string | null>(null);
+
+  /* ---- Theme State ---- */
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("stuart-theme") : null;
+    return (saved === "dark" ? "dark" : "light");
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("stuart-theme", theme);
+  }, [theme]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme(prev => prev === "light" ? "dark" : "light");
+  }, []);
 
   /* ---- UI State ---- */
   const [composerDraft, setComposerDraft] = useState("");
   const [composerImage, setComposerImage] = useState<string | null>(null);
-  const [composerFile, setComposerFile] = useState<{ name: string; size: number; dataBase64: string } | null>(null);
+  const [composerFile, setComposerFile] = useState<{ name: string; size: number; file: File } | null>(null);
   const [composerDragOver, setComposerDragOver] = useState(false);
   const [serverHealth, setServerHealth] = useState<"ok" | "degraded" | "down">("ok");
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -354,24 +372,6 @@ function App() {
       void endStudySession();
     }, 30 * 60 * 1000); // 30 min inactivity
   }, [endStudySession]);
-
-  const trackReviewEvent = useCallback(async (correct: boolean) => {
-    if (!activeSessionId) return;
-    resetInactivityTimer();
-    try {
-      const sessionRes = await fetch(apiUrl(`/api/study-sessions/${activeSessionId}`));
-      // We don't have a GET endpoint, so just PATCH with increments
-      // Use a simple approach: increment by 1 each time
-      await fetch(apiUrl(`/api/study-sessions/${activeSessionId}`), {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cardsReviewed: 1, // Will be replaced with accumulated value
-          correctCount: correct ? 1 : 0,
-        }),
-      });
-    } catch { /* non-critical */ }
-  }, [activeSessionId, resetInactivityTimer]);
 
   useEffect(() => {
     return () => {
@@ -1229,6 +1229,7 @@ function App() {
 
   /* ---- Image attachment helpers ---- */
   const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MB
+  const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024; // 64 MB
 
   function processImageFile(file: File) {
     if (!file.type.startsWith("image/")) return;
@@ -1264,6 +1265,18 @@ function App() {
     reader.readAsDataURL(file);
   }
 
+  function processDocumentFile(file: File) {
+    if (file.size > MAX_DOCUMENT_BYTES) {
+      setError(
+        `That file is too large to attach in chat. The current limit is ${Math.round(
+          MAX_DOCUMENT_BYTES / (1024 * 1024)
+        )}MB.`
+      );
+      return;
+    }
+    setComposerFile({ name: file.name, size: file.size, file });
+  }
+
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1274,15 +1287,7 @@ function App() {
       return;
     }
 
-    // Document file — read as base64 and attach
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
-      // Strip the data URL prefix to get raw base64
-      const base64 = dataUrl.split(",")[1] ?? "";
-      setComposerFile({ name: file.name, size: file.size, dataBase64: base64 });
-    };
-    reader.readAsDataURL(file);
+    processDocumentFile(file);
   }
 
   function handleComposerPaste(e: React.ClipboardEvent) {
@@ -1320,14 +1325,7 @@ function App() {
     if (file.type.startsWith("image/")) {
       processImageFile(file);
     } else {
-      // Document file
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = reader.result as string;
-        const base64 = dataUrl.split(",")[1] ?? "";
-        setComposerFile({ name: file.name, size: file.size, dataBase64: base64 });
-      };
-      reader.readAsDataURL(file);
+      processDocumentFile(file);
     }
   }
 
@@ -1345,7 +1343,11 @@ function App() {
           setThinkingState({ taskId: selectedTask.id, label: `Staging ${composerFile.name}...`, recentActions: [] });
           await request(`/api/tasks/${selectedTask.id}/upload-file`, {
             method: "POST",
-            body: JSON.stringify({ filename: composerFile.name, dataBase64: composerFile.dataBase64 }),
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "X-Stuart-Filename": composerFile.name,
+            },
+            body: composerFile.file,
           });
         }
 
@@ -1547,16 +1549,42 @@ function App() {
                 }
               />
             </div>
-            <button
-              className="ghost-button compact library-collapse-btn"
-              type="button"
-              onClick={() => setLibraryCollapsed(true)}
-              title="Hide sidebar"
-            >
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="9 3 4 7 9 11" />
-              </svg>
-            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: "2px" }}>
+              <button
+                className="theme-toggle-btn"
+                type="button"
+                onClick={toggleTheme}
+                title={theme === "light" ? "Switch to dark mode" : "Switch to light mode"}
+              >
+                {theme === "light" ? (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                  </svg>
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="5" />
+                    <line x1="12" y1="1" x2="12" y2="3" />
+                    <line x1="12" y1="21" x2="12" y2="23" />
+                    <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+                    <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+                    <line x1="1" y1="12" x2="3" y2="12" />
+                    <line x1="21" y1="12" x2="23" y2="12" />
+                    <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+                    <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+                  </svg>
+                )}
+              </button>
+              <button
+                className="ghost-button compact library-collapse-btn"
+                type="button"
+                onClick={() => setLibraryCollapsed(true)}
+                title="Hide sidebar"
+              >
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="9 3 4 7 9 11" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <div className="library-body">
@@ -1673,14 +1701,15 @@ function App() {
               </div>
             ) : null}
 
-            {/* Source files with clean names */}
+            {/* Source files — compact preview */}
             {selectedIngestion && selectedIngestion.documents.length > 0 ? (
-              <div className="library-section">
+              <div className="library-section sources-section">
                 <span className="library-kicker">
-                  Sources ({selectedIngestion.documents.length})
+                  Sources
+                  <span className="source-count">{selectedIngestion.documents.length}</span>
                 </span>
                 <div className="library-source-list">
-                  {selectedIngestion.documents.slice(0, 30).map((doc) => (
+                  {selectedIngestion.documents.slice(0, 3).map((doc) => (
                     <div key={doc.id} className="library-source-item">
                       <span className="source-badge">
                         {fileExtension(doc.relativePath).slice(0, 3)}
@@ -1688,6 +1717,9 @@ function App() {
                       <span className="source-name">{cleanSourceName(doc.relativePath)}</span>
                     </div>
                   ))}
+                  {selectedIngestion.documents.length > 3 && (
+                    <span className="source-more">+{selectedIngestion.documents.length - 3} more files indexed</span>
+                  )}
                 </div>
               </div>
             ) : null}
@@ -1838,18 +1870,20 @@ function App() {
                     const text = streamingDelta.text.trim();
                     // Detect if streaming content is a JSON artifact — show clean placeholder instead of raw code
                     const looksLikeArtifact = (text.startsWith("{") || text.includes("```json")) &&
-                      /\b"kind"\s*:\s*"(flashcards|quiz|mindmap|diagram|mock_exam|interactive|custom)"/.test(text);
+                      /\b"kind"\s*:\s*"(flashcards|quiz|mindmap|diagram|mock_exam|interactive|custom|document_docx|document_xlsx|document_pptx|document_pdf|study_doc)"/.test(text);
                     return (
                       <article className="chat-bubble assistant streaming">
                         <div className="chat-meta">
                           <span className="chat-label">Stuart</span>
                           <span className="chat-typing">typing...</span>
                         </div>
-                        {looksLikeArtifact ? (
-                          <p style={{ color: "var(--ink-muted)", fontStyle: "italic" }}>Generating study artifact...</p>
-                        ) : (
-                          <MarkdownMessage content={streamingDelta.text} />
-                        )}
+                        <div className="chat-content">
+                          {looksLikeArtifact ? (
+                            <p style={{ color: "var(--ink-muted)", fontStyle: "italic" }}>Generating study artifact...</p>
+                          ) : (
+                            <MarkdownMessage content={streamingDelta.text} />
+                          )}
+                        </div>
                       </article>
                     );
                   })() : null}
@@ -2014,11 +2048,7 @@ function App() {
                     onClick={() => handleStudyToolClick("flashcards")}
                     disabled={busy === "message" || turnInFlight}
                   >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="2" y="4" width="20" height="16" rx="2" />
-                      <line x1="6" y1="10" x2="18" y2="10" />
-                      <line x1="6" y1="14" x2="14" y2="14" />
-                    </svg>
+                    <span className="material-symbols-outlined">style</span>
                     Flashcards
                   </button>
                   <button
@@ -2027,13 +2057,7 @@ function App() {
                     onClick={() => handleStudyToolClick("mindmap")}
                     disabled={busy === "message" || turnInFlight}
                   >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <circle cx="12" cy="12" r="3" />
-                      <line x1="12" y1="3" x2="12" y2="9" />
-                      <line x1="12" y1="15" x2="12" y2="21" />
-                      <line x1="3" y1="12" x2="9" y2="12" />
-                      <line x1="15" y1="12" x2="21" y2="12" />
-                    </svg>
+                    <span className="material-symbols-outlined">hub</span>
                     Mind Map
                   </button>
                   <button
@@ -2042,11 +2066,7 @@ function App() {
                     onClick={() => handleStudyToolClick("quiz")}
                     disabled={busy === "message" || turnInFlight}
                   >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <circle cx="12" cy="12" r="10" />
-                      <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
-                      <line x1="12" y1="17" x2="12.01" y2="17" />
-                    </svg>
+                    <span className="material-symbols-outlined">quiz</span>
                     Quiz
                   </button>
                   <button
@@ -2055,12 +2075,7 @@ function App() {
                     onClick={() => handleStudyToolClick("diagram")}
                     disabled={busy === "message" || turnInFlight}
                   >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="3" y="3" width="7" height="7" rx="1" />
-                      <rect x="14" y="3" width="7" height="7" rx="1" />
-                      <rect x="3" y="14" width="7" height="7" rx="1" />
-                      <rect x="14" y="14" width="7" height="7" rx="1" />
-                    </svg>
+                    <span className="material-symbols-outlined">schema</span>
                     Diagram
                   </button>
                   <button
@@ -2091,13 +2106,7 @@ function App() {
                     }}
                     disabled={busy === "message"}
                   >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                      <polyline points="14 2 14 8 20 8" />
-                      <line x1="16" y1="13" x2="8" y2="13" />
-                      <line x1="16" y1="17" x2="8" y2="17" />
-                      <polyline points="10 9 9 9 8 9" />
-                    </svg>
+                    <span className="material-symbols-outlined">description</span>
                     Study Doc
                   </button>
                   <button
@@ -2106,10 +2115,7 @@ function App() {
                     onClick={() => handleStudyToolClick("mock_exam")}
                     disabled={busy === "message" || turnInFlight}
                   >
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M9 11l3 3L22 4" />
-                      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-                    </svg>
+                    <span className="material-symbols-outlined">checklist</span>
                     Mock Exam
                   </button>
 
@@ -2235,29 +2241,45 @@ function App() {
               {selectedStudyArtifacts.length > 0 ? (
                 <div className="tools-section">
                   <span className="tools-section-label">Your study artifacts</span>
+                  {/* Filter pills */}
+                  {(() => {
+                    const kindLabels: Record<string, string> = {
+                      study_doc: "Docs", flashcards: "Cards", quiz: "Quiz",
+                      mindmap: "Maps", diagram: "Diagrams", mock_exam: "Exams",
+                      interactive: "Apps", document_docx: "DOCX", document_xlsx: "XLSX",
+                      document_pptx: "PPTX", document_pdf: "PDF", custom: "Other", other: "Other",
+                    };
+                    const activeKinds = Object.entries(groupedArtifacts).filter(([, a]) => a.length > 0);
+                    if (activeKinds.length <= 1) return null;
+                    return (
+                      <div className="artifact-filter-pills">
+                        <button
+                          className={`artifact-filter-pill${artifactFilter === null ? " active" : ""}`}
+                          type="button"
+                          onClick={() => setArtifactFilter(null)}
+                        >All</button>
+                        {activeKinds.map(([kind, artifacts]) => (
+                          <button
+                            key={kind}
+                            className={`artifact-filter-pill ${kind}${artifactFilter === kind ? " active" : ""}`}
+                            type="button"
+                            onClick={() => setArtifactFilter(artifactFilter === kind ? null : kind)}
+                          >{kindLabels[kind] ?? kind} <span className="artifact-filter-count">{artifacts.length}</span></button>
+                        ))}
+                      </div>
+                    );
+                  })()}
                   {Object.entries(groupedArtifacts).map(([kind, artifacts]) => {
                     if (artifacts.length === 0) return null;
-                    const labels: Record<string, string> = {
-                      study_doc: "Study Docs",
-                      flashcards: "Flashcards",
-                      quiz: "Quizzes",
-                      mindmap: "Mind Maps",
-                      diagram: "Diagrams",
-                      mock_exam: "Mock Exams",
-                      interactive: "Interactive",
-                      document_docx: "Documents",
-                      document_xlsx: "Spreadsheets",
-                      document_pptx: "Presentations",
-                      document_pdf: "PDFs",
-                      custom: "Custom",
-                      other: "Other",
-                    };
+                    if (artifactFilter !== null && artifactFilter !== kind) return null;
                     return (
                       <div key={kind} className="artifact-folder">
-                        <div className="artifact-folder-header">
-                          <span className={`kind-badge ${kind}`}>{labels[kind] ?? kind}</span>
-                          <span className="artifact-folder-count">{artifacts.length}</span>
-                        </div>
+                        {artifactFilter === null && (
+                          <div className="artifact-folder-header">
+                            <span className={`kind-badge ${kind}`}>{kind.replace(/_/g, " ").replace(/\bdocument /g, "").toUpperCase()}</span>
+                            <span className="artifact-folder-count">{artifacts.length}</span>
+                          </div>
+                        )}
                         <div className="artifact-folder-items">
                           {artifacts.map((artifact) => (
                             <div key={artifact.id} className="artifact-card-row">
@@ -3338,6 +3360,23 @@ function ArtifactMenu({ onDelete }: { onDelete: () => void }) {
 }
 
 function ChatBubble({ message }: { message: TaskMessageRecord }) {
+  const artifactKinds = [
+    "flashcards",
+    "quiz",
+    "mindmap",
+    "mind_map",
+    "flashcard",
+    "diagram",
+    "mock_exam",
+    "interactive",
+    "custom",
+    "document_docx",
+    "document_xlsx",
+    "document_pptx",
+    "document_pdf",
+    "study_doc",
+  ];
+
   // Detect if assistant message is a JSON artifact — show a clean card instead of raw JSON
   const isJsonArtifact = message.role === "assistant" && (() => {
     const trimmed = message.content.trim();
@@ -3346,9 +3385,7 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
       const jsonStr = trimmed.startsWith("{") ? trimmed : (trimmed.match(/```(?:json)?\s*\n([\s\S]*?)\n```/)?.[1] ?? "");
       if (!jsonStr) return false;
       const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
-      return ["flashcards", "quiz", "mindmap", "diagram", "mind_map", "flashcard", "mock_exam", "interactive", "custom"].includes(
-        String(parsed.kind ?? parsed.artifactType ?? parsed.type ?? "").toLowerCase()
-      );
+      return artifactKinds.includes(String(parsed.kind ?? parsed.artifactType ?? parsed.type ?? "").toLowerCase());
     } catch { return false; }
   })();
 
@@ -3442,6 +3479,47 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
           if (notes.length > 0) {
             lines.push("**Key points:** " + notes.map(n => n.label ?? "").filter(Boolean).join(", "));
           }
+        } else if (kind === "document xlsx") {
+          const workbook = (p.workbook as Record<string, unknown> | undefined) ?? p;
+          const sheets = Array.isArray(workbook.sheets)
+            ? (workbook.sheets as Array<Record<string, unknown>>)
+            : [];
+          lines.push(`${sheets.length} worksheet${sheets.length === 1 ? "" : "s"}`);
+          const names = sheets.map((sheet) => String(sheet.name ?? "").trim()).filter(Boolean);
+          if (names.length > 0) {
+            lines.push("**Sheets:** " + names.slice(0, 6).join(", ") + (names.length > 6 ? `, and ${names.length - 6} more` : ""));
+          }
+        } else if (kind === "document docx" || kind === "document pdf") {
+          const document = (p.document as Record<string, unknown> | undefined) ?? p;
+          const sections = Array.isArray(document.sections)
+            ? (document.sections as Array<Record<string, unknown>>)
+            : [];
+          lines.push(`${sections.length} section${sections.length === 1 ? "" : "s"}`);
+          const headings = sections.map((section) => String(section.heading ?? "").trim()).filter(Boolean);
+          if (headings.length > 0) {
+            lines.push("**Sections:** " + headings.slice(0, 5).join(", ") + (headings.length > 5 ? `, and ${headings.length - 5} more` : ""));
+          }
+        } else if (kind === "document pptx") {
+          const presentation = (p.presentation as Record<string, unknown> | undefined) ?? p;
+          const slides = Array.isArray(presentation.slides)
+            ? (presentation.slides as Array<Record<string, unknown>>)
+            : [];
+          lines.push(`${slides.length} slide${slides.length === 1 ? "" : "s"}`);
+          const titles = slides.map((slide) => String(slide.title ?? "").trim()).filter(Boolean);
+          if (titles.length > 0) {
+            lines.push("**Slides:**");
+            titles.slice(0, 5).forEach((slideTitle) => lines.push(`- ${slideTitle}`));
+            if (titles.length > 5) lines.push(`- ...and ${titles.length - 5} more`);
+          }
+        } else if (kind === "study doc") {
+          const markdown = String(p.markdown ?? "");
+          const headings = Array.from(markdown.matchAll(/^#{1,6}\s+(.+)$/gm))
+            .map((match) => match[1]?.trim())
+            .filter(Boolean) as string[];
+          lines.push("Editable study document");
+          if (headings.length > 0) {
+            lines.push("**Sections:** " + headings.slice(0, 5).join(", ") + (headings.length > 5 ? `, and ${headings.length - 5} more` : ""));
+          }
         }
 
         const kindLabel = kind.charAt(0).toUpperCase() + kind.slice(1);
@@ -3483,11 +3561,13 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
         </span>
         <span className="chat-time">{formatDate(message.createdAt)}</span>
       </div>
-      {message.role === "assistant" ? (
-        <MarkdownMessage content={displayContent} />
-      ) : (
-        <p className="plain-message">{message.content}</p>
-      )}
+      <div className="chat-content">
+        {message.role === "assistant" ? (
+          <MarkdownMessage content={displayContent} />
+        ) : (
+          <p className="plain-message">{message.content}</p>
+        )}
+      </div>
     </article>
   );
 }

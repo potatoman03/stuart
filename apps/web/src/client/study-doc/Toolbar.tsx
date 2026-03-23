@@ -18,16 +18,59 @@ export function StudyDocToolbar({ editor, title, onTitleChange, onSave, onDelete
   if (!editor) return null;
 
   return (
-    <div className="study-doc-toolbar">
-      <input
-        className="toolbar-title-input"
-        value={title}
-        onChange={(e) => onTitleChange?.(e.target.value)}
-        placeholder="Untitled Notes"
-        spellCheck={false}
-      />
+    <div className="study-doc-toolbar-wrap">
+      {/* Row 1: Title + actions (always visible) */}
+      <div className="study-doc-toolbar-header">
+        <input
+          className="toolbar-title-input"
+          value={title}
+          onChange={(e) => onTitleChange?.(e.target.value)}
+          placeholder="Untitled Notes"
+          spellCheck={false}
+        />
+        <div className="toolbar-header-actions">
+          {isDirty ? (
+            <span className="toolbar-status-text unsaved">Unsaved</span>
+          ) : (
+            <span className="toolbar-status-text saved">Saved</span>
+          )}
+          {onSave ? (
+            <button className="toolbar-save-btn" type="button" onClick={onSave} disabled={isSaving || !isDirty}>
+              {isSaving ? "..." : "Save"}
+            </button>
+          ) : null}
+          {onToggleFullscreen ? (
+            <button className="toolbar-btn" type="button" onClick={onToggleFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+              {isFullscreen ? (
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="4 1 1 1 1 4" /><polyline points="12 1 15 1 15 4" /><polyline points="4 15 1 15 1 12" /><polyline points="12 15 15 15 15 12" />
+                </svg>
+              ) : (
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="1 5 1 1 5 1" /><polyline points="11 1 15 1 15 5" /><polyline points="15 11 15 15 11 15" /><polyline points="5 15 1 15 1 11" />
+                </svg>
+              )}
+            </button>
+          ) : null}
+          {onDelete ? (
+            <button className="toolbar-btn destructive" type="button" onClick={onDelete} title="Delete">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 3 14 13 14 13 6" /><line x1="1" y1="4" x2="15" y2="4" /><line x1="6" y1="2" x2="10" y2="2" />
+              </svg>
+            </button>
+          ) : null}
+          {onClose ? (
+            <button className="toolbar-btn" type="button" onClick={onClose} title="Close">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                <line x1="4" y1="4" x2="12" y2="12" /><line x1="12" y1="4" x2="4" y2="12" />
+              </svg>
+            </button>
+          ) : null}
+        </div>
+      </div>
 
-      <div className="toolbar-divider" />
+      {/* Row 2: Formatting tools (scrollable) */}
+      <div className="study-doc-toolbar">
 
       <div className="toolbar-group">
         <ToolbarButton
@@ -214,77 +257,6 @@ export function StudyDocToolbar({ editor, title, onTitleChange, onSave, onDelete
         </ToolbarButton>
       </div>
 
-      <div className="toolbar-spacer" />
-
-      <div className="toolbar-group toolbar-status">
-        {isDirty ? (
-          <span className="toolbar-status-text unsaved">Unsaved</span>
-        ) : (
-          <span className="toolbar-status-text saved">Saved</span>
-        )}
-        {onSave ? (
-          <button
-            className="toolbar-save-btn"
-            type="button"
-            onClick={onSave}
-            disabled={isSaving || !isDirty}
-          >
-            {isSaving ? "Saving..." : "Save"}
-          </button>
-        ) : null}
-        {onToggleFullscreen ? (
-          <button
-            className="toolbar-btn"
-            type="button"
-            onClick={onToggleFullscreen}
-            title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-          >
-            {isFullscreen ? (
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="4 1 1 1 1 4" />
-                <polyline points="12 1 15 1 15 4" />
-                <polyline points="4 15 1 15 1 12" />
-                <polyline points="12 15 15 15 15 12" />
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="1 5 1 1 5 1" />
-                <polyline points="11 1 15 1 15 5" />
-                <polyline points="15 11 15 15 11 15" />
-                <polyline points="5 15 1 15 1 11" />
-              </svg>
-            )}
-          </button>
-        ) : null}
-        {onDelete ? (
-          <button
-            className="toolbar-btn destructive"
-            type="button"
-            onClick={onDelete}
-            title="Delete this document"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="3 6 3 14 13 14 13 6" />
-              <line x1="1" y1="4" x2="15" y2="4" />
-              <line x1="6" y1="2" x2="10" y2="2" />
-              <line x1="6" y1="8" x2="6" y2="11" />
-              <line x1="10" y1="8" x2="10" y2="11" />
-            </svg>
-          </button>
-        ) : null}
-        {onClose ? (
-          <button
-            className="toolbar-btn"
-            type="button"
-            onClick={onClose}
-            title="Close editor"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-              <line x1="4" y1="4" x2="12" y2="12" />
-              <line x1="12" y1="4" x2="4" y2="12" />
-            </svg>
-          </button>
-        ) : null}
       </div>
     </div>
   );

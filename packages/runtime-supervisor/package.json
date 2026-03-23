@@ -16,16 +16,21 @@
     "typecheck": "tsc --noEmit -p tsconfig.json --rootDir ../.."
   },
   "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@stuart/db": "workspace:*",
     "@stuart/sandbox-executor": "workspace:*",
     "@stuart/shared": "workspace:*",
     "docx": "^9.0.0",
     "fast-xml-parser": "^5.5.1",
     "jszip": "^3.10.1",
+    "katex": "^0.16.38",
+    "latex-to-omml": "^2.1.1",
     "mammoth": "^1.11.0",
+    "mathjax": "^4.1.1",
     "pdfjs-dist": "^5.5.207",
     "pdfkit": "^0.15.0",
     "pptxgenjs": "^3.12.0",
+    "svg-to-pdfkit": "^0.1.8",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

@@ -480,7 +480,16 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       return;
     }
     const taskId = firstParam(request.params.taskId);
-    const artifact = runtime.db.createStudyArtifact({ taskId, kind, title, payload });
+    const isDocument = typeof kind === "string" && kind.startsWith("document_");
+    const artifact = runtime.db.createStudyArtifact({
+      taskId,
+      kind,
+      title,
+      payload,
+      payloadVersion: isDocument ? 2 : 1,
+      renderStatus: isDocument ? "pending" : undefined,
+      previewStatus: isDocument ? "pending" : undefined,
+    });
     response.status(201).json(artifact satisfies StudyArtifactRecord);
   });
 
@@ -656,12 +665,20 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
 
   // Upload a file to the task's staging area (transient by default).
   // Codex can read it during the turn. Pass ?persist=true to also copy to project root.
-  router.post("/tasks/:taskId/upload-file", asyncRoute(async (request, response) => {
+  router.post("/tasks/:taskId/upload-file", express.raw({ type: "application/octet-stream", limit: "80mb" }), asyncRoute(async (request, response) => {
     const taskId = firstParam(request.params.taskId);
-    const { filename, dataBase64 } = request.body ?? {};
+    const legacyBody = Buffer.isBuffer(request.body) ? null : (request.body ?? {});
+    const rawFilenameHeader = request.header("x-stuart-filename");
+    const filename = sanitizeUploadedFilename(
+      typeof rawFilenameHeader === "string" && rawFilenameHeader.trim() !== ""
+        ? rawFilenameHeader
+        : typeof legacyBody?.filename === "string"
+          ? legacyBody.filename
+          : ""
+    );
     const persist = request.query.persist === "true";
-    if (!filename || !dataBase64) {
-      response.status(400).send("filename and dataBase64 are required.");
+    if (!filename) {
+      response.status(400).send("A filename is required.");
       return;
     }
     const task = runtime.db.getTask(taskId);
@@ -675,7 +692,15 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     const stagingDir = latestRun?.stagingPath ?? join(runtime.dataDir, "staging", taskId);
     const destPath = join(stagingDir, "uploads", filename);
     await mkdir(join(stagingDir, "uploads"), { recursive: true });
-    const buffer = Buffer.from(dataBase64, "base64");
+    const buffer = Buffer.isBuffer(request.body)
+      ? request.body
+      : typeof legacyBody?.dataBase64 === "string"
+        ? Buffer.from(legacyBody.dataBase64, "base64")
+        : null;
+    if (!buffer || buffer.length === 0) {
+      response.status(400).send("Uploaded file body is empty.");
+      return;
+    }
     await writeFile(destPath, buffer);
 
     // Optionally persist to project root
@@ -797,6 +822,10 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       const { rm } = await import("node:fs/promises");
       await rm(result.filePath, { force: true }).catch(() => {});
     }
+    if (result.previewPath && result.previewPath !== result.filePath) {
+      const { rm } = await import("node:fs/promises");
+      await rm(result.previewPath, { force: true }).catch(() => {});
+    }
     response.json({ deleted: true });
   }));
 
@@ -891,110 +920,39 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
       return;
     }
 
-    // For document kinds, always try to render the binary first
+    // For document kinds, serve the persisted preview asset.
     if (kind.startsWith("document_")) {
-      const filePath = await runtime.ensureDocumentFile(artifact.id);
+      const previewPath = await runtime.ensureDocumentPreviewPath(artifact.id);
+      const refreshed = runtime.db.getStudyArtifact(artifact.id) ?? artifact;
 
-      // PDF — serve the binary (browser renders natively in iframe)
-      if (kind === "document_pdf" && filePath) {
-        response.setHeader("Content-Type", "application/pdf");
-        const { createReadStream } = await import("node:fs");
-        createReadStream(filePath).pipe(response);
+      if (previewPath) {
+        if (kind === "document_pdf") {
+          response.setHeader("Content-Type", "application/pdf");
+          const { createReadStream } = await import("node:fs");
+          createReadStream(previewPath).pipe(response);
+          return;
+        }
+
+        response.setHeader("Content-Type", "text/html; charset=utf-8");
+        const { readFile } = await import("node:fs/promises");
+        response.send(await readFile(previewPath, "utf8"));
         return;
       }
 
-      // DOCX — convert binary to HTML via mammoth
-      if (kind === "document_docx" && filePath) {
-        try {
-          const mammoth = await import("mammoth");
-          const { readFile } = await import("node:fs/promises");
-          const buffer = await readFile(filePath);
-          const result = await mammoth.convertToHtml({ buffer });
-          response.setHeader("Content-Type", "text/html; charset=utf-8");
-          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.6;color:#333}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f5f5f5}</style></head><body>${result.value}</body></html>`);
-          return;
-        } catch { /* fall through to HTML preview */ }
+      const title = kind.replace("document_", "").toUpperCase();
+      if (refreshed.previewStatus === "failed" || refreshed.renderStatus === "failed") {
+        response
+          .status(500)
+          .setHeader("Content-Type", "text/html; charset=utf-8")
+          .send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;color:#333;background:#f7f7f5}.box{max-width:460px;text-align:center}h2{margin:0 0 8px;font-size:1.2rem;color:#B91C1C}p{color:#666;font-size:14px;line-height:1.5}</style></head><body><div class="box"><h2>${title} preview unavailable</h2><p>${escapeHtml(refreshed.previewError ?? refreshed.renderError ?? "Stuart could not prepare a preview for this document.")}</p></div></body></html>`);
+        return;
       }
 
-      // XLSX — convert binary to HTML via xlsx
-      if (kind === "document_xlsx" && filePath) {
-        try {
-          const XLSX = await import("xlsx");
-          const workbook = XLSX.readFile(filePath);
-          const sheets = workbook.SheetNames.map((name) => {
-            const html = XLSX.utils.sheet_to_html(workbook.Sheets[name]!);
-            return `<h2>${name}</h2>${html}`;
-          }).join("");
-          response.setHeader("Content-Type", "text/html; charset=utf-8");
-          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#333}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f5f5f5;font-weight:600}</style></head><body>${sheets}</body></html>`);
-          return;
-        } catch { /* fall through */ }
-      }
-
-      // PPTX — render HTML cards from JSON payload
-      if (kind === "document_pptx") {
-        try {
-          const data = JSON.parse(artifact.payload) as { presentation?: { slides?: Array<Record<string, unknown>> } };
-          const slides = data.presentation?.slides ?? (data as unknown as { slides?: Array<Record<string, unknown>> }).slides ?? [];
-          const slideHtml = slides.map((slide, i) => {
-            const layout = slide.layout as string;
-            const title = (slide.title as string) ?? "";
-            let body = "";
-            if (layout === "content") {
-              const bullets = (slide.bullets as string[]) ?? [];
-              body = `<ul>${bullets.map((b) => `<li>${b}</li>`).join("")}</ul>`;
-            } else if (layout === "two_column") {
-              const left = (slide.left as string[]) ?? [];
-              const right = (slide.right as string[]) ?? [];
-              body = `<div style="display:flex;gap:2rem"><div style="flex:1"><ul>${left.map((b) => `<li>${b}</li>`).join("")}</ul></div><div style="flex:1"><ul>${right.map((b) => `<li>${b}</li>`).join("")}</ul></div></div>`;
-            } else if (layout === "table") {
-              const headers = (slide.headers as string[]) ?? [];
-              const rows = (slide.rows as string[][]) ?? [];
-              body = `<table><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${headers.map((_, ci) => `<td>${r[ci] ?? ""}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
-            } else if (layout === "title") {
-              body = slide.subtitle ? `<p style="color:#666;font-size:1.1rem">${slide.subtitle}</p>` : "";
-            } else if (layout === "sources") {
-              const entries = (slide.entries as string[]) ?? [];
-              body = `<ul style="font-size:0.9rem;color:#555">${entries.map((e) => `<li>${e}</li>`).join("")}</ul>`;
-            }
-            return `<div class="slide"><div class="slide-num">Slide ${i + 1}</div><h3>${title}</h3>${body}</div>`;
-          }).join("");
-          response.setHeader("Content-Type", "text/html; charset=utf-8");
-          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#333}.slide{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:1.5rem;margin:1rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.slide-num{font-size:0.75rem;color:#999;margin-bottom:0.5rem}table{border-collapse:collapse;width:100%;margin:0.5rem 0}th,td{border:1px solid #ddd;padding:6px 10px;text-align:left}th{background:#f5f5f5}</style></head><body>${slideHtml}</body></html>`);
-          return;
-        } catch { /* fall through */ }
-      }
-
-      // Fallback: render an HTML preview from JSON payload (only for JSON-schema artifacts)
-      try {
-        const data = JSON.parse(artifact.payload) as Record<string, unknown>;
-
-        // Script-based artifact with no rendered file
-        if (data.script) {
-          const ext = kind.replace("document_", "").toUpperCase();
-          const retryCount = Number(request.query.retry) || 0;
-
-          // Allow up to 3 auto-retries (9 seconds total), then show error
-          if (retryCount < 3) {
-            response.setHeader("Content-Type", "text/html; charset=utf-8");
-            response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;color:#333;text-align:center}.box{max-width:400px}h2{margin:0 0 8px;font-size:1.2rem}p{color:#666;font-size:14px;line-height:1.5}.spin{display:inline-block;width:24px;height:24px;border:3px solid #e5e7eb;border-top-color:#2962FF;border-radius:50%;animation:s 0.8s linear infinite;margin-bottom:12px}@keyframes s{to{transform:rotate(360deg)}}</style></head><body><div class="box"><div class="spin"></div><h2>Generating ${ext}...</h2><p>The document is being rendered. This page will refresh automatically.</p></div><script>setTimeout(()=>{const u=new URL(location.href);u.searchParams.set("retry",${retryCount + 1});location.replace(u)},3000)</script></body></html>`);
-            return;
-          }
-
-          // Retries exhausted — show error with manual retry
-          response.setHeader("Content-Type", "text/html; charset=utf-8");
-          response.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;color:#333;text-align:center}.box{max-width:440px}h2{margin:0 0 8px;font-size:1.2rem;color:#B91C1C}p{color:#666;font-size:14px;line-height:1.5}a,button{color:#2962FF;text-decoration:none;font-weight:600;cursor:pointer;background:none;border:none;font-size:14px}a:hover,button:hover{text-decoration:underline}.sep{margin:12px 0;border:none;border-top:1px solid #e5e7eb}</style></head><body><div class="box"><h2>${ext} generation failed</h2><p>The sandbox couldn't produce the document. This usually means the generated script had an error. Try asking Stuart to regenerate it.</p><hr class="sep"/><button onclick="location.href=location.pathname">Retry</button> · <a href="/api/study-artifacts/${artifact.id}/download">Try download</a></div></body></html>`);
-          return;
-        }
-
-        // JSON-schema artifact fallback
-        const sections = (data.document as Record<string, unknown>)?.sections ?? data.sections;
-        if (Array.isArray(sections) && sections.length > 0) {
-          response.setHeader("Content-Type", "text/html; charset=utf-8");
-          response.send(renderPdfPayloadAsHtml(artifact.title, sections as Array<Record<string, unknown>>));
-          return;
-        }
-      } catch { /* fall through */ }
+      response
+        .status(503)
+        .setHeader("Content-Type", "text/html; charset=utf-8")
+        .send(`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;color:#333;background:#f7f7f5}.box{max-width:420px;text-align:center}.spin{display:inline-block;width:24px;height:24px;border:3px solid #e5e7eb;border-top-color:#2962FF;border-radius:50%;animation:s 0.8s linear infinite;margin-bottom:12px}@keyframes s{to{transform:rotate(360deg)}}</style></head><body><div class="box"><div class="spin"></div><h2>Preparing preview...</h2><p>Stuart is still generating the ${title} preview asset. Retry in a moment.</p></div></body></html>`);
+      return;
     }
 
     // Final fallback
@@ -1319,6 +1277,34 @@ function firstParam(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? "" : value ?? "";
 }
 
+function sanitizeUploadedFilename(filename: string): string {
+  const trimmed = filename.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const leaf = trimmed
+    .split(/[\\/]/)
+    .pop()
+    ?.replace(/[\u0000-\u001f<>:"|?*]/g, "_")
+    .trim();
+
+  if (!leaf || leaf === "." || leaf === "..") {
+    return "";
+  }
+
+  return leaf;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 async function safeSystemDiagnostics(runtime: StuartRuntime) {
   try {
     return await runtime.getSystemDiagnostics();
@@ -1367,109 +1353,4 @@ function safeTasks(runtime: StuartRuntime) {
   } catch {
     return [];
   }
-}
-
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-function renderPdfPayloadAsHtml(title: string, sections: Array<Record<string, unknown>>): string {
-  const headingTag: Record<number, string> = { 1: "h2", 2: "h3", 3: "h4" };
-
-  function renderPara(para: Record<string, unknown>): string {
-    const type = para.type as string;
-    const content = escHtml((para.content as string) ?? "");
-
-    switch (type) {
-      case "text":
-        return `<p>${content}</p>`;
-      case "bullet":
-        return `<li>${content}</li>`;
-      case "numbered":
-        return `<li>${content}</li>`;
-      case "definition":
-        return `<div class="def"><strong>${escHtml((para.term as string) ?? "")}</strong> ${escHtml((para.definition as string) ?? "")}</div>`;
-      case "kv": {
-        const entries = (para.entries as Array<{ key: string; value: string }>) ?? [];
-        return `<div class="kv">${entries.map((e) => `<div class="kv-row"><span class="kv-key">${escHtml(e.key)}</span><span class="kv-val">${escHtml(e.value)}</span></div>`).join("")}</div>`;
-      }
-      case "table": {
-        const headers = (para.headers as string[]) ?? [];
-        const rows = (para.rows as string[][]) ?? [];
-        return `<table><thead><tr>${headers.map((h) => `<th>${escHtml(h)}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${headers.map((_, ci) => `<td>${escHtml(String(r[ci] ?? ""))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
-      }
-      case "math":
-        return `<div class="math${(para.display as boolean) ? " display" : ""}">${content}</div>`;
-      case "code":
-        return `<pre class="code">${content}</pre>`;
-      case "callout":
-        return `<div class="callout callout-${(para.style as string) ?? "info"}">${content}</div>`;
-      case "quote":
-        return `<blockquote>${content}</blockquote>`;
-      case "divider":
-        return `<hr/>`;
-      case "citation_note":
-        return `<div class="cite">${content}</div>`;
-      default:
-        return `<p>${content}</p>`;
-    }
-  }
-
-  let body = "";
-  for (const section of sections) {
-    const tag = headingTag[(section.level as number) ?? 1] ?? "h2";
-    body += `<${tag}>${escHtml((section.heading as string) ?? "")}</${tag}>`;
-    const paragraphs = (section.paragraphs as Array<Record<string, unknown>>) ?? [];
-    // Wrap consecutive bullets/numbered in ul/ol
-    let inList: string | null = null;
-    for (const para of paragraphs) {
-      const type = para.type as string;
-      if (type === "bullet" && inList !== "ul") {
-        if (inList) body += `</${inList}>`;
-        body += "<ul>";
-        inList = "ul";
-      } else if (type === "numbered" && inList !== "ol") {
-        if (inList) body += `</${inList}>`;
-        body += "<ol>";
-        inList = "ol";
-      } else if (type !== "bullet" && type !== "numbered" && inList) {
-        body += `</${inList}>`;
-        inList = null;
-      }
-      body += renderPara(para);
-    }
-    if (inList) body += `</${inList}>`;
-  }
-
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-body{font-family:system-ui,sans-serif;max-width:860px;margin:1.5rem auto;padding:0 1.5rem;color:#1a1a2e;font-size:14px;line-height:1.5}
-h1{font-size:1.4rem;border-bottom:2px solid #2962FF;padding-bottom:4px;margin:1.2rem 0 0.6rem}
-h2{font-size:1.15rem;color:#16213e;border-left:3px solid #2962FF;padding-left:8px;margin:1rem 0 0.4rem}
-h3{font-size:1rem;color:#0f3460;margin:0.8rem 0 0.3rem}
-h4{font-size:0.9rem;color:#333;margin:0.6rem 0 0.2rem}
-p{margin:0.3rem 0}
-ul,ol{margin:0.2rem 0 0.4rem 1.2rem;padding:0}
-li{margin:0.15rem 0}
-table{border-collapse:collapse;width:100%;margin:0.5rem 0;font-size:13px}
-th{background:#2962FF;color:#fff;font-weight:600;padding:5px 8px;text-align:left}
-td{border:1px solid #dee2e6;padding:4px 8px}
-tr:nth-child(even){background:#f8f9fa}
-blockquote{border-left:3px solid #6b7280;margin:0.4rem 0;padding:4px 12px;color:#4b5563;font-style:italic}
-.math{font-family:monospace;color:#5b21b6;background:#f5f3ff;border:1px solid #c4b5fd;border-radius:4px;padding:4px 8px;margin:0.3rem 0}
-.math.display{text-align:center;font-size:1.05em}
-.code{font-family:monospace;background:#1e293b;color:#e2e8f0;border-radius:4px;padding:6px 10px;margin:0.3rem 0;font-size:12px;overflow-x:auto}
-.callout{border-radius:4px;padding:6px 10px;margin:0.3rem 0;font-weight:600;font-size:13px}
-.callout-info{background:#ebf5ff;border-left:3px solid #3b82f6;color:#1e40af}
-.callout-tip{background:#ecfdf5;border-left:3px solid #10b981;color:#065f46}
-.callout-warning{background:#fffbeb;border-left:3px solid #f59e0b;color:#92400e}
-.callout-important{background:#fef2f2;border-left:3px solid #ef4444;color:#991b1b}
-.def{margin:0.2rem 0}
-.def strong{color:#1e40af;margin-right:6px}
-.kv{margin:0.3rem 0}
-.kv-row{display:flex;gap:8px;margin:1px 0;font-size:13px}
-.kv-key{font-weight:600;color:#374151;min-width:100px;flex-shrink:0}
-.kv-val{color:#555}
-.cite{font-size:11px;color:#9ca3af;font-style:italic;margin:0.2rem 0}
-hr{border:none;border-top:1px dashed #e5e7eb;margin:0.6rem 0}
-</style></head><body><h1>${escHtml(title)}</h1>${body}</body></html>`;
 }

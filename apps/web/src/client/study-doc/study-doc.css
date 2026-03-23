@@ -17,24 +17,66 @@
 
 /* ---- Toolbar ---- */
 
-.study-doc-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 6px 12px;
-  background: var(--zen-surface);
+/* Two-row toolbar: header (fixed) + format bar (scrollable) */
+.study-doc-toolbar-wrap {
   position: sticky;
   top: 0;
   z-index: 10;
   flex-shrink: 0;
-  flex-wrap: nowrap;
-  overflow-x: auto;
+  background: var(--zen-surface);
   border-bottom: 1px solid rgba(0, 0, 0, 0.05);
-  scrollbar-width: none;
+}
+
+.study-doc-toolbar-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+  min-height: 36px;
+}
+
+.toolbar-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.toolbar-header-actions .toolbar-btn {
+  width: 26px;
+  height: 26px;
+}
+
+.toolbar-header-actions .toolbar-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.study-doc-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 12px;
+  overflow-x: auto;
+  flex-wrap: nowrap;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0,0,0,0.15) transparent;
+  min-height: 30px;
 }
 
 .study-doc-toolbar::-webkit-scrollbar {
-  display: none;
+  height: 3px;
+}
+
+.study-doc-toolbar::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,0.15);
+  border-radius: 3px;
+}
+
+.study-doc-toolbar::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .toolbar-group {
@@ -46,25 +88,27 @@
 
 .toolbar-divider {
   width: 1px;
-  height: 20px;
-  margin: 0 6px;
+  height: 16px;
+  margin: 0 4px;
   background: var(--zen-outline-variant);
   opacity: 0.3;
+  flex-shrink: 0;
 }
 
 .toolbar-spacer {
   flex: 1;
+  min-width: 8px;
 }
 
 .toolbar-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   padding: 0;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--zen-on-surface-variant);
   font-size: 12px;
@@ -106,9 +150,10 @@
 }
 
 .toolbar-status-text {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
   letter-spacing: 0.02em;
+  margin-right: 2px;
 }
 
 .toolbar-status-text.saved {
@@ -120,15 +165,15 @@
 }
 
 .toolbar-save-btn {
-  padding: 4px 14px;
-  font-size: 12px;
+  padding: 3px 10px;
+  font-size: 11px;
   font-weight: 600;
   border: none;
-  border-radius: 9999px;
-  background: linear-gradient(135deg, var(--zen-primary), var(--zen-primary-dim));
+  border-radius: 6px;
+  background: var(--zen-primary);
   color: var(--zen-on-primary);
   cursor: pointer;
-  transition: opacity 120ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: opacity 120ms;
 }
 
 .toolbar-save-btn:hover:not(:disabled) {
@@ -446,11 +491,16 @@
   text-align: center;
   cursor: pointer;
   border-radius: 10px;
+  overflow-x: auto;
   transition: background 150ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .math-node-display:hover {
   background: rgba(41, 103, 103, 0.04);
+}
+
+.math-node-display .katex-display {
+  margin: 0;
 }
 
 .math-node-error {
@@ -618,6 +668,7 @@
   align-items: center;
   justify-content: center;
   min-height: 80px;
+  overflow-x: auto;
   transition: background 150ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
@@ -626,8 +677,13 @@
 }
 
 .mermaid-display svg {
+  display: block;
   max-width: 100%;
   height: auto;
+}
+
+.mermaid-display > div {
+  width: 100%;
 }
 
 .mermaid-error {

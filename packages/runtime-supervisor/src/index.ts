@@ -11,13 +11,12 @@ import {
   writeFile
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { basename, extname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { LocalDatabase } from "@stuart/db";
 import type {
   AttachmentMode,
   ApprovalRecord,
-  ArtifactRecord,
   CreateProjectInput,
   CreateTaskInput,
   CreateWorkerInput,
@@ -28,14 +27,13 @@ import type {
   IngestionIndexStats,
   IngestionSearchResult,
   ProjectRecord,
-  StagedAttachmentSnapshot,
   StudyArtifactRecord,
+  StagedAttachmentSnapshot,
   TaskMessageRecord,
   TaskRunManifest,
   TaskRunRecord,
   TaskSpec,
   TaskWorkerRecord,
-  TopicPerformanceRecord,
   UpdateTaskInput,
   VmStatus
 } from "@stuart/shared";
@@ -46,8 +44,10 @@ import {
   isIngestiblePath,
   type ParsedIngestionDocument
 } from "./ingestion.js";
-import { renderDocument } from "./document-renderer.js";
-import { matchSkills, type Skill } from "./skills.js";
+import { renderDocumentArtifact, validateOfficePackage } from "./document-pipeline.js";
+import { validateArtifactDraft } from "./artifact-validator.js";
+import { matchSkills, resolveSkillPrompt, listSkillBundleAssets, type Skill } from "./skills.js";
+import { buildSkillWorkerPlans } from "./skill-orchestration.js";
 import { SandboxExecutor } from "@stuart/sandbox-executor";
 import {
   collectSystemDiagnostics,
@@ -157,7 +157,7 @@ function resolveIngestionWorkerConfig() {
 }
 
 export class VmHelperClient {
-  constructor(private readonly helperBinaryPath?: string) {}
+  constructor(_helperBinaryPath?: string) {}
 
   private async invoke(_command: "status" | "start" | "stop"): Promise<VmStatus> {
     // Simplified for student runtime: always report running locally.
@@ -274,13 +274,33 @@ export class StuartRuntime {
     if (this.turns.size === 0) return;
     if (!this.codex.isConnected) return;
 
+    const now = Date.now();
+    for (const [turnId, turn] of this.turns.entries()) {
+      if (turn.kind !== "worker" || (!turn.memoryExtraction && !turn.quizValidation)) {
+        continue;
+      }
+      const lastActivityAt = turn.lastActivityAt || (turn.startedAt ? new Date(turn.startedAt).getTime() : now);
+      const stallTimeoutMs = turn.stallTimeoutMs ?? defaultTurnStallMs;
+      if (now - lastActivityAt < stallTimeoutMs) {
+        continue;
+      }
+      if (turn.quizValidation) {
+        this.recordRuntimeMessage(
+          turn.taskId,
+          "Quiz validation timed out. Keeping the generated quiz unchanged."
+        );
+      }
+      process.stderr.write(
+        `[stuart] auxiliary turn ${turnId} timed out after ${Math.max(1, Math.floor((now - lastActivityAt) / 1000))}s.\n`
+      );
+      this.turns.delete(turnId);
+    }
+
     // Only check task turns, not workers or memory extraction
     const taskTurns = [...this.turns.values()].filter(
       (t) => t.kind === "task" && !t.memoryExtraction
     );
     if (taskTurns.length === 0) return;
-
-    const now = Date.now();
     const staleTurns = taskTurns.filter((turn) => {
       const lastActivityAt = turn.lastActivityAt || (turn.startedAt ? new Date(turn.startedAt).getTime() : now);
       const stallTimeoutMs = turn.stallTimeoutMs ?? defaultTurnStallMs;
@@ -599,8 +619,8 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
         startedEmitted: false,
         memoryExtraction: true,
       });
-    } catch {
-      // Extraction is best-effort — never block the main flow
+    } catch (error) {
+      process.stderr.write(`[stuart] memory extraction turn could not start for task ${taskId}: ${String(error)}\n`);
     }
   }
 
@@ -659,19 +679,39 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
    * Renders on-demand if the file is missing. Returns the file path or null.
    */
   async ensureDocumentFile(artifactId: string): Promise<string | null> {
-    const artifact = this.db.getStudyArtifact(artifactId);
-    if (!artifact || !artifact.kind.startsWith("document_")) return null;
+    const artifact = await this.ensureDocumentAssets(artifactId);
+    return artifact?.filePath ?? null;
+  }
 
-    if (artifact.filePath && existsSync(artifact.filePath)) {
-      return artifact.filePath;
+  async ensureDocumentPreviewPath(artifactId: string): Promise<string | null> {
+    const artifact = await this.ensureDocumentAssets(artifactId);
+    return artifact?.previewPath ?? null;
+  }
+
+  private async ensureDocumentAssets(artifactId: string): Promise<StudyArtifactRecord | null> {
+    const artifact = this.db.getStudyArtifact(artifactId);
+    if (!artifact || !artifact.kind.startsWith("document_")) {
+      return null;
+    }
+
+    const binaryReady = !!artifact.filePath && existsSync(artifact.filePath);
+    const previewReady = !!artifact.previewPath && existsSync(artifact.previewPath);
+    if (binaryReady && previewReady) {
+      return artifact;
     }
 
     try {
       const data = JSON.parse(artifact.payload);
       const outputDir = this.resolveDocumentOutputDir(artifact.taskId);
+      const safeFilename = this.getSafeDocumentFilename(artifact.title);
 
-      // Script-based artifact: re-execute through sandbox
       if (data.script && data.language && data.outputFilename && this.sandboxAvailable) {
+        this.db.updateStudyArtifactLifecycle(artifact.id, {
+          renderStatus: "pending",
+          previewStatus: "pending",
+          renderError: null,
+          previewError: null,
+        });
         const result = await this.sandbox.executeScript({
           language: data.language,
           script: data.script,
@@ -681,25 +721,61 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
           sourcesDir: outputDir,
         });
         if (result.success && result.outputPath) {
-          this.db.updateStudyArtifactFilePath(artifact.id, result.outputPath);
-          return result.outputPath;
+          const previewPath = artifact.kind === "document_pdf" ? result.outputPath : artifact.previewPath ?? null;
+          return this.db.updateStudyArtifactLifecycle(artifact.id, {
+            filePath: result.outputPath,
+            previewPath,
+            renderStatus: "ready",
+            previewStatus: previewPath ? "ready" : "failed",
+            renderError: null,
+            previewError: previewPath ? null : "No preview asset is available for this legacy scripted document.",
+          }) ?? null;
         }
+        this.db.updateStudyArtifactLifecycle(artifact.id, {
+          renderStatus: "failed",
+          previewStatus: "failed",
+          renderError: `Sandbox re-execution failed with exit ${result.exitCode}.`,
+          previewError: "Preview unavailable because document rendering failed.",
+        });
         console.error(`[stuart] sandbox re-execution failed for artifact ${artifactId}: exit=${result.exitCode}`);
-        return null;
+        return this.db.getStudyArtifact(artifact.id) ?? null;
       }
 
-      // JSON-render path
-      const safeFilename = (artifact.title || "document")
-        .replace(/[^a-zA-Z0-9_\- ]/g, "")
-        .replace(/\s+/g, "_")
-        .slice(0, 80);
-      const filePath = await renderDocument(artifact.kind, data, outputDir, safeFilename);
-      this.db.updateStudyArtifactFilePath(artifact.id, filePath);
-      return filePath;
+      this.db.updateStudyArtifactLifecycle(artifact.id, {
+        renderStatus: "pending",
+        previewStatus: "pending",
+        renderError: null,
+        previewError: null,
+        payloadVersion: artifact.payloadVersion ?? 2,
+      });
+      const result = await renderDocumentArtifact(artifact.kind, data, outputDir, safeFilename);
+      return this.db.updateStudyArtifactLifecycle(artifact.id, {
+        filePath: result.outputPath,
+        previewPath: result.previewPath,
+        renderStatus: "ready",
+        previewStatus: "ready",
+        renderError: null,
+        previewError: null,
+        payloadVersion: Math.max(artifact.payloadVersion ?? 1, 2),
+      }) ?? null;
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.db.updateStudyArtifactLifecycle(artifact.id, {
+        renderStatus: "failed",
+        previewStatus: "failed",
+        renderError: message,
+        previewError: "Preview unavailable because document preparation failed.",
+      });
       console.error(`[stuart] document render failed for artifact ${artifactId}:`, err);
-      return null;
+      return this.db.getStudyArtifact(artifact.id) ?? null;
     }
+  }
+
+  private getSafeDocumentFilename(title: string): string {
+    return (title || "document")
+      .replace(/[^a-zA-Z0-9_\- ]/g, "")
+      .replace(/\s+/g, "_")
+      .slice(0, 80);
   }
 
   async deleteTask(taskId: string): Promise<boolean> {
@@ -867,6 +943,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     if (skills.length > 0) {
       this.recordRuntimeMessage(task.id, `Loaded skill${skills.length === 1 ? "" : "s"}: ${skills.map((skill) => skill.id).join(", ")}`);
     }
+    await this.stageSkillBundleAssets(context.cwd, skills);
 
     // Determine model + effort per turn based on what's needed.
     // Sandbox scripts (Python/JS doc gen) → flagship gpt-5.4 + high effort.
@@ -929,7 +1006,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       ...((skills.length > 0)
         ? skills.map((skill) => ({
             type: "text" as const,
-            text: skill.prompt,
+            text: resolveSkillPrompt(skill, trimmed),
             text_elements: []
           }))
         : []),
@@ -967,7 +1044,10 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     });
 
     // For large material sets with complex queries, spawn parallel explore workers
-    if (isLargeMaterialSet && !targetedFiles.length && !isSimpleQuery && !isResearch) {
+    const spawnedSkillWorkers = await this.spawnSkillWorkers(task, context, trimmed, skills).catch(
+      () => false
+    );
+    if (!spawnedSkillWorkers && isLargeMaterialSet && !targetedFiles.length && !isSimpleQuery && !isResearch) {
       void this.spawnExploreWorkers(task, context, trimmed).catch(() => {
         // Non-critical — the main turn will still work
       });
@@ -1581,7 +1661,13 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       );
     }
 
-    await Promise.allSettled(workerPromises);
+    const results = await Promise.allSettled(workerPromises);
+    const failures = results.filter((result) => result.status === "rejected");
+    if (failures.length > 0) {
+      process.stderr.write(
+        `[stuart] ${failures.length} explore worker${failures.length === 1 ? "" : "s"} failed to start for task ${task.id}.\n`
+      );
+    }
     this.emitEvent({
       type: "task.agent",
       taskId: task.id,
@@ -1589,6 +1675,44 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       status: "running",
       label: `Exploring ${docs.length} sources across ${maxWorkers} agents`,
     });
+  }
+
+  private async spawnSkillWorkers(
+    task: TaskSpec,
+    context: TaskExecutionContext,
+    question: string,
+    skills: Skill[]
+  ): Promise<boolean> {
+    const plans = buildSkillWorkerPlans(question, skills).slice(0, 3);
+    if (plans.length === 0) {
+      return false;
+    }
+
+    await mkdir(join(context.cwd, ".stuart", "worker-briefs"), { recursive: true });
+
+    const workerPromises = plans.map((plan) =>
+      this.createTaskWorker(task.id, {
+        role: plan.role,
+        objective: plan.objective,
+        taskRunId: context.taskRun?.id,
+      }).then(() => undefined)
+    );
+
+    const results = await Promise.allSettled(workerPromises);
+    const failures = results.filter((result) => result.status === "rejected");
+    if (failures.length > 0) {
+      process.stderr.write(
+        `[stuart] ${failures.length} skill worker${failures.length === 1 ? "" : "s"} failed to start for task ${task.id}.\n`
+      );
+    }
+    this.emitEvent({
+      type: "task.agent",
+      taskId: task.id,
+      agentId: "skill-swarm",
+      status: "running",
+      label: `Coordinating ${plans.length} skill worker${plans.length === 1 ? "" : "s"}`,
+    });
+    return true;
   }
 
   /**
@@ -1603,7 +1727,10 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     let data: { questions?: Array<Record<string, unknown>> };
     try {
       data = JSON.parse(artifact.payload);
-    } catch { return; }
+    } catch (error) {
+      process.stderr.write(`[stuart] could not parse quiz artifact ${artifactId} before validation: ${String(error)}\n`);
+      return;
+    }
 
     if (!data.questions || data.questions.length === 0) return;
 
@@ -1657,14 +1784,15 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
         turnId: turn.turn.id,
         startedAt: new Date().toISOString(),
         lastActivityAt: Date.now(),
+        stallTimeoutMs: 60_000,
         kind: "worker" as const,
         assistantText: "",
         thinkingLabel: "Checking quiz accuracy",
         startedEmitted: false,
         quizValidation: { artifactId, originalPayload: artifact.payload },
       });
-    } catch {
-      // Validation is best-effort
+    } catch (error) {
+      process.stderr.write(`[stuart] quiz validation could not start for artifact ${artifactId}: ${String(error)}\n`);
     }
   }
 
@@ -1714,7 +1842,13 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       }).then(() => undefined)
     );
 
-    await Promise.allSettled(workerPromises);
+    const results = await Promise.allSettled(workerPromises);
+    const failures = results.filter((result) => result.status === "rejected");
+    if (failures.length > 0) {
+      process.stderr.write(
+        `[stuart] ${failures.length} research worker${failures.length === 1 ? "" : "s"} failed to start for task ${task.id}.\n`
+      );
+    }
     this.emitEvent({
       type: "task.agent",
       taskId: task.id,
@@ -1773,8 +1907,8 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
             process.stdout.write(`[stuart] migrated .stuart-memory.md to structured memory (${lines.length} entries).\n`);
           }
         }
-      } catch {
-        // Migration is best-effort
+      } catch (error) {
+        process.stderr.write(`[stuart] structured memory migration failed for project ${task.projectId}: ${String(error)}\n`);
       }
     }
 
@@ -2262,8 +2396,8 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                 process.stdout.write(`[stuart] extracted ${memories.length} student memor${memories.length === 1 ? "y" : "ies"} from turn.\n`);
               }
             }
-          } catch {
-            // Extraction parsing failed — non-critical
+          } catch (error) {
+            process.stderr.write(`[stuart] failed to parse memory extraction output for turn ${params.turn.id}: ${String(error)}\n`);
           }
           this.turns.delete(params.turn.id);
           return;
@@ -2304,8 +2438,8 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                 process.stdout.write("[stuart] quiz validation: all questions passed.\n");
               }
             }
-          } catch {
-            // Validation parsing failed — non-critical
+          } catch (error) {
+            process.stderr.write(`[stuart] failed to parse quiz validation output for turn ${params.turn.id}: ${String(error)}\n`);
           }
           this.turns.delete(params.turn.id);
           return;
@@ -2389,11 +2523,27 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
             if (assistantText) {
               const parsed = tryParseArtifactJson(assistantText, state.cwd);
               if (parsed) {
+                const validation = validateArtifactDraft(parsed.kind, parsed.data);
+                if (!validation.ok) {
+                  this.recordRuntimeMessage(
+                    state.taskId,
+                    `Skipped storing the ${parsed.kind} artifact because validation failed: ${validation.errors.join("; ")}`
+                  );
+                } else {
+                  if (validation.warnings.length > 0) {
+                    this.recordRuntimeMessage(
+                      state.taskId,
+                      `Artifact quality check for ${parsed.kind}: ${validation.warnings.join("; ")}`
+                    );
+                  }
                 const artifact = this.db.createStudyArtifact({
                   taskId: state.taskId,
                   kind: parsed.kind,
                   title: parsed.title,
-                  payload: JSON.stringify(parsed.data)
+                  payload: JSON.stringify(parsed.data),
+                  payloadVersion: parsed.kind.startsWith("document_") ? 2 : 1,
+                  renderStatus: parsed.kind.startsWith("document_") ? "pending" : undefined,
+                  previewStatus: parsed.kind.startsWith("document_") ? "pending" : undefined,
                 });
                 this.recordRuntimeMessage(
                   state.taskId,
@@ -2408,22 +2558,11 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                 // Render document kinds to binary files
                 if (parsed.kind.startsWith("document_")) {
                   try {
-                    const safeFilename = (parsed.title || "document")
-                      .replace(/[^a-zA-Z0-9_\- ]/g, "")
-                      .replace(/\s+/g, "_")
-                      .slice(0, 80);
-                    const outputDir = this.resolveDocumentOutputDir(state.taskId);
-                    const filePath = await renderDocument(
-                      parsed.kind,
-                      parsed.data,
-                      outputDir,
-                      safeFilename
-                    );
-                    this.db.updateStudyArtifactFilePath(artifact.id, filePath);
+                    const prepared = await this.ensureDocumentAssets(artifact.id);
                     const ext = parsed.kind.replace("document_", "").toUpperCase();
                     this.recordRuntimeMessage(
                       state.taskId,
-                      `Generated ${ext} document: "${parsed.title}".`
+                      `Generated ${ext} document: "${parsed.title}"${prepared?.previewPath ? " with a ready preview." : "."}`
                     );
                   } catch (renderErr) {
                     // Rendering is non-fatal — artifact JSON is still stored
@@ -2432,6 +2571,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                       `Note: document rendering failed but the artifact data was saved. Error: ${String(renderErr)}`
                     );
                   }
+                }
                 }
               } else if (this.sandboxAvailable) {
                 // No JSON artifact found — try script-based execution path
@@ -2455,7 +2595,10 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                       script: script.script,
                       language: script.language,
                       outputFilename: script.outputFilename,
-                    })
+                    }),
+                    payloadVersion: 1,
+                    renderStatus: "pending",
+                    previewStatus: "pending",
                   });
                   this.recordRuntimeMessage(
                     state.taskId,
@@ -2490,18 +2633,40 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                     });
 
                     if (result.success && result.outputPath) {
-                      this.db.updateStudyArtifactFilePath(artifact.id, result.outputPath);
+                      if (kind === "document_docx" || kind === "document_xlsx" || kind === "document_pptx") {
+                        await validateOfficePackage(result.outputPath, kind);
+                      }
+                      this.db.updateStudyArtifactLifecycle(artifact.id, {
+                        filePath: result.outputPath,
+                        previewPath: kind === "document_pdf" ? result.outputPath : null,
+                        renderStatus: "ready",
+                        previewStatus: kind === "document_pdf" ? "ready" : "failed",
+                        renderError: null,
+                        previewError: kind === "document_pdf" ? null : "Legacy scripted Office documents do not have a persisted preview asset.",
+                      });
                       this.recordRuntimeMessage(
                         state.taskId,
                         `Generated ${ext.toUpperCase()} document via sandbox: "${script.title}" (${result.durationMs}ms).`
                       );
                     } else {
+                      this.db.updateStudyArtifactLifecycle(artifact.id, {
+                        renderStatus: "failed",
+                        previewStatus: "failed",
+                        renderError: `Sandbox execution failed (exit ${result.exitCode}).`,
+                        previewError: "Preview unavailable because document rendering failed.",
+                      });
                       this.recordRuntimeMessage(
                         state.taskId,
                         `Sandbox execution failed (exit ${result.exitCode}): ${truncateForLog(result.stderr || result.stdout, 300)}`
                       );
                     }
                   } catch (sandboxErr) {
+                    this.db.updateStudyArtifactLifecycle(artifact.id, {
+                      renderStatus: "failed",
+                      previewStatus: "failed",
+                      renderError: sandboxErr instanceof Error ? sandboxErr.message : String(sandboxErr),
+                      previewError: "Preview unavailable because document rendering failed.",
+                    });
                     this.emitEvent({
                       type: "sandbox.execution.completed",
                       taskId: state.taskId,
@@ -3064,6 +3229,28 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
     await this.codex.close();
     this.db.close();
   }
+
+  private async stageSkillBundleAssets(cwd: string, skills: Skill[]): Promise<void> {
+    const root = join(cwd, ".stuart", "skill-assets");
+    await mkdir(root, { recursive: true });
+    const seen = new Set<string>();
+
+    for (const skill of skills) {
+      if (seen.has(skill.id)) {
+        continue;
+      }
+      seen.add(skill.id);
+      const assets = listSkillBundleAssets(skill);
+      if (assets.length === 0) {
+        continue;
+      }
+      for (const asset of assets) {
+        const destination = join(root, skill.id, asset.relativePath);
+        await mkdir(dirname(destination), { recursive: true });
+        await cp(asset.absolutePath, destination, { force: true });
+      }
+    }
+  }
 }
 
 export async function inventoryPath(rootPath: string): Promise<Record<string, FileFingerprint>> {
@@ -3229,32 +3416,6 @@ function buildDiffOperations(
   return operations;
 }
 
-export function summarizeDiff(preview: DiffPreview): Record<DiffOperation["kind"], number> {
-  return preview.operations.reduce<Record<DiffOperation["kind"], number>>(
-    (summary, operation) => {
-      summary[operation.kind] += 1;
-      return summary;
-    },
-    {
-      create: 0,
-      modify: 0,
-      delete: 0,
-      move: 0
-    }
-  );
-}
-
-export function createPlaceholderArtifact(taskRunId: string, guestPath: string): ArtifactRecord {
-  return {
-    id: randomUUID(),
-    taskRunId,
-    guestPath,
-    type: "other",
-    status: "draft",
-    createdAt: new Date().toISOString()
-  };
-}
-
 function buildDeveloperInstructions(task: TaskSpec): string {
   const scopeSummary =
     task.attachments.length === 0
@@ -3274,6 +3435,7 @@ function buildDeveloperInstructions(task: TaskSpec): string {
     "If you create an HTML interactive or generated file, save it inside the staged workspace and end with exactly one JSON code block describing the artifact handoff.",
     "Use `.stuart/workspace-map.json` to understand the staged workspace layout and attachment mapping before touching files.",
     "Use `.stuart/workspace-memory.md` as the durable task memory file for important discovered facts, plans, and handoff notes when the task spans multiple turns.",
+    "When present, use `.stuart/skill-assets/<skill-id>/` for skill templates or helper scripts and `.stuart/worker-briefs/` for worker-produced build notes.",
     "Read and write files only inside the staged workspace. Editable and output changes stay staged until the host apply step reviews them.",
     scopeSummary,
     browserSummary
@@ -3479,6 +3641,16 @@ export function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec
 - Avoid walls of text, long preambles, filler, and raw excerpt dumps.
 - Only go deep when the student asks for depth or when the concept genuinely requires it.
 - When helpful, end with one useful next step, memory hook, or quick check for understanding. Do not turn every answer into homework.
+
+## Presence and tone
+- Sound like a thoughtful human guide: warm, calm, clear, and professionally engaged.
+- Talk to the student like a real person you are helping, not like a generic chatbot or a lecturer reading notes aloud.
+- Use natural language with light warmth and tact, but stay sharp and efficient.
+- It is good to briefly acknowledge confusion, effort, progress, or a genuinely good insight when it matters, as long as you move quickly back to useful teaching.
+- Encouragement and enthusiasm are welcome when they feel earned, specific, and grounded in what the student is actually doing or understanding.
+- Ask a natural follow-up question only when it will genuinely help the student learn or choose the next step.
+- Avoid canned enthusiasm, empty flattery, therapy-speak, corporate tone, or repetitive phrases like "Great question" on every turn.
+- Do not become chatty or overly casual. The target is warm professionalism, not hype.
 
 ## Core behaviour
 - Use your domain expertise to enrich and improve on what the workspace materials provide — add better examples, clearer explanations, and deeper context.

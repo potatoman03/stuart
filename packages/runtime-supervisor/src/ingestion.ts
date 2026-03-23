@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { readFile, stat as fsStat, mkdir, writeFile, rm, mkdtemp, access } from "node:fs/promises";
+import { readFile, mkdir, writeFile, rm, mkdtemp, access } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
@@ -143,9 +143,19 @@ const commandAvailability = new Map<string, Promise<boolean>>();
 // Utility functions
 // ---------------------------------------------------------------------------
 
-const execFileAsync = (command: string, args: string[], cwd?: string) =>
+const execFileAsync = (
+  command: string,
+  args: string[],
+  cwd?: string,
+  timeoutMs?: number,
+) =>
   new Promise<{ stdout: string; stderr: string }>((resolve_, reject) => {
-    execFile(command, args, { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(command, args, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    }, (error, stdout, stderr) => {
       if (error) {
         reject(Object.assign(error, { stdout, stderr }));
         return;
@@ -249,7 +259,7 @@ const persistVisualPreview = async (
 const runTesseract = async (filePath: string) => {
   if (!(await hasCommand("tesseract"))) return "";
   try {
-    const { stdout } = await execFileAsync("tesseract", [filePath, "stdout", "--psm", "6"]);
+    const { stdout } = await execFileAsync("tesseract", [filePath, "stdout", "--psm", "6"], undefined, 20_000);
     return normalizeWhitespace(stdout);
   } catch {
     return "";
@@ -262,7 +272,7 @@ const renderPdfPages = async (filePath: string) => {
 
   const outputDir = await createTempDir("stuart-render-pdf-");
   try {
-    const { stdout } = await execFileAsync("swift", [renderPdfScriptPath, filePath, outputDir, "1600"]);
+    const { stdout } = await execFileAsync("swift", [renderPdfScriptPath, filePath, outputDir, "1600"], undefined, 60_000);
     const lines = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
     if (lines.length === 0) {
       await cleanupDir(outputDir);
@@ -287,7 +297,7 @@ const convertDocxToPdf = async (filePath: string) => {
       "--convert-to", "pdf",
       "--outdir", outputDir,
       filePath,
-    ]);
+    ], undefined, 60_000);
     const pdfPath = join(outputDir, `${basename(filePath, extname(filePath))}.pdf`);
     await access(pdfPath);
     await cleanupDir(profileDir);
@@ -597,11 +607,6 @@ const buildOutline = (parser: string, normalizedText: string): OutlineItem[] => 
 
   return outline.slice(0, 24);
 };
-
-const outlineFromSections = (sections: ExtractedSection[]): OutlineItem[] =>
-  dedupe(sections.map((s) => s.heading).filter(Boolean) as string[])
-    .slice(0, 24)
-    .map((label, index) => ({ id: slugify(label) || `section-${index + 1}`, label, depth: 1 }));
 
 // ---------------------------------------------------------------------------
 // Chunk summarization

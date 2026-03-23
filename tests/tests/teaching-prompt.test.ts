@@ -34,6 +34,9 @@ describe("buildTeachingInstructions", () => {
     expect(prompt).toContain("Be concise, effective, and digestible by default.");
     expect(prompt).toContain("Start with the direct answer or core takeaway");
     expect(prompt).toContain("Avoid walls of text");
+    expect(prompt).toContain("Sound like a thoughtful human guide");
+    expect(prompt).toContain("warm, calm, clear, and professionally engaged");
+    expect(prompt).toContain("Avoid canned enthusiasm");
     expect(prompt).toContain("clean mental model first");
     expect(prompt).toContain("The artifact itself is the primary deliverable");
     expect(prompt).toContain("never stop at a prose description plus a filename mention");

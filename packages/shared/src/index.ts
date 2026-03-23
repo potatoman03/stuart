@@ -523,8 +523,15 @@ export type DocxParagraph =
   | { type: "bullet"; content: string }
   | { type: "numbered"; content: string }
   | { type: "table"; headers: string[]; rows: string[][] }
-  | { type: "callout"; content: string }
-  | { type: "citation_note"; content: string };
+  | { type: "callout"; content: string; style?: "info" | "warning" | "tip" | "important" }
+  | { type: "quote"; content: string }
+  | { type: "citation_note"; content: string }
+  | { type: "math"; content: string; display?: boolean }
+  | { type: "svg"; svg: string; caption?: string; alt?: string; width?: number; height?: number }
+  | { type: "code"; content: string; language?: string }
+  | { type: "divider" }
+  | { type: "definition"; term: string; definition: string }
+  | { type: "kv"; entries: Array<{ key: string; value: string }> };
 
 export type DocxSection = {
   heading: string;
@@ -539,10 +546,34 @@ export type DocxDocumentPayload = {
 };
 
 export type XlsxColumn = { header: string; width?: number };
+export type XlsxCellStyle =
+  | "header"
+  | "subheader"
+  | "emphasis"
+  | "good"
+  | "warning"
+  | "muted";
+export type XlsxCellValue = string | number | boolean | null;
+export type XlsxCell = {
+  value?: XlsxCellValue;
+  formula?: string;
+  numberFormat?: string;
+  style?: XlsxCellStyle;
+};
+export type XlsxMergeRange = {
+  startRow: number;
+  startColumn: number;
+  endRow: number;
+  endColumn: number;
+};
 export type XlsxSheet = {
   name: string;
   columns: XlsxColumn[];
-  rows: (string | number | boolean | null)[][];
+  rows: (XlsxCellValue | XlsxCell)[][];
+  frozenRows?: number;
+  frozenColumns?: number;
+  autoFilter?: boolean;
+  merges?: XlsxMergeRange[];
 };
 
 export type XlsxWorkbookPayload = {
@@ -551,12 +582,13 @@ export type XlsxWorkbookPayload = {
 };
 
 export type PptxSlide =
-  | { layout: "title"; title: string; subtitle?: string }
-  | { layout: "content"; title: string; bullets: string[] }
-  | { layout: "two_column"; title: string; left: string[]; right: string[] }
-  | { layout: "table"; title: string; headers: string[]; rows: string[][] }
-  | { layout: "section"; title: string }
-  | { layout: "sources"; entries: string[] };
+  | { layout: "title"; title: string; subtitle?: string; notes?: string[] }
+  | { layout: "content"; title: string; bullets: string[]; notes?: string[] }
+  | { layout: "two_column"; title: string; left: string[]; right: string[]; notes?: string[] }
+  | { layout: "table"; title: string; headers: string[]; rows: string[][]; notes?: string[] }
+  | { layout: "diagram"; title: string; svg: string; caption?: string; notes?: string[] }
+  | { layout: "section"; title: string; notes?: string[] }
+  | { layout: "sources"; entries: string[]; notes?: string[] };
 
 export type PptxPresentationPayload = {
   theme?: { primaryColor?: string; fontFamily?: string };
@@ -573,6 +605,7 @@ export type PdfParagraph =
   | { type: "quote"; content: string }
   | { type: "citation_note"; content: string }
   | { type: "math"; content: string; display?: boolean }
+  | { type: "svg"; svg: string; caption?: string; alt?: string; width?: number; height?: number }
   | { type: "code"; content: string; language?: string }
   | { type: "divider" }
   | { type: "definition"; term: string; definition: string }
@@ -591,6 +624,8 @@ export type PdfDocumentPayload = {
   citations: CitationRef[];
   sections: PdfSection[];
 };
+
+export type DocumentArtifactStatus = "pending" | "ready" | "failed";
 
 export type TipTapJSONContent = {
   type: string;
@@ -630,7 +665,14 @@ export type StudyArtifactRecord = {
   title: string;
   payload: string;
   filePath?: string;
+  previewPath?: string;
+  payloadVersion?: number;
+  renderStatus?: DocumentArtifactStatus;
+  previewStatus?: DocumentArtifactStatus;
+  renderError?: string;
+  previewError?: string;
   createdAt: string;
+  updatedAt?: string;
 };
 
 export type CardPerformanceRecord = {

@@ -1,7 +1,7 @@
 import { Node, mergeAttributes } from "@tiptap/core";
 import { ReactNodeViewRenderer, NodeViewWrapper, type NodeViewProps } from "@tiptap/react";
 import { useState, useRef, useEffect, useCallback } from "react";
-import katex from "katex";
+import { renderLatexMarkup } from "./rendering";
 
 function MathNodeView({ node, updateAttributes, selected, deleteNode }: NodeViewProps) {
   const [editing, setEditing] = useState(!node.attrs.latex);
@@ -45,13 +45,7 @@ function MathNodeView({ node, updateAttributes, selected, deleteNode }: NodeView
     );
   }
 
-  let html = "";
-  let error = "";
-  try {
-    html = katex.renderToString(latex, { displayMode: true, throwOnError: true });
-  } catch (e) {
-    error = e instanceof Error ? e.message : "Invalid LaTeX";
-  }
+  const { html, error } = renderLatexMarkup(latex, true);
 
   return (
     <NodeViewWrapper className={`math-node rendered${selected ? " selected" : ""}`}>

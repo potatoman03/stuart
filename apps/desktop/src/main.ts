@@ -604,6 +604,16 @@ ipcMain.handle("stuart:open-external", async (_event, url: string) => {
     return false;
   }
 
+  // Only allow http/https URLs to prevent protocol handler exploits
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
   await shell.openExternal(url);
   return true;
 });

@@ -43,6 +43,10 @@ export function getApiOrigin(): string {
     return "";
   }
 
+  if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+    return window.location.origin.replace(/\/$/, "");
+  }
+
   const bridge = getDesktopBridge();
   if (bridge?.apiOrigin) {
     return bridge.apiOrigin.replace(/\/$/, "");

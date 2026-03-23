@@ -1,6 +1,7 @@
 import { Node, mergeAttributes } from "@tiptap/core";
 import { ReactNodeViewRenderer, NodeViewWrapper, type NodeViewProps } from "@tiptap/react";
 import { useState, useEffect, useRef, useCallback } from "react";
+import { renderMermaidSvg } from "./rendering";
 
 function MermaidNodeView({ node, updateAttributes, selected, deleteNode }: NodeViewProps) {
   const [editing, setEditing] = useState(!node.attrs.code);
@@ -15,19 +16,10 @@ function MermaidNodeView({ node, updateAttributes, selected, deleteNode }: NodeV
     let cancelled = false;
 
     (async () => {
-      try {
-        const mermaidModule = await import("mermaid");
-        const mermaid = mermaidModule.default;
-        mermaid.initialize({ startOnLoad: false, theme: "neutral", securityLevel: "loose" });
-        const { svg: rendered } = await mermaid.render(idRef.current, code);
-        if (!cancelled) {
-          setSvg(rendered);
-          setError(null);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : "Diagram error");
-        }
+      const { svg: rendered, error: renderError } = await renderMermaidSvg(code, idRef.current);
+      if (!cancelled) {
+        setSvg(rendered);
+        setError(renderError);
       }
     })();
 

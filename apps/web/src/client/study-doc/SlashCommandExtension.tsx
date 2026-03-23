@@ -13,6 +13,7 @@ import {
   useImperativeHandle,
 } from "react";
 import { apiUrl } from "../platform";
+import { convertStudyDocBlocks } from "./rendering";
 
 /**
  * Slash command menu for inline AI actions in the study doc editor.
@@ -66,139 +67,58 @@ const SLASH_COMMANDS: SlashCommand[] = [
 // Quick-math lookup table
 // ---------------------------------------------------------------------------
 
-const QUICK_MATH: Record<string, string> = {
-  // Common integrals
-  "integral of e^x": "\\int e^x \\, dx = e^x + C",
-  "integral of sin x": "\\int \\sin x \\, dx = -\\cos x + C",
-  "integral of cos x": "\\int \\cos x \\, dx = \\sin x + C",
-  "integral of 1/x": "\\int \\frac{1}{x} \\, dx = \\ln|x| + C",
-  "integral of x^n": "\\int x^n \\, dx = \\frac{x^{n+1}}{n+1} + C, \\quad n \\neq -1",
-  "integral of ln x": "\\int \\ln x \\, dx = x \\ln x - x + C",
-  "integral of e^-x": "\\int e^{-x} \\, dx = -e^{-x} + C",
-  "integral of sec^2 x": "\\int \\sec^2 x \\, dx = \\tan x + C",
-  "integral of tan x": "\\int \\tan x \\, dx = -\\ln|\\cos x| + C",
-  // Common derivatives
-  "derivative of e^x": "\\frac{d}{dx} e^x = e^x",
-  "derivative of sin x": "\\frac{d}{dx} \\sin x = \\cos x",
-  "derivative of cos x": "\\frac{d}{dx} \\cos x = -\\sin x",
-  "derivative of ln x": "\\frac{d}{dx} \\ln x = \\frac{1}{x}",
-  "derivative of x^n": "\\frac{d}{dx} x^n = n x^{n-1}",
-  "derivative of tan x": "\\frac{d}{dx} \\tan x = \\sec^2 x",
-  // Famous equations/formulas
-  "pythagorean theorem": "a^2 + b^2 = c^2",
-  "quadratic formula": "x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}",
-  "euler's formula": "e^{i\\pi} + 1 = 0",
-  "euler's identity": "e^{i\\theta} = \\cos\\theta + i\\sin\\theta",
-  "binomial theorem": "(x + y)^n = \\sum_{k=0}^{n} \\binom{n}{k} x^{n-k} y^k",
-  "taylor series": "f(x) = \\sum_{n=0}^{\\infty} \\frac{f^{(n)}(a)}{n!}(x-a)^n",
-  "bayes theorem": "P(A|B) = \\frac{P(B|A) \\cdot P(A)}{P(B)}",
-  "normal distribution": "f(x) = \\frac{1}{\\sigma\\sqrt{2\\pi}} e^{-\\frac{(x-\\mu)^2}{2\\sigma^2}}",
-  "chain rule": "\\frac{dy}{dx} = \\frac{dy}{du} \\cdot \\frac{du}{dx}",
-  "product rule": "\\frac{d}{dx}[f(x)g(x)] = f'(x)g(x) + f(x)g'(x)",
-  "quotient rule": "\\frac{d}{dx}\\left[\\frac{f(x)}{g(x)}\\right] = \\frac{f'(x)g(x) - f(x)g'(x)}{[g(x)]^2}",
-  "integration by parts": "\\int u \\, dv = uv - \\int v \\, du",
-  "sum of geometric series": "\\sum_{k=0}^{n-1} ar^k = a \\cdot \\frac{1 - r^n}{1 - r}, \\quad r \\neq 1",
-  "sum of arithmetic series": "\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}",
-  // Linear algebra
-  "determinant 2x2": "\\det \\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix} = ad - bc",
-  "matrix multiplication": "(AB)_{ij} = \\sum_{k} A_{ik} B_{kj}",
-  "eigenvalue equation": "A\\mathbf{v} = \\lambda\\mathbf{v}",
-  "dot product": "\\mathbf{a} \\cdot \\mathbf{b} = \\sum_{i} a_i b_i = |\\mathbf{a}||\\mathbf{b}|\\cos\\theta",
-  "cross product": "\\mathbf{a} \\times \\mathbf{b} = |\\mathbf{a}||\\mathbf{b}|\\sin\\theta \\, \\hat{\\mathbf{n}}",
-  // Physics
-  "newton's second law": "F = ma",
-  "kinetic energy": "KE = \\frac{1}{2}mv^2",
-  "gravitational force": "F = G\\frac{m_1 m_2}{r^2}",
-  "schrodinger equation": "i\\hbar \\frac{\\partial}{\\partial t}\\Psi = \\hat{H}\\Psi",
-  "einstein mass energy": "E = mc^2",
-  "ohm's law": "V = IR",
-  // Statistics
-  "standard deviation": "\\sigma = \\sqrt{\\frac{1}{N}\\sum_{i=1}^{N}(x_i - \\mu)^2}",
-  "variance": "\\text{Var}(X) = E[(X - \\mu)^2] = E[X^2] - (E[X])^2",
-  "expected value": "E[X] = \\sum_{i} x_i \\cdot P(x_i)",
-  "correlation": "r = \\frac{\\sum(x_i - \\bar{x})(y_i - \\bar{y})}{\\sqrt{\\sum(x_i-\\bar{x})^2 \\sum(y_i-\\bar{y})^2}}",
-  // Fundamental theorem of calculus
-  "ftc": "\\frac{d}{dx}\\int_a^x f(t)\\,dt = f(x)",
-  "ftc1": "\\frac{d}{dx}\\int_a^x f(t)\\,dt = f(x)",
-  "ftc 1": "\\frac{d}{dx}\\int_a^x f(t)\\,dt = f(x)",
-  "fundamental theorem of calculus": "\\int_a^b f(x)\\,dx = F(b) - F(a), \\quad F'(x) = f(x)",
-  "fundamental theorem of calc": "\\int_a^b f(x)\\,dx = F(b) - F(a), \\quad F'(x) = f(x)",
-  "ftc2": "\\int_a^b f(x)\\,dx = F(b) - F(a)",
-  "ftc 2": "\\int_a^b f(x)\\,dx = F(b) - F(a)",
-  // More common
-  "limit definition of derivative": "f'(x) = \\lim_{h \\to 0} \\frac{f(x+h) - f(x)}{h}",
-  "mean value theorem": "f'(c) = \\frac{f(b) - f(a)}{b - a}",
-  "mvt": "f'(c) = \\frac{f(b) - f(a)}{b - a}",
-  "lhopitals rule": "\\lim_{x \\to c} \\frac{f(x)}{g(x)} = \\lim_{x \\to c} \\frac{f'(x)}{g'(x)}",
-  "l'hopital's rule": "\\lim_{x \\to c} \\frac{f(x)}{g(x)} = \\lim_{x \\to c} \\frac{f'(x)}{g'(x)}",
-  "lhopital": "\\lim_{x \\to c} \\frac{f(x)}{g(x)} = \\lim_{x \\to c} \\frac{f'(x)}{g'(x)}",
-  "power rule": "\\frac{d}{dx} x^n = nx^{n-1}",
-  "area of circle": "A = \\pi r^2",
-  "circumference": "C = 2\\pi r",
-  "volume of sphere": "V = \\frac{4}{3}\\pi r^3",
-  "surface area of sphere": "A = 4\\pi r^2",
-  "law of cosines": "c^2 = a^2 + b^2 - 2ab\\cos C",
-  "law of sines": "\\frac{a}{\\sin A} = \\frac{b}{\\sin B} = \\frac{c}{\\sin C}",
-  "distance formula": "d = \\sqrt{(x_2-x_1)^2 + (y_2-y_1)^2}",
-  "midpoint formula": "M = \\left(\\frac{x_1+x_2}{2}, \\frac{y_1+y_2}{2}\\right)",
-  "slope formula": "m = \\frac{y_2 - y_1}{x_2 - x_1}",
-  "point slope form": "y - y_1 = m(x - x_1)",
-  "slope intercept": "y = mx + b",
-  "compound interest": "A = P\\left(1 + \\frac{r}{n}\\right)^{nt}",
-  "continuous compound interest": "A = Pe^{rt}",
-  "logarithm change of base": "\\log_b a = \\frac{\\ln a}{\\ln b}",
-  "log rules": "\\log(ab) = \\log a + \\log b, \\quad \\log\\frac{a}{b} = \\log a - \\log b, \\quad \\log a^n = n\\log a",
-  "trig identity": "\\sin^2\\theta + \\cos^2\\theta = 1",
-  "double angle": "\\sin 2\\theta = 2\\sin\\theta\\cos\\theta, \\quad \\cos 2\\theta = \\cos^2\\theta - \\sin^2\\theta",
-  "half angle": "\\sin\\frac{\\theta}{2} = \\pm\\sqrt{\\frac{1-\\cos\\theta}{2}}, \\quad \\cos\\frac{\\theta}{2} = \\pm\\sqrt{\\frac{1+\\cos\\theta}{2}}",
-  // CS / Algorithms
-  "big o": "T(n) = O(g(n)) \\iff \\exists\\, c, n_0 > 0 : T(n) \\leq c \\cdot g(n) \\; \\forall\\, n \\geq n_0",
-  "master theorem": "T(n) = aT(n/b) + f(n)",
-  "entropy": "H(X) = -\\sum_{i} p(x_i) \\log_2 p(x_i)",
-  "softmax": "\\sigma(z_i) = \\frac{e^{z_i}}{\\sum_{j} e^{z_j}}",
-  "sigmoid": "\\sigma(x) = \\frac{1}{1 + e^{-x}}",
-  "relu": "\\text{ReLU}(x) = \\max(0, x)",
-  "gradient descent": "\\theta_{t+1} = \\theta_t - \\alpha \\nabla J(\\theta_t)",
-  "cross entropy loss": "L = -\\sum_{i} y_i \\log \\hat{y}_i",
-  "mse": "\\text{MSE} = \\frac{1}{n}\\sum_{i=1}^{n}(y_i - \\hat{y}_i)^2",
-  "linear regression": "\\hat{y} = \\mathbf{X}\\boldsymbol{\\beta}, \\quad \\boldsymbol{\\beta} = (\\mathbf{X}^T\\mathbf{X})^{-1}\\mathbf{X}^T\\mathbf{y}",
-};
+// LaTeX generation prompt — adapted from Inkd's proven approach.
+// Always routes through Codex quick-complete, no local lookup table.
+const LATEX_SYSTEM_PROMPT = `Output ONLY raw LaTeX math code. No thinking, no commentary, no explanation.
 
-function normalize(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-}
+ABSOLUTE RULES:
+- Your entire response must be valid LaTeX math syntax
+- NO English words or sentences
+- NO "I will...", NO reasoning, NO thinking out loud
+- NO dollar signs, NO backticks, NO markdown
+- Just LaTeX code, nothing else
 
-function findQuickMath(query: string): string | null {
-  const norm = normalize(query);
-  // Exact match (normalized)
-  for (const [key, latex] of Object.entries(QUICK_MATH)) {
-    if (normalize(key) === norm) return latex;
-  }
-  // Fuzzy: query contains key or key contains query
-  for (const [key, latex] of Object.entries(QUICK_MATH)) {
-    const nk = normalize(key);
-    if (norm.includes(nk) || nk.includes(norm)) return latex;
-  }
-  return null;
-}
+CONCISE BY DEFAULT:
+- "quadratic formula" → x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}
+- "pythagorean theorem" → a^2 + b^2 = c^2
+- "integral of sin x" → \\int \\sin x \\, dx = -\\cos x + C
+- "fourier series" → f(x) = \\frac{a_0}{2} + \\sum_{n=1}^{\\infty} \\left( a_n \\cos \\frac{n\\pi x}{L} + b_n \\sin \\frac{n\\pi x}{L} \\right)
+- "fourier transform" → \\hat{f}(\\xi) = \\int_{-\\infty}^{\\infty} f(x) \\, e^{-2\\pi i \\xi x} \\, dx
+
+Only use \\begin{aligned} if user says "show steps", "derive", or "prove".`;
+
+// ---------------------------------------------------------------------------
+// Quick-complete helper
+// ---------------------------------------------------------------------------
+
+// Legacy local quick-math lookup was removed. All /math requests now route
+// through Codex using the strict LaTeX-only prompt above.
 
 // ---------------------------------------------------------------------------
 // processSlashCommand -- executes a completed slash command
 // ---------------------------------------------------------------------------
 
-function showLoading(editor: any, _label: string): () => void {
-  // Insert a small styled placeholder and return a cleanup function
-  const marker = `\u200B__stuart_loading__\u200B`;
+function showLoading(editor: any, label: string): () => void {
+  // Insert a visually styled loading indicator
+  const loadingId = `loading-${Date.now()}`;
   editor.chain().focus().insertContent({
-    type: "paragraph",
-    content: [{ type: "text", text: marker }],
+    type: "callout",
+    attrs: { style: "tip" },
+    content: [{ type: "paragraph", content: [{ type: "text", text: `Generating${label ? `: ${label.slice(0, 40)}` : ""}...` }] }],
   }).run();
 
+  // Track the position of the last inserted node
+  const insertPos = editor.state.selection.from;
+
   return () => {
+    // Remove the loading callout — find the nearest callout before current cursor
     const { doc, tr } = editor.state;
+    let found = false;
     doc.descendants((node: any, pos: number) => {
-      if (node.isTextblock && node.textContent.includes("__stuart_loading__")) {
+      if (found) return false;
+      if (node.type.name === "callout" && node.textContent.startsWith("Generating")) {
         tr.delete(pos, pos + node.nodeSize);
+        found = true;
         return false;
       }
     });
@@ -211,19 +131,10 @@ export async function processSlashCommand(
   query: string,
   editor: any,
 ): Promise<void> {
-  // --- /math: try quick local lookup first, then Codex ---
+  // --- /math: always route through Codex with Inkd-style prompt ---
   if (commandId === "math") {
-    const quick = findQuickMath(query);
-    if (quick) {
-      editor.chain().focus().insertContent({
-        type: "mathBlock",
-        attrs: { latex: quick, display: true },
-      }).run();
-      return;
-    }
-
-    // If the query looks like raw LaTeX already (has backslashes or braces), insert directly
-    if (/[\\{}^_]/.test(query)) {
+    // If raw LaTeX (has backslashes or braces), insert directly
+    if (/[\\{}]/.test(query)) {
       editor.chain().focus().insertContent({
         type: "mathBlock",
         attrs: { latex: query, display: true },
@@ -231,16 +142,25 @@ export async function processSlashCommand(
       return;
     }
 
-    // Send to Codex for natural language → LaTeX conversion (inline, no chat)
+    // Route everything through Codex — fast model, strict LaTeX-only prompt
     const removeLoading = showLoading(editor, query);
     const latex = await quickComplete(
-      `Convert this to LaTeX. Return ONLY the raw LaTeX expression, no $$ delimiters, no explanation, no markdown, no code fences. Just the LaTeX:\n\n${query}`,
+      `${LATEX_SYSTEM_PROMPT}\n\n${query}`,
       `\\text{${query}}`,
     );
+
+    // Clean up the response — strip any stray delimiters or markdown
+    const cleaned = latex
+      .replace(/^\$\$?\s*/, "")
+      .replace(/\s*\$\$?$/, "")
+      .replace(/^```[a-z]*\n?/, "")
+      .replace(/\n?```$/, "")
+      .trim();
+
     removeLoading();
     editor.chain().focus().insertContent({
       type: "mathBlock",
-      attrs: { latex, display: true },
+      attrs: { latex: cleaned || `\\text{${query}}`, display: true },
     }).run();
     return;
   }
@@ -264,7 +184,14 @@ export async function processSlashCommand(
   if (commandId === "code") {
     const removeLoading = showLoading(editor, query);
     const result = await quickComplete(
-      `Write code for: ${query}. Return ONLY the code with comments. No explanation outside the code, no markdown fences.`,
+      `Write code for: ${query}
+
+Return ONLY the code with clear comments. Include:
+- A brief docstring/comment at the top explaining what it does
+- Inline comments on non-obvious lines
+- A small usage example at the bottom (commented out)
+
+No markdown fences, no explanation outside the code. Just the code.`,
       `# ${query}`,
     );
     removeLoading();
@@ -275,19 +202,34 @@ export async function processSlashCommand(
     return;
   }
 
-  // --- /explain: ask Codex inline, insert result as callout ---
+  // --- /explain: ask Codex for a rich inline explanation ---
   if (commandId === "explain") {
     const removeLoading = showLoading(editor, query);
     const explanation = await quickComplete(
-      `Explain briefly and clearly for a university student: ${query}. Be concise (2-4 sentences). No markdown headers.`,
+      `The student is writing study notes and wants an explanation of: "${query}"
+
+Write a clear, concise explanation suitable for inline insertion in their notes. Use:
+- Brief paragraphs (2-3 sentences each)
+- Display math in $$...$$ where equations help
+- Inline math in $...$ for variables
+- Bullet points for key properties or steps
+- Bold for key terms
+
+Keep it focused — 3-6 short paragraphs max. No title or top-level header.
+Return ONLY the content as markdown.`,
       query,
     );
     removeLoading();
-    editor.chain().focus().insertContent({
-      type: "callout",
-      attrs: { style: "note" },
-      content: [{ type: "paragraph", content: [{ type: "text", text: explanation }] }],
-    }).run();
+
+    // Insert as parsed markdown, then convert $$ blocks to math nodes
+    const markdownParser = editor.storage.markdown?.parser;
+    if (markdownParser) {
+      const parsed = markdownParser.parse(explanation);
+      editor.chain().focus().insertContent(parsed).run();
+    } else {
+      editor.chain().focus().insertContent(explanation).run();
+    }
+    convertStudyDocBlocks(editor);
     return;
   }
 

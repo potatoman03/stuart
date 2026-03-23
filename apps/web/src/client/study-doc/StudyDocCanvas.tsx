@@ -1,99 +1,11 @@
-import { useEditor, EditorContent, type Editor, generateJSON } from "@tiptap/react";
+import { useEditor, EditorContent } from "@tiptap/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { buildStudyDocExtensions } from "./extensions";
 import { StudyDocToolbar } from "./Toolbar";
 import { AiBubbleMenu } from "./AiBubbleMenu";
 import { apiUrl } from "../platform";
+import { convertStudyDocBlocks } from "./rendering";
 import "./study-doc.css";
-
-/**
- * Walk the editor document and convert raw `$$ ... $$` text into mathBlock nodes.
- * Handles both single-paragraph (`$$ F = ma $$`) and multi-paragraph forms where
- * `$$` appears alone in a paragraph followed by content and a closing `$$` paragraph.
- */
-function convertMathBlocks(editor: Editor) {
-  const { doc, schema } = editor.state;
-  const mathBlockType = schema.nodes.mathBlock;
-  if (!mathBlockType) return;
-
-  // Strategy 1: Single text node contains $$ ... $$
-  const transforms: Array<{ from: number; to: number; latex: string }> = [];
-
-  doc.descendants((node, pos) => {
-    if (node.isTextblock) {
-      const text = node.textContent;
-      // Match display math: $$ ... $$ (possibly with whitespace/newlines)
-      const regex = /\$\$([\s\S]+?)\$\$/g;
-      let match;
-      while ((match = regex.exec(text)) !== null) {
-        // Only convert if the paragraph contains ONLY the math expression
-        // (inline math within text would require an inline node, not supported yet)
-        const beforeMath = text.slice(0, match.index).trim();
-        const afterMath = text.slice(match.index + match[0].length).trim();
-        if (!beforeMath && !afterMath) {
-          const captured = match[1];
-          if (captured) {
-            transforms.push({
-              from: pos,
-              to: pos + node.nodeSize,
-              latex: captured.trim(),
-            });
-          }
-        }
-      }
-    }
-  });
-
-  if (transforms.length === 0) {
-    // Strategy 2: Multi-paragraph form where $$ appears alone in paragraphs
-    // e.g., paragraph("$$"), paragraph("F = ma"), paragraph("$$")
-    const nodes: Array<{ pos: number; size: number; text: string }> = [];
-    doc.descendants((node, pos) => {
-      if (node.isTextblock) {
-        nodes.push({ pos, size: node.nodeSize, text: node.textContent.trim() });
-      }
-    });
-
-    for (let i = 0; i < nodes.length - 2; i++) {
-      const nodeI = nodes[i]!;
-      if (nodeI.text === "$$") {
-        // Find the closing $$
-        for (let j = i + 1; j < nodes.length; j++) {
-          const nodeJ = nodes[j]!;
-          if (nodeJ.text === "$$") {
-            // Collect content between opening and closing $$
-            const latexParts: string[] = [];
-            for (let k = i + 1; k < j; k++) {
-              latexParts.push(nodes[k]!.text);
-            }
-            const latex = latexParts.join("\n").trim();
-            if (latex) {
-              transforms.push({
-                from: nodeI.pos,
-                to: nodeJ.pos + nodeJ.size,
-                latex,
-              });
-              i = j; // skip past closing $$
-            }
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  if (transforms.length === 0) return;
-
-  // Apply transforms in reverse order to preserve positions
-  const tr = editor.state.tr;
-  for (let i = transforms.length - 1; i >= 0; i--) {
-    const t = transforms[i]!;
-    const mathNode = mathBlockType.create({ latex: t.latex, display: true });
-    tr.replaceWith(t.from, t.to, mathNode);
-  }
-
-  editor.view.dispatch(tr);
-}
 
 type StudyDocCanvasProps = {
   initialDoc: unknown;
@@ -169,10 +81,10 @@ export function StudyDocCanvas({
       if (!initialDoc && initialMarkdown) {
         e.commands.setContent(initialMarkdown);
       }
-      // Post-process: convert $$ ... $$ text into mathBlock nodes
-      convertMathBlocks(e);
+      // Post-process: convert display math and Mermaid-like blocks into nodes
+      convertStudyDocBlocks(e);
       // Mark initialization complete after a tick so onUpdate ignores
-      // the transactions produced by setContent + convertMathBlocks
+      // the transactions produced by setContent + post-processing
       queueMicrotask(() => {
         isInitializingRef.current = false;
       });

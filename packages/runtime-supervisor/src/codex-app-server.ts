@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createConnection, createServer } from "node:net";
+import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { buildCodexCommandArgs, resolveCodexCommandConfig } from "./codex-command.js";
 
@@ -30,6 +30,8 @@ type PendingRequest = {
   resolve: (value: any) => void;
   reject: (reason?: unknown) => void;
 };
+
+const DEFAULT_RPC_TIMEOUT_MS = Number(process.env.STUART_CODEX_RPC_TIMEOUT_MS ?? 20_000);
 
 type SocketLike = {
   send(data: string): void;
@@ -123,7 +125,21 @@ export class CodexAppServerClient {
   private requestInternal<TResult = unknown>(method: string, params?: unknown): Promise<TResult> {
     const id = String(++this.requestCounter);
     const responsePromise = new Promise<TResult>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Timed out waiting for codex app-server response to ${method}.`));
+      }, DEFAULT_RPC_TIMEOUT_MS);
+      timeout.unref?.();
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
+        reject: (reason) => {
+          clearTimeout(timeout);
+          reject(reason);
+        },
+      });
     });
 
     this.send({

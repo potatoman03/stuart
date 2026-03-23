@@ -1,11 +1,28 @@
 /**
  * Document renderer — converts structured JSON payloads into binary
- * DOCX, XLSX, PPTX, and PDF files using dedicated libraries.
+ * Office and PDF files. DOCX/XLSX/PPTX are written directly as
+ * OpenXML packages; PDF remains library-backed.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { CitationRef } from "@stuart/shared";
+import {
+  renderDocxOpenXml,
+  renderPptxOpenXml,
+  renderXlsxOpenXml,
+} from "./openxml-renderer.js";
+import {
+  renderLatexToPlainText,
+  renderLatexToSvg,
+  renderTextWithLatexToPlainText,
+} from "./math-rendering.js";
+import {
+  clampSize,
+  getSvgDimensions,
+  normalizeSvgForHtml,
+  pxToPt,
+} from "./svg-rendering.js";
 
 // ---- Shared citation formatter ----
 
@@ -20,512 +37,7 @@ function formatCitations(citations: CitationRef[]): string[] {
   });
 }
 
-// ---- DOCX Renderer ----
-
-async function renderDocx(
-  payload: Record<string, unknown>,
-  outputPath: string
-): Promise<void> {
-  const {
-    Document,
-    Paragraph,
-    TextRun,
-    HeadingLevel,
-    Packer,
-    Table,
-    TableRow,
-    TableCell,
-    WidthType,
-    BorderStyle,
-    ShadingType,
-    AlignmentType,
-  } = await import("docx");
-
-  const doc = payload as {
-    metadata?: { author?: string; subject?: string; description?: string };
-    citations?: CitationRef[];
-    sections?: Array<{
-      heading: string;
-      level: number;
-      paragraphs: Array<Record<string, unknown>>;
-    }>;
-  };
-
-  const children: Array<
-    InstanceType<typeof Paragraph> | InstanceType<typeof Table>
-  > = [];
-
-  const headingMap: Record<number, (typeof HeadingLevel)[keyof typeof HeadingLevel]> = {
-    1: HeadingLevel.HEADING_1,
-    2: HeadingLevel.HEADING_2,
-    3: HeadingLevel.HEADING_3,
-  };
-
-  for (const section of doc.sections ?? []) {
-    // Section heading
-    children.push(
-      new Paragraph({
-        heading: headingMap[section.level] ?? HeadingLevel.HEADING_1,
-        children: [
-          new TextRun({
-            text: section.heading,
-            bold: true,
-            size: section.level === 1 ? 36 : section.level === 2 ? 30 : 26,
-          }),
-        ],
-      })
-    );
-
-    for (const para of section.paragraphs ?? []) {
-      const pType = para.type as string;
-      const content = (para.content as string) ?? "";
-
-      switch (pType) {
-        case "text":
-          children.push(
-            new Paragraph({
-              children: [new TextRun({ text: content, size: 24 })],
-              spacing: { after: 120 },
-            })
-          );
-          break;
-
-        case "bullet":
-          children.push(
-            new Paragraph({
-              bullet: { level: 0 },
-              children: [new TextRun({ text: content, size: 24 })],
-            })
-          );
-          break;
-
-        case "numbered":
-          children.push(
-            new Paragraph({
-              numbering: { reference: "default-numbering", level: 0 },
-              children: [new TextRun({ text: content, size: 24 })],
-            })
-          );
-          break;
-
-        case "callout":
-          children.push(
-            new Paragraph({
-              shading: { type: ShadingType.SOLID, color: "E8F0FE", fill: "E8F0FE" },
-              children: [new TextRun({ text: `💡 ${content}`, size: 24, italics: true })],
-              spacing: { before: 120, after: 120 },
-              indent: { left: 360, right: 360 },
-            })
-          );
-          break;
-
-        case "citation_note":
-          children.push(
-            new Paragraph({
-              children: [
-                new TextRun({ text: content, size: 20, italics: true, color: "666666" }),
-              ],
-              spacing: { after: 60 },
-            })
-          );
-          break;
-
-        case "table": {
-          const headers = (para.headers as string[]) ?? [];
-          const rows = (para.rows as string[][]) ?? [];
-
-          if (headers.length > 0) {
-            const headerRow = new TableRow({
-              children: headers.map(
-                (h) =>
-                  new TableCell({
-                    children: [
-                      new Paragraph({
-                        children: [new TextRun({ text: h, bold: true, size: 22 })],
-                        alignment: AlignmentType.CENTER,
-                      }),
-                    ],
-                    shading: { type: ShadingType.SOLID, color: "E0E0E0", fill: "E0E0E0" },
-                  })
-              ),
-            });
-
-            const dataRows = rows.map(
-              (row) =>
-                new TableRow({
-                  children: headers.map(
-                    (_, ci) =>
-                      new TableCell({
-                        children: [
-                          new Paragraph({
-                            children: [
-                              new TextRun({ text: String(row[ci] ?? ""), size: 22 }),
-                            ],
-                          }),
-                        ],
-                      })
-                  ),
-                })
-            );
-
-            children.push(
-              new Table({
-                rows: [headerRow, ...dataRows],
-                width: { size: 100, type: WidthType.PERCENTAGE },
-                borders: {
-                  top: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-                  bottom: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-                  left: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-                  right: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-                  insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-                  insideVertical: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-                },
-              })
-            );
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  // Endnotes section from citations
-  const citations = doc.citations ?? [];
-  if (citations.length > 0) {
-    children.push(
-      new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: "References", bold: true, size: 36 })],
-        spacing: { before: 400 },
-      })
-    );
-    for (const line of formatCitations(citations)) {
-      children.push(
-        new Paragraph({
-          children: [new TextRun({ text: line, size: 20, color: "444444" })],
-          spacing: { after: 60 },
-        })
-      );
-    }
-  }
-
-  const document = new Document({
-    creator: doc.metadata?.author ?? "Stuart",
-    description: doc.metadata?.description ?? "",
-    numbering: {
-      config: [
-        {
-          reference: "default-numbering",
-          levels: [
-            {
-              level: 0,
-              format: "decimal" as unknown as (typeof import("docx"))["LevelFormat"]["DECIMAL"],
-              text: "%1.",
-              alignment: AlignmentType.LEFT,
-            },
-          ],
-        },
-      ],
-    },
-    sections: [{ children }],
-  });
-
-  const buffer = await Packer.toBuffer(document);
-  await writeFile(outputPath, buffer);
-}
-
-// ---- XLSX Renderer ----
-
-async function renderXlsx(
-  payload: Record<string, unknown>,
-  outputPath: string
-): Promise<void> {
-  const XLSX = await import("xlsx");
-
-  const wb = payload as {
-    sheets?: Array<{
-      name: string;
-      columns?: Array<{ header: string; width?: number }>;
-      rows?: (string | number | boolean | null)[][];
-    }>;
-    sourceNotes?: string[];
-  };
-
-  const workbook = XLSX.utils.book_new();
-
-  for (const sheet of wb.sheets ?? []) {
-    const headers = (sheet.columns ?? []).map((c) => c.header);
-    const aoa = [headers, ...(sheet.rows ?? [])];
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-
-    // Apply column widths
-    if (sheet.columns) {
-      ws["!cols"] = sheet.columns.map((c) => ({ wch: c.width ?? 15 }));
-    }
-
-    XLSX.utils.book_append_sheet(workbook, ws, sheet.name || "Sheet1");
-  }
-
-  // Add Sources sheet if sourceNotes are present
-  if (wb.sourceNotes && wb.sourceNotes.length > 0) {
-    const sourcesAoa = [["Source"], ...wb.sourceNotes.map((n) => [n])];
-    const sourcesWs = XLSX.utils.aoa_to_sheet(sourcesAoa);
-    sourcesWs["!cols"] = [{ wch: 80 }];
-    XLSX.utils.book_append_sheet(workbook, sourcesWs, "Sources");
-  }
-
-  XLSX.writeFile(workbook, outputPath);
-}
-
-// ---- PPTX Renderer ----
-
-async function renderPptx(
-  payload: Record<string, unknown>,
-  outputPath: string
-): Promise<void> {
-  const pptxModule = await import("pptxgenjs");
-  const PptxGenJS = pptxModule.default ?? pptxModule;
-  const pres = new (PptxGenJS as unknown as new () => import("pptxgenjs").default)();
-
-  const data = payload as {
-    theme?: { primaryColor?: string; fontFamily?: string };
-    citations?: CitationRef[];
-    slides?: Array<Record<string, unknown>>;
-  };
-
-  const primaryColor = data.theme?.primaryColor?.replace("#", "") ?? "2962FF";
-  const fontFamily = data.theme?.fontFamily ?? "Arial";
-
-  pres.layout = "LAYOUT_WIDE";
-
-  for (const slide of data.slides ?? []) {
-    const layout = slide.layout as string;
-    const s = pres.addSlide();
-
-    switch (layout) {
-      case "title": {
-        s.addText(String(slide.title ?? ""), {
-          x: 0.5,
-          y: 1.5,
-          w: "90%",
-          h: 1.5,
-          fontSize: 36,
-          fontFace: fontFamily,
-          color: primaryColor,
-          bold: true,
-          align: "center",
-        });
-        if (slide.subtitle) {
-          s.addText(String(slide.subtitle), {
-            x: 0.5,
-            y: 3.2,
-            w: "90%",
-            h: 0.8,
-            fontSize: 18,
-            fontFace: fontFamily,
-            color: "666666",
-            align: "center",
-          });
-        }
-        break;
-      }
-
-      case "content": {
-        s.addText(String(slide.title ?? ""), {
-          x: 0.5,
-          y: 0.3,
-          w: "90%",
-          h: 0.8,
-          fontSize: 24,
-          fontFace: fontFamily,
-          color: primaryColor,
-          bold: true,
-        });
-        const bullets = (slide.bullets as string[]) ?? [];
-        s.addText(
-          bullets.map((b) => ({
-            text: b,
-            options: { bullet: true, fontSize: 16, fontFace: fontFamily, color: "333333" },
-          })),
-          { x: 0.7, y: 1.3, w: "85%", h: 4.5, valign: "top" }
-        );
-        break;
-      }
-
-      case "two_column": {
-        s.addText(String(slide.title ?? ""), {
-          x: 0.5,
-          y: 0.3,
-          w: "90%",
-          h: 0.8,
-          fontSize: 24,
-          fontFace: fontFamily,
-          color: primaryColor,
-          bold: true,
-        });
-        const left = (slide.left as string[]) ?? [];
-        const right = (slide.right as string[]) ?? [];
-        s.addText(
-          left.map((b) => ({
-            text: b,
-            options: { bullet: true, fontSize: 14, fontFace: fontFamily, color: "333333" },
-          })),
-          { x: 0.5, y: 1.3, w: "45%", h: 4.5, valign: "top" }
-        );
-        s.addText(
-          right.map((b) => ({
-            text: b,
-            options: { bullet: true, fontSize: 14, fontFace: fontFamily, color: "333333" },
-          })),
-          { x: 5.5, y: 1.3, w: "45%", h: 4.5, valign: "top" }
-        );
-        break;
-      }
-
-      case "table": {
-        s.addText(String(slide.title ?? ""), {
-          x: 0.5,
-          y: 0.3,
-          w: "90%",
-          h: 0.8,
-          fontSize: 24,
-          fontFace: fontFamily,
-          color: primaryColor,
-          bold: true,
-        });
-        const headers = (slide.headers as string[]) ?? [];
-        const rows = (slide.rows as string[][]) ?? [];
-        const tableRows = [
-          headers.map((h) => ({
-            text: h,
-            options: { bold: true, fontSize: 14, fontFace: fontFamily, fill: { color: "E0E0E0" } },
-          })),
-          ...rows.map((row) =>
-            headers.map((_, ci) => ({
-              text: String(row[ci] ?? ""),
-              options: { fontSize: 12, fontFace: fontFamily },
-            }))
-          ),
-        ];
-        s.addTable(tableRows as Parameters<typeof s.addTable>[0], {
-          x: 0.5,
-          y: 1.3,
-          w: 9,
-          border: { pt: 0.5, color: "CCCCCC" },
-        });
-        break;
-      }
-
-      case "section": {
-        s.addText(String(slide.title ?? ""), {
-          x: 0.5,
-          y: 2,
-          w: "90%",
-          h: 1.5,
-          fontSize: 32,
-          fontFace: fontFamily,
-          color: primaryColor,
-          bold: true,
-          align: "center",
-        });
-        break;
-      }
-
-      case "sources": {
-        const entries = (slide.entries as string[]) ?? [];
-        s.addText("References", {
-          x: 0.5,
-          y: 0.3,
-          w: "90%",
-          h: 0.8,
-          fontSize: 24,
-          fontFace: fontFamily,
-          color: primaryColor,
-          bold: true,
-        });
-        s.addText(
-          entries.map((e) => ({
-            text: e,
-            options: { fontSize: 11, fontFace: fontFamily, color: "555555", bullet: true },
-          })),
-          { x: 0.7, y: 1.3, w: "85%", h: 4.5, valign: "top" }
-        );
-        break;
-      }
-    }
-  }
-
-  // Auto-generated references slide from citations
-  const citations = data.citations ?? [];
-  if (citations.length > 0) {
-    const refSlide = pres.addSlide();
-    refSlide.addText("References", {
-      x: 0.5,
-      y: 0.3,
-      w: "90%",
-      h: 0.8,
-      fontSize: 24,
-      fontFace: fontFamily,
-      color: primaryColor,
-      bold: true,
-    });
-    refSlide.addText(
-      formatCitations(citations).map((line) => ({
-        text: line,
-        options: { fontSize: 10, fontFace: fontFamily, color: "555555", bullet: true },
-      })),
-      { x: 0.7, y: 1.3, w: "85%", h: 4.5, valign: "top" }
-    );
-  }
-
-  await pres.writeFile({ fileName: outputPath });
-}
-
 // ---- PDF Renderer ----
-
-// Unicode-friendly math symbol replacement for LaTeX-like expressions
-function renderMathText(raw: string): string {
-  return raw
-    // Greek letters
-    .replace(/\\alpha/g, "\u03B1").replace(/\\beta/g, "\u03B2").replace(/\\gamma/g, "\u03B3")
-    .replace(/\\delta/g, "\u03B4").replace(/\\epsilon/g, "\u03B5").replace(/\\zeta/g, "\u03B6")
-    .replace(/\\eta/g, "\u03B7").replace(/\\theta/g, "\u03B8").replace(/\\iota/g, "\u03B9")
-    .replace(/\\kappa/g, "\u03BA").replace(/\\lambda/g, "\u03BB").replace(/\\mu/g, "\u03BC")
-    .replace(/\\nu/g, "\u03BD").replace(/\\xi/g, "\u03BE").replace(/\\pi/g, "\u03C0")
-    .replace(/\\rho/g, "\u03C1").replace(/\\sigma/g, "\u03C3").replace(/\\tau/g, "\u03C4")
-    .replace(/\\phi/g, "\u03C6").replace(/\\chi/g, "\u03C7").replace(/\\psi/g, "\u03C8")
-    .replace(/\\omega/g, "\u03C9")
-    .replace(/\\Gamma/g, "\u0393").replace(/\\Delta/g, "\u0394").replace(/\\Theta/g, "\u0398")
-    .replace(/\\Lambda/g, "\u039B").replace(/\\Pi/g, "\u03A0").replace(/\\Sigma/g, "\u03A3")
-    .replace(/\\Phi/g, "\u03A6").replace(/\\Psi/g, "\u03A8").replace(/\\Omega/g, "\u03A9")
-    // Operators and symbols
-    .replace(/\\times/g, "\u00D7").replace(/\\div/g, "\u00F7").replace(/\\cdot/g, "\u00B7")
-    .replace(/\\pm/g, "\u00B1").replace(/\\mp/g, "\u2213")
-    .replace(/\\leq/g, "\u2264").replace(/\\geq/g, "\u2265").replace(/\\neq/g, "\u2260")
-    .replace(/\\approx/g, "\u2248").replace(/\\equiv/g, "\u2261")
-    .replace(/\\infty/g, "\u221E").replace(/\\partial/g, "\u2202")
-    .replace(/\\nabla/g, "\u2207").replace(/\\sqrt/g, "\u221A")
-    .replace(/\\sum/g, "\u2211").replace(/\\prod/g, "\u220F").replace(/\\int/g, "\u222B")
-    .replace(/\\forall/g, "\u2200").replace(/\\exists/g, "\u2203")
-    .replace(/\\in/g, "\u2208").replace(/\\notin/g, "\u2209")
-    .replace(/\\subset/g, "\u2282").replace(/\\supset/g, "\u2283")
-    .replace(/\\cup/g, "\u222A").replace(/\\cap/g, "\u2229")
-    .replace(/\\emptyset/g, "\u2205")
-    .replace(/\\rightarrow/g, "\u2192").replace(/\\leftarrow/g, "\u2190")
-    .replace(/\\Rightarrow/g, "\u21D2").replace(/\\Leftarrow/g, "\u21D0")
-    .replace(/\\leftrightarrow/g, "\u2194").replace(/\\Leftrightarrow/g, "\u21D4")
-    .replace(/\\lfloor/g, "\u230A").replace(/\\rfloor/g, "\u230B")
-    .replace(/\\lceil/g, "\u2308").replace(/\\rceil/g, "\u2309")
-    .replace(/\\ldots/g, "\u2026").replace(/\\cdots/g, "\u22EF")
-    // Superscripts / subscripts (simple single-char)
-    .replace(/\^2/g, "\u00B2").replace(/\^3/g, "\u00B3").replace(/\^n/g, "\u207F")
-    .replace(/\^0/g, "\u2070").replace(/\^1/g, "\u00B9")
-    .replace(/_0/g, "\u2080").replace(/_1/g, "\u2081").replace(/_2/g, "\u2082")
-    .replace(/_i/g, "\u1D62").replace(/_n/g, "\u2099")
-    // Clean up remaining LaTeX braces
-    .replace(/[{}]/g, "")
-    .replace(/\\\\/g, "  ");
-}
 
 // Color palette for callout styles
 const CALLOUT_STYLES: Record<string, { bg: string; border: string; text: string; icon: string }> = {
@@ -572,6 +84,7 @@ async function renderPdf(
 
   const pdf = new PDFDocument({
     size: pageSize,
+    bufferPages: true,
     margins: { top: margin, bottom: margin, left: margin, right: margin },
     info: {
       Title: doc.metadata?.subject ?? "",
@@ -659,6 +172,8 @@ async function renderPdf(
 
   // Helper: draw a table with proper borders and alternating rows
   function drawTable(headers: string[], rows: string[][], x: number, width: number) {
+    const renderedHeaders = headers.map((header) => renderTextWithLatexToPlainText(header));
+    const renderedRows = rows.map((row) => row.map((cell) => renderTextWithLatexToPlainText(String(cell ?? ""))));
     const nCols = headers.length;
     const cellPad = 3;
     const fontSize = Math.max(baseFontSize - 1, 6);
@@ -675,7 +190,7 @@ async function renderPdf(
 
     pdf.fontSize(fontSize).font("Helvetica-Bold").fillColor("#FFFFFF");
     for (let ci = 0; ci < nCols; ci++) {
-      pdf.text(headers[ci] ?? "", x + ci * cellW + cellPad, tableY + cellPad, {
+      pdf.text(renderedHeaders[ci] ?? "", x + ci * cellW + cellPad, tableY + cellPad, {
         width: cellW - cellPad * 2,
         height: rowH,
         lineBreak: false,
@@ -686,7 +201,7 @@ async function renderPdf(
     // Data rows
     pdf.font("Helvetica").fillColor("#222222");
     for (let ri = 0; ri < rows.length; ri++) {
-      const row = rows[ri]!;
+      const row = renderedRows[ri]!;
       const bgColor = ri % 2 === 0 ? "#F8F9FA" : "#FFFFFF";
       pdf.save();
       pdf.rect(x, tableY, width, rowH).fillColor(bgColor).fill();
@@ -762,12 +277,13 @@ async function renderPdf(
     for (const para of section.paragraphs ?? []) {
       const pType = para.type as string;
       const content = (para.content as string) ?? "";
+      const renderedContent = renderTextWithLatexToPlainText(content);
 
       switch (pType) {
         case "text":
           ensureSpace(baseFontSize + 4);
           pdf.fontSize(baseFontSize).font("Helvetica").fillColor("#333333")
-            .text(content, col.x, pdf.y, { width: col.width, lineGap: 1.5 });
+            .text(renderedContent, col.x, pdf.y, { width: col.width, lineGap: 1.5 });
           pdf.y += 3;
           break;
 
@@ -779,7 +295,7 @@ async function renderPdf(
           pdf.circle(col.x + 4, pdf.y + baseFontSize / 2, 1.5).fillColor("#2962FF").fill();
           pdf.restore();
           pdf.fillColor("#333333");
-          pdf.text(content, col.x + 10, pdf.y, { width: col.width - 10, lineGap: 1 });
+          pdf.text(renderedContent, col.x + 10, pdf.y, { width: col.width - 10, lineGap: 1 });
           pdf.y += 1;
           break;
 
@@ -791,7 +307,7 @@ async function renderPdf(
           // Go back up to same line
           pdf.y -= baseFontSize + 2;
           pdf.fontSize(baseFontSize).font("Helvetica").fillColor("#333333")
-            .text(content, col.x + 14, pdf.y, { width: col.width - 14, lineGap: 1 });
+            .text(renderedContent, col.x + 14, pdf.y, { width: col.width - 14, lineGap: 1 });
           pdf.y += 1;
           break;
 
@@ -800,7 +316,7 @@ async function renderPdf(
           const calloutFontSize = baseFontSize - 0.5;
           // Measure text height
           const textH = pdf.fontSize(calloutFontSize).font("Helvetica")
-            .heightOfString(content, { width: col.width - 14 });
+            .heightOfString(renderedContent, { width: col.width - 14 });
           const boxH = textH + 8;
           ensureSpace(boxH + 4);
 
@@ -813,7 +329,7 @@ async function renderPdf(
           pdf.restore();
 
           pdf.fontSize(calloutFontSize).font("Helvetica-Bold").fillColor(style.text)
-            .text(content, col.x + 8, boxY + 4, { width: col.width - 14, lineGap: 1 });
+            .text(renderedContent, col.x + 8, boxY + 4, { width: col.width - 14, lineGap: 1 });
           pdf.y = boxY + boxH + 4;
           break;
         }
@@ -826,7 +342,7 @@ async function renderPdf(
           pdf.rect(col.x + 2, quoteY, 2, baseFontSize + 6).fillColor("#6B7280").fill();
           pdf.restore();
           pdf.fontSize(baseFontSize).font("Helvetica-Oblique").fillColor("#4B5563")
-            .text(`"${content}"`, col.x + 10, quoteY + 2, { width: col.width - 14, lineGap: 1 });
+            .text(`"${renderedContent}"`, col.x + 10, quoteY + 2, { width: col.width - 14, lineGap: 1 });
           pdf.y += 4;
           break;
         }
@@ -834,28 +350,93 @@ async function renderPdf(
         case "citation_note":
           ensureSpace(baseFontSize);
           pdf.fontSize(Math.max(baseFontSize - 2, 5.5)).font("Helvetica-Oblique").fillColor("#9CA3AF")
-            .text(content, col.x, pdf.y, { width: col.width, lineGap: 0.5 });
+            .text(renderedContent, col.x, pdf.y, { width: col.width, lineGap: 0.5 });
           pdf.y += 2;
           break;
 
         case "math": {
           const display = (para.display as boolean) ?? false;
-          const rendered = renderMathText(content);
-          const mathFontSize = display ? baseFontSize + 1 : baseFontSize;
-          const textH = pdf.fontSize(mathFontSize).font("Courier")
-            .heightOfString(rendered, { width: col.width - 16 });
-          const boxH = textH + 10;
-          ensureSpace(boxH + 4);
+          try {
+            const { svg, widthPt, heightPt } = await renderLatexToSvg(content, display);
+            const SVGToPDFModule = await import("svg-to-pdfkit");
+            const SVGToPDF = (SVGToPDFModule.default ?? SVGToPDFModule) as
+              (doc: unknown, svg: string, x: number, y: number, options?: Record<string, unknown>) => void;
+            const maxWidth = col.width - 20;
+            const scale = Math.min(1, maxWidth / Math.max(widthPt, 1));
+            const drawWidth = Math.max(24, widthPt * scale);
+            const drawHeight = Math.max(18, heightPt * scale);
+            const boxH = drawHeight + 14;
+            ensureSpace(boxH + 4);
 
-          const boxY = pdf.y;
-          drawRoundedBg(col.x, boxY, col.width, boxH, "#F5F3FF", "#8B5CF6");
-          pdf.fontSize(mathFontSize).font("Courier").fillColor("#5B21B6")
-            .text(rendered, col.x + 8, boxY + 5, {
-              width: col.width - 16,
-              align: display ? "center" : "left",
-              lineGap: 1.5,
+            const boxY = pdf.y;
+            drawRoundedBg(col.x, boxY, col.width, boxH, "#F8FAFC", "#C7D2FE");
+            const drawX = display
+              ? col.x + Math.max(10, (col.width - drawWidth) / 2)
+              : col.x + 10;
+            SVGToPDF(pdf, svg, drawX, boxY + 7, {
+              width: drawWidth,
+              height: drawHeight,
+              preserveAspectRatio: "xMidYMid meet",
             });
-          pdf.y = boxY + boxH + 3;
+            pdf.y = boxY + boxH + 3;
+          } catch {
+            const rendered = renderLatexToPlainText(content);
+            const mathFontSize = display ? baseFontSize + 1 : baseFontSize;
+            const textH = pdf.fontSize(mathFontSize).font("Courier")
+              .heightOfString(rendered, { width: col.width - 16 });
+            const boxH = textH + 10;
+            ensureSpace(boxH + 4);
+
+            const boxY = pdf.y;
+            drawRoundedBg(col.x, boxY, col.width, boxH, "#F5F3FF", "#8B5CF6");
+            pdf.fontSize(mathFontSize).font("Courier").fillColor("#5B21B6")
+              .text(rendered, col.x + 8, boxY + 5, {
+                width: col.width - 16,
+                align: display ? "center" : "left",
+                lineGap: 1.5,
+              });
+            pdf.y = boxY + boxH + 3;
+          }
+          break;
+        }
+
+        case "svg": {
+          try {
+            const SVGToPDFModule = await import("svg-to-pdfkit");
+            const SVGToPDF = (SVGToPDFModule.default ?? SVGToPDFModule) as
+              (doc: unknown, svg: string, x: number, y: number, options?: Record<string, unknown>) => void;
+            const svgMarkup = normalizeSvgForHtml(String(para.svg ?? ""));
+            const { widthPx, heightPx } = getSvgDimensions(svgMarkup);
+            const caption = typeof para.caption === "string" ? renderTextWithLatexToPlainText(para.caption) : "";
+            const maxWidth = col.width - 20;
+            const maxHeight = Math.min(220, pageBottom - pdf.y - 32);
+            const scaled = clampSize(pxToPt(widthPx), pxToPt(heightPx), maxWidth, Math.max(48, maxHeight));
+            const figureHeight = scaled.height + (caption ? baseFontSize + 12 : 12);
+            ensureSpace(figureHeight + 4);
+
+            const boxY = pdf.y;
+            drawRoundedBg(col.x, boxY, col.width, figureHeight, "#FFFFFF", "#DBE4FF");
+            const drawX = col.x + Math.max(10, (col.width - scaled.width) / 2);
+            SVGToPDF(pdf, svgMarkup, drawX, boxY + 6, {
+              width: scaled.width,
+              height: scaled.height,
+              preserveAspectRatio: "xMidYMid meet",
+            });
+            if (caption) {
+              pdf.fontSize(Math.max(baseFontSize - 1, 6.5)).font("Helvetica-Oblique").fillColor("#6B7280")
+                .text(caption, col.x + 12, boxY + scaled.height + 8, {
+                  width: col.width - 24,
+                  align: "center",
+                });
+            }
+            pdf.y = boxY + figureHeight + 3;
+            pdf.fillColor("#333333");
+          } catch {
+            ensureSpace(baseFontSize + 8);
+            pdf.fontSize(baseFontSize).font("Helvetica-Oblique").fillColor("#6B7280")
+              .text("[Diagram unavailable]", col.x, pdf.y, { width: col.width, align: "center" });
+            pdf.y += 4;
+          }
           break;
         }
 
@@ -886,8 +467,8 @@ async function renderPdf(
           break;
 
         case "definition": {
-          const term = (para.term as string) ?? "";
-          const def = (para.definition as string) ?? "";
+          const term = renderTextWithLatexToPlainText((para.term as string) ?? "");
+          const def = renderTextWithLatexToPlainText((para.definition as string) ?? "");
           ensureSpace(baseFontSize * 2 + 4);
           pdf.fontSize(baseFontSize).font("Helvetica-Bold").fillColor("#1E40AF")
             .text(term, col.x, pdf.y, { width: col.width, continued: false });
@@ -905,10 +486,10 @@ async function renderPdf(
             const kvW = col.width;
             const keyW = Math.min(kvW * 0.35, 120);
             pdf.fontSize(baseFontSize).font("Helvetica-Bold").fillColor("#374151")
-              .text(entry.key, kvX, pdf.y, { width: keyW, continued: false });
+              .text(renderTextWithLatexToPlainText(entry.key), kvX, pdf.y, { width: keyW, continued: false });
             pdf.y -= baseFontSize + 2;
             pdf.fontSize(baseFontSize).font("Helvetica").fillColor("#555555")
-              .text(entry.value, kvX + keyW, pdf.y, { width: kvW - keyW, lineGap: 1 });
+              .text(renderTextWithLatexToPlainText(entry.value), kvX + keyW, pdf.y, { width: kvW - keyW, lineGap: 1 });
             pdf.y += 1;
           }
           pdf.y += 2;
@@ -944,13 +525,13 @@ async function renderPdf(
     pdf.y += 2;
     for (const line of formatCitations(citations)) {
       pdf.fontSize(refFontSize).font("Helvetica").fillColor("#9CA3AF")
-        .text(line, col.x, pdf.y, { width: col.width, lineGap: 0.5 });
+        .text(renderTextWithLatexToPlainText(line), col.x, pdf.y, { width: col.width, lineGap: 0.5 });
     }
   }
 
   // Footer on each page
   const pages = pdf.bufferedPageRange();
-  for (let i = 0; i < pages.count; i++) {
+  for (let i = pages.start; i < pages.start + pages.count; i++) {
     pdf.switchToPage(i);
     pdf.fontSize(6).font("Helvetica").fillColor("#BBBBBB")
       .text(`Generated by Stuart`, margin, pdf.page.height - margin + 10, {
@@ -991,13 +572,13 @@ export async function renderDocument(
 
   switch (kind) {
     case "document_docx":
-      await renderDocx(docPayload, outputPath);
+      await renderDocxOpenXml(docPayload as Parameters<typeof renderDocxOpenXml>[0], outputPath);
       break;
     case "document_xlsx":
-      await renderXlsx(docPayload, outputPath);
+      await renderXlsxOpenXml(docPayload as Parameters<typeof renderXlsxOpenXml>[0], outputPath);
       break;
     case "document_pptx":
-      await renderPptx(docPayload, outputPath);
+      await renderPptxOpenXml(docPayload as Parameters<typeof renderPptxOpenXml>[0], outputPath);
       break;
     case "document_pdf":
       await renderPdf(docPayload, outputPath);

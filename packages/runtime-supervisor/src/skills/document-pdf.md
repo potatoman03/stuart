@@ -46,6 +46,7 @@ The document must be grounded in the workspace material, information-dense but s
           { "type": "kv", "entries": [{ "key": "Property", "value": "its value" }] },
           { "type": "table", "headers": ["Col 1", "Col 2"], "rows": [["val1", "val2"]] },
           { "type": "math", "content": "E = mc^2", "display": true },
+          { "type": "svg", "svg": "<svg viewBox=\"0 0 320 160\">...</svg>", "caption": "Simplex feasible-region sketch" },
           { "type": "code", "content": "fork() // creates child process" },
           { "type": "callout", "content": "Key exam insight!", "style": "warning" },
           { "type": "quote", "content": "A direct quote from source material." },
@@ -69,6 +70,7 @@ The document must be grounded in the workspace material, information-dense but s
 | `kv` | Key-value pairs | Two-column layout within one block. Good for properties, parameters, comparisons. |
 | `table` | Structured comparisons | Full table with header row and zebra striping. Use for side-by-side comparisons. |
 | `math` | Formulas, equations | LaTeX-like syntax auto-converted to Unicode math symbols. Set `"display": true` for centered display. Supports: Greek letters (`\alpha`, `\beta`...), operators (`\times`, `\leq`, `\infty`...), superscripts (`^2`, `^n`), subscripts (`_i`, `_0`). |
+| `svg` | Diagrams, plots, geometric figures | Provide raw `<svg>...</svg>` markup. Optional `caption`. Use when a visual or 2D layout matters more than text. |
 | `code` | Code snippets, pseudocode, syscalls | Monospace on dark background. Keep short — 1-3 lines ideal. |
 | `callout` | Key insights, exam traps, must-know rules | Colored box. Styles: `"info"` (blue), `"tip"` (green), `"warning"` (amber), `"important"` (red). |
 | `quote` | Important definitions from sources | Italic with left bar. Use sparingly. |
@@ -92,9 +94,21 @@ Use LaTeX-like syntax in `math` paragraphs. The renderer converts these to prope
 - Arrows: `\rightarrow`, `\Rightarrow`, `\leftrightarrow`
 - Superscripts: `^2`, `^3`, `^n`; Subscripts: `_0`, `_1`, `_2`, `_i`, `_n`
 
-For inline math within `text` or `bullet` paragraphs, just write the symbol directly (e.g. "O(n^2) time complexity").
+For inline math anywhere inside strings — including `text`, `bullet`, `numbered`, `definition`, `kv`, `table`, and `citation_note` — wrap the math in `$...$`.
+
+Examples:
+
+- `"Runtime is $O(n^2)$ in the worst case."`
+- `"Constraint 1: $x_1 + 2x_2 \\leq 6$"`
+- `["Variable", "$x_1$"]`
+
+Do not emit bare forms like `x1 + 2x2 <= 6` when you mean mathematical notation.
 
 For display equations, use `{ "type": "math", "content": "F = ma", "display": true }`.
+
+For diagrams, charts, trees, state graphs, coordinate plots, and other spatial visuals, use `{ "type": "svg", "svg": "<svg ...>...</svg>", "caption": "..." }`.
+
+Use `math` paragraphs for standalone equations, derivations, and formulas the student should study directly. If a section is formula-heavy, pair the equation with a compact `definition`, `kv`, or `table` block so symbols and assumptions stay explicit instead of being flattened into prose.
 
 ## Grounding rules
 
@@ -152,6 +166,7 @@ A good cheat sheet uses **at least 4 different paragraph types**. Do NOT produce
 - **Definitions section**: use `definition` type for each term
 - **Comparison section**: use `table` (e.g., Monolithic vs Microkernel)
 - **Formula section**: use `math` with `"display": true`
+- **Formula-heavy section**: lead with `math`, then use `definition` or `kv` to name variables and `table` to compare cases or rearrangements
 - **Process/algorithm**: use `numbered` for steps
 - **Key rules**: use `callout` with `"style": "important"`
 - **Exam traps**: use `callout` with `"style": "warning"`
@@ -167,7 +182,7 @@ Before returning, verify:
 - `columns` is set (2 for cheat sheets, 1 for longer documents)
 - uses at least 4 different paragraph types
 - every section has `heading`, `level`, and `paragraphs`
-- paragraph types are valid: text, bullet, numbered, table, callout, quote, citation_note, math, code, divider, definition, kv
+- paragraph types are valid: text, bullet, numbered, table, callout, quote, citation_note, math, svg, code, divider, definition, kv
 - tables have matching header/row column counts
 - math content uses LaTeX-like syntax (not raw Unicode)
 - callouts have a `style` field (info, tip, warning, important)

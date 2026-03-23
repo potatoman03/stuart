@@ -189,7 +189,15 @@ export class LocalDatabase {
         kind TEXT NOT NULL,
         title TEXT NOT NULL,
         payload TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        file_path TEXT,
+        preview_path TEXT,
+        payload_version INTEGER NOT NULL DEFAULT 1,
+        render_status TEXT,
+        preview_status TEXT,
+        render_error TEXT,
+        preview_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS card_performance (
@@ -272,9 +280,45 @@ export class LocalDatabase {
       ON topic_performance (project_id, total_attempts DESC);
     `);
 
-    // Add file_path column to study_artifacts (idempotent)
+    // Add study_artifact columns idempotently for older local DBs.
     try {
       this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN file_path TEXT`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN preview_path TEXT`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN payload_version INTEGER NOT NULL DEFAULT 1`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN render_status TEXT`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN preview_status TEXT`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN render_error TEXT`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN preview_error TEXT`);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec(`ALTER TABLE study_artifacts ADD COLUMN updated_at TEXT`);
+      this.db.exec(`UPDATE study_artifacts SET updated_at = created_at WHERE updated_at IS NULL`);
     } catch {
       // Column already exists — safe to ignore
     }
@@ -1495,7 +1539,19 @@ export class LocalDatabase {
     return [...merged.values()].slice(0, limit);
   }
 
-  createStudyArtifact(input: { taskId: string; kind: string; title: string; payload: string; filePath?: string }): StudyArtifactRecord {
+  createStudyArtifact(input: {
+    taskId: string;
+    kind: string;
+    title: string;
+    payload: string;
+    filePath?: string;
+    previewPath?: string;
+    payloadVersion?: number;
+    renderStatus?: StudyArtifactRecord["renderStatus"];
+    previewStatus?: StudyArtifactRecord["previewStatus"];
+    renderError?: string;
+    previewError?: string;
+  }): StudyArtifactRecord {
     const now = new Date().toISOString();
     const record: StudyArtifactRecord = {
       id: randomUUID(),
@@ -1504,13 +1560,50 @@ export class LocalDatabase {
       title: input.title,
       payload: input.payload,
       filePath: input.filePath ?? undefined,
-      createdAt: now
+      previewPath: input.previewPath ?? undefined,
+      payloadVersion: input.payloadVersion ?? 1,
+      renderStatus: input.renderStatus,
+      previewStatus: input.previewStatus,
+      renderError: input.renderError,
+      previewError: input.previewError,
+      createdAt: now,
+      updatedAt: now,
     };
 
     this.db
       .prepare(
-        `INSERT INTO study_artifacts (id, task_id, kind, title, payload, file_path, created_at)
-         VALUES (@id, @taskId, @kind, @title, @payload, @filePath, @createdAt)`
+        `INSERT INTO study_artifacts (
+          id,
+          task_id,
+          kind,
+          title,
+          payload,
+          file_path,
+          preview_path,
+          payload_version,
+          render_status,
+          preview_status,
+          render_error,
+          preview_error,
+          created_at,
+          updated_at
+        )
+         VALUES (
+          @id,
+          @taskId,
+          @kind,
+          @title,
+          @payload,
+          @filePath,
+          @previewPath,
+          @payloadVersion,
+          @renderStatus,
+          @previewStatus,
+          @renderError,
+          @previewError,
+          @createdAt,
+          @updatedAt
+        )`
       )
       .run(
         asSqlParams({
@@ -1520,7 +1613,14 @@ export class LocalDatabase {
           title: record.title,
           payload: record.payload,
           filePath: record.filePath ?? null,
-          createdAt: record.createdAt
+          previewPath: record.previewPath ?? null,
+          payloadVersion: record.payloadVersion ?? 1,
+          renderStatus: record.renderStatus ?? null,
+          previewStatus: record.previewStatus ?? null,
+          renderError: record.renderError ?? null,
+          previewError: record.previewError ?? null,
+          createdAt: record.createdAt,
+          updatedAt: record.updatedAt ?? record.createdAt,
         })
       );
 
@@ -1538,7 +1638,15 @@ export class LocalDatabase {
             title,
             payload,
             file_path as filePath,
+            preview_path as previewPath,
+            payload_version as payloadVersion,
+            render_status as renderStatus,
+            preview_status as previewStatus,
+            render_error as renderError,
+            preview_error as previewError,
             created_at as createdAt
+            ,
+            updated_at as updatedAt
            FROM study_artifacts
            WHERE task_id = ?
            ORDER BY created_at DESC`
@@ -1557,7 +1665,15 @@ export class LocalDatabase {
           title,
           payload,
           file_path as filePath,
+          preview_path as previewPath,
+          payload_version as payloadVersion,
+          render_status as renderStatus,
+          preview_status as previewStatus,
+          render_error as renderError,
+          preview_error as previewError,
           created_at as createdAt
+          ,
+          updated_at as updatedAt
          FROM study_artifacts
          WHERE id = ?`
       )
@@ -1567,19 +1683,81 @@ export class LocalDatabase {
   updateStudyArtifact(id: string, payload: string): StudyArtifactRecord | undefined {
     this.db
       .prepare(
-        `UPDATE study_artifacts SET payload = ? WHERE id = ?`
+        `UPDATE study_artifacts SET payload = ?, updated_at = ? WHERE id = ?`
       )
-      .run(payload, id);
+      .run(payload, new Date().toISOString(), id);
     return this.getStudyArtifact(id);
   }
 
   updateStudyArtifactFilePath(id: string, filePath: string): void {
     this.db
-      .prepare(`UPDATE study_artifacts SET file_path = ? WHERE id = ?`)
-      .run(filePath, id);
+      .prepare(`UPDATE study_artifacts SET file_path = ?, updated_at = ? WHERE id = ?`)
+      .run(filePath, new Date().toISOString(), id);
   }
 
-  deleteStudyArtifact(id: string): { deleted: boolean; filePath?: string } {
+  updateStudyArtifactLifecycle(
+    id: string,
+    updates: {
+      payload?: string;
+      filePath?: string | null;
+      previewPath?: string | null;
+      payloadVersion?: number;
+      renderStatus?: StudyArtifactRecord["renderStatus"];
+      previewStatus?: StudyArtifactRecord["previewStatus"];
+      renderError?: string | null;
+      previewError?: string | null;
+    }
+  ): StudyArtifactRecord | undefined {
+    const current = this.getStudyArtifact(id);
+    if (!current) {
+      return undefined;
+    }
+
+    const next: StudyArtifactRecord = {
+      ...current,
+      payload: updates.payload ?? current.payload,
+      filePath: updates.filePath === undefined ? current.filePath : updates.filePath ?? undefined,
+      previewPath: updates.previewPath === undefined ? current.previewPath : updates.previewPath ?? undefined,
+      payloadVersion: updates.payloadVersion ?? current.payloadVersion ?? 1,
+      renderStatus: updates.renderStatus ?? current.renderStatus,
+      previewStatus: updates.previewStatus ?? current.previewStatus,
+      renderError: updates.renderError === undefined ? current.renderError : updates.renderError ?? undefined,
+      previewError: updates.previewError === undefined ? current.previewError : updates.previewError ?? undefined,
+      updatedAt: new Date().toISOString(),
+    };
+
+    this.db
+      .prepare(
+        `UPDATE study_artifacts
+         SET payload = @payload,
+             file_path = @filePath,
+             preview_path = @previewPath,
+             payload_version = @payloadVersion,
+             render_status = @renderStatus,
+             preview_status = @previewStatus,
+             render_error = @renderError,
+             preview_error = @previewError,
+             updated_at = @updatedAt
+         WHERE id = @id`
+      )
+      .run(
+        asSqlParams({
+          id: next.id,
+          payload: next.payload,
+          filePath: next.filePath ?? null,
+          previewPath: next.previewPath ?? null,
+          payloadVersion: next.payloadVersion ?? 1,
+          renderStatus: next.renderStatus ?? null,
+          previewStatus: next.previewStatus ?? null,
+          renderError: next.renderError ?? null,
+          previewError: next.previewError ?? null,
+          updatedAt: next.updatedAt ?? new Date().toISOString(),
+        })
+      );
+    return this.getStudyArtifact(id);
+  }
+
+  deleteStudyArtifact(id: string): { deleted: boolean; filePath?: string; previewPath?: string } {
     const artifact = this.getStudyArtifact(id);
     if (!artifact) return { deleted: false };
 
@@ -1596,7 +1774,11 @@ export class LocalDatabase {
       throw error;
     }
 
-    return { deleted: true, filePath: artifact.filePath ?? undefined };
+    return {
+      deleted: true,
+      filePath: artifact.filePath ?? undefined,
+      previewPath: artifact.previewPath ?? undefined,
+    };
   }
 
   upsertCardPerformance(input: {
@@ -2207,33 +2389,55 @@ export class LocalDatabase {
   }
 
   getStudyTimeline(projectId: string, days = 30): StudyTimelineEntry[] {
-    const sessions = this.listStudySessions(projectId, 1000);
-    const now = new Date();
-    const entries: StudyTimelineEntry[] = [];
+    // Read from card_performance and quiz_performance directly
+    // (study_session counters have a known increment bug)
+    const tasks = this.listTasks().filter((t) => t.projectId === projectId);
+    const dayData: Record<string, { reviews: number; correct: number; sessions: number }> = {};
 
-    for (let i = days - 1; i >= 0; i--) {
-      const date = new Date(now);
-      date.setDate(date.getDate() - i);
-      const dateStr = date.toISOString().slice(0, 10);
-
-      const daySessions = sessions.filter(
-        (s) => s.startedAt.slice(0, 10) === dateStr
-      );
-
-      const reviews = daySessions.reduce(
-        (sum, s) => sum + s.cardsReviewed + s.questionsAnswered,
-        0
-      );
-      const correct = daySessions.reduce((sum, s) => sum + s.correctCount, 0);
-
-      entries.push({
-        date: dateStr,
-        sessions: daySessions.length,
-        reviews,
-        accuracy: reviews > 0 ? correct / reviews : 0,
-      });
+    for (const task of tasks) {
+      const artifacts = this.listStudyArtifacts(task.id);
+      for (const artifact of artifacts) {
+        if (artifact.kind === "flashcards") {
+          for (const card of this.listCardPerformance(artifact.id)) {
+            if (!card.nextReviewDate || card.totalReviews === 0) continue;
+            const date = card.nextReviewDate.slice(0, 10);
+            if (!dayData[date]) dayData[date] = { reviews: 0, correct: 0, sessions: 0 };
+            dayData[date]!.reviews++;
+            if (card.correctCount > 0) dayData[date]!.correct++;
+          }
+        }
+        if (artifact.kind === "quiz") {
+          for (const q of this.listQuizPerformance(artifact.id)) {
+            const date = q.attemptedAt?.slice(0, 10);
+            if (!date) continue;
+            if (!dayData[date]) dayData[date] = { reviews: 0, correct: 0, sessions: 0 };
+            dayData[date]!.reviews++;
+            if (q.isCorrect) dayData[date]!.correct++;
+          }
+        }
+      }
     }
 
+    for (const s of this.listStudySessions(projectId, 1000)) {
+      const date = s.startedAt.slice(0, 10);
+      if (!dayData[date]) dayData[date] = { reviews: 0, correct: 0, sessions: 0 };
+      dayData[date]!.sessions++;
+    }
+
+    const now = new Date();
+    const entries: StudyTimelineEntry[] = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      const day = dayData[dateStr] ?? { reviews: 0, correct: 0, sessions: 0 };
+      entries.push({
+        date: dateStr,
+        sessions: day.sessions,
+        reviews: day.reviews,
+        accuracy: day.reviews > 0 ? day.correct / day.reviews : 0,
+      });
+    }
     return entries;
   }
 

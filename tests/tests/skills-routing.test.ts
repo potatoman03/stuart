@@ -7,9 +7,14 @@ describe("skill routing", () => {
     expect(matchSkill("Summarize the lecture slides for me.", true)).toBeNull();
   });
 
-  it("selects scripted document generation when sandbox execution is available", () => {
-    expect(matchSkill("Create a cheat sheet PDF for chapter 3.", true)?.id).toBe("document-pdf-scripted");
-    expect(matchSkill("Build a PowerPoint slide deck on virtual memory.", true)?.id).toBe("document-pptx-scripted");
+  it("keeps PDF on the deterministic path by default", () => {
+    expect(matchSkill("Create a cheat sheet PDF for chapter 3.", true)?.id).toBe("document-pdf");
+  });
+
+  it("keeps Office documents on the OpenXML JSON path even when sandbox execution is available", () => {
+    expect(matchSkill("Build a PowerPoint slide deck on virtual memory.", true)?.id).toBe("document-pptx");
+    expect(matchSkill("Create an Excel comparison table for cache policies.", true)?.id).toBe("document-xlsx");
+    expect(matchSkill("Build a Word study guide on virtual memory.", true)?.id).toBe("document-docx");
   });
 
   it("falls back to JSON document skills when sandbox execution is unavailable", () => {

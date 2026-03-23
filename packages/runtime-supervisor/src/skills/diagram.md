@@ -12,6 +12,7 @@ The diagram should clarify a process, relationship, structure, or sequence that 
 - Choose a diagram form that matches the concept.
 - Keep the diagram readable. Do not overload it.
 - Do not invent steps, nodes, or relationships that are not supported by the workspace evidence.
+- Treat the Mermaid output as an SVG-first artifact: keep labels short enough to stay legible when rendered, and move longer explanations into `notes`.
 
 ## Required output schema
 
@@ -103,6 +104,7 @@ Do not pick a fancy type just because it looks impressive. Pick the one that bes
 - Use edge labels when the relationship matters.
 - Keep the layout directional and easy to follow.
 - If the topic is too broad, diagram the central mechanism or pathway rather than forcing everything into one image.
+- If a node or edge depends on a mathematical relationship, encode the symbol or condition compactly instead of writing a paragraph inside the node.
 
 ## Mermaid writing rules
 

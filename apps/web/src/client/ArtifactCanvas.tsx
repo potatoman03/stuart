@@ -13,51 +13,29 @@ import type {
 } from "@stuart/shared";
 import { apiUrl } from "./platform";
 import { StudyDocCanvas } from "./study-doc";
-import katex from "katex";
+import {
+  renderLatexMarkup,
+  renderMermaidSvg,
+  splitTextWithMath,
+} from "./study-doc/rendering";
 
 /** Render text with inline ($...$) and display ($$...$$) LaTeX rendered via KaTeX. */
 function LatexText({ text }: { text: string }) {
-  // First strip HTML, then render LaTeX
-  const cleaned = stripHtml(text);
-  const parts: Array<{ type: "text" | "math"; content: string; display: boolean }> = [];
-  let remaining = cleaned;
+  const parts = splitTextWithMath(text);
 
-  // Match $$...$$ (display) and $...$ (inline) — process display first
-  const regex = /\$\$([\s\S]+?)\$\$|\$([^$\n]+?)\$/g;
-  let lastIndex = 0;
-  let match;
-
-  while ((match = regex.exec(remaining)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push({ type: "text", content: remaining.slice(lastIndex, match.index), display: false });
-    }
-    const isDisplay = match[1] !== undefined;
-    const latex = (match[1] ?? match[2] ?? "").trim();
-    parts.push({ type: "math", content: latex, display: isDisplay });
-    lastIndex = match.index + match[0].length;
-  }
-
-  if (lastIndex < remaining.length) {
-    parts.push({ type: "text", content: remaining.slice(lastIndex), display: false });
-  }
-
-  if (parts.length === 0) return <>{cleaned}</>;
+  if (parts.length === 0) return <>{text}</>;
 
   return (
     <>
       {parts.map((part, i) => {
         if (part.type === "text") return <span key={i}>{part.content}</span>;
-        try {
-          const html = katex.renderToString(part.content, {
-            displayMode: part.display,
-            throwOnError: false,
-          });
-          return part.display
-            ? <div key={i} className="katex-display-inline" dangerouslySetInnerHTML={{ __html: html }} />
-            : <span key={i} dangerouslySetInnerHTML={{ __html: html }} />;
-        } catch {
+        const { html } = renderLatexMarkup(part.content, part.display);
+        if (!html) {
           return <code key={i}>{part.content}</code>;
         }
+        return part.display
+          ? <span key={i} className="katex-display-inline" dangerouslySetInnerHTML={{ __html: html }} />
+          : <span key={i} dangerouslySetInnerHTML={{ __html: html }} />;
       })}
     </>
   );
@@ -73,55 +51,6 @@ function cleanSourceName(rawPath: string): string {
   name = parts[parts.length - 1] || name;
   name = name.replace(/\.(pdf|docx|pptx|xlsx|txt|md|html|csv|json|epub)$/i, "");
   return name;
-}
-
-/** Strip HTML tags, Anki cloze notation, and field labels from text.
- *  Converts block-level HTML into line breaks so multi-point answers stay readable. */
-function stripHtml(text: string): string {
-  return text
-    // Convert block-level tags to newlines BEFORE stripping
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(?:p|div|li|tr|h[1-6])>/gi, "\n")
-    .replace(/<(?:p|div|li|tr|h[1-6])\b[^>]*>/gi, "")
-    // Convert bullet-style HTML list markers
-    .replace(/<ul[^>]*>/gi, "")
-    .replace(/<\/ul>/gi, "\n")
-    .replace(/<ol[^>]*>/gi, "")
-    .replace(/<\/ol>/gi, "\n")
-    // Strip remaining HTML tags
-    .replace(/<[^>]+>/g, "")
-    // Decode common HTML entities
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&mdash;/g, "—")
-    .replace(/&ndash;/g, "–")
-    .replace(/&#8211;/g, "–")
-    .replace(/&#8212;/g, "—")
-    // {{c1::answer::hint}} → answer
-    .replace(/\{\{c\d+::(.*?)(?:::[^}]*)?\}\}/gi, "$1")
-    // {{text}} → text
-    .replace(/\{\{([^}]*)\}\}/g, "$1")
-    // Remove "Tags: word::word::word" lines entirely
-    .replace(/\bTags:\s*[\w:]+(?:::[\w:]+)*/gi, "")
-    // Remove Anki field prefixes like "Extra:", "Notes:", "Hint:"
-    .replace(/^(Extra|Notes|Hint|Tags|Source|Ref):\s*/gim, "")
-    // Clean remaining :: tag separators (e.g., "anaesthesia::chapter6") → remove
-    .replace(/\b\w+(?:::\w+){2,}\b/g, "")
-    // Clean double colons between words
-    .replace(/(\w)::([\w])/g, "$1, $2")
-    // Insert line breaks before common list patterns (e.g., "point1.Point2" → "point1.\nPoint2")
-    .replace(/\.([A-Z])/g, ".\n$1")
-    // Insert line break before em-dash-separated items that run together
-    .replace(/([a-z])—\s*([A-Z])/g, "$1\n—$2")
-    // Collapse multiple blank lines into one, but preserve single newlines
-    .replace(/\n{3,}/g, "\n\n")
-    // Collapse spaces within lines (but NOT newlines)
-    .replace(/[^\S\n]+/g, " ")
-    // Trim each line
-    .split("\n").map(l => l.trim()).filter((l, i, arr) => l || (i > 0 && arr[i - 1] !== "")).join("\n")
-    .trim();
 }
 
 /* ---- Helpers ---- */
@@ -169,8 +98,8 @@ type SM2Rating = "again" | "hard" | "good" | "easy";
 function sm2RatingToQuality(rating: SM2Rating): number {
   switch (rating) {
     case "again": return 0;
-    case "hard": return 2;
-    case "good": return 3;
+    case "hard": return 3;
+    case "good": return 4;
     case "easy": return 5;
   }
 }
@@ -276,13 +205,16 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
 
   // Generate a stable ID for localStorage persistence
   const artifactId = useMemo(() => {
+    if (artifactDbId) {
+      return `stuart-artifact-${artifactDbId}`;
+    }
     let hash = 0;
-    const str = title + kind;
+    const str = `${title}\u0000${kind}\u0000${payload}`;
     for (let i = 0; i < str.length; i++) {
       hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
     }
     return `stuart-artifact-${kind}-${Math.abs(hash).toString(36)}`;
-  }, [title, kind]);
+  }, [artifactDbId, title, kind, payload]);
 
   return (
     <div className="artifact-canvas-overlay">
@@ -1287,6 +1219,7 @@ function FlashcardsCanvas({
   function rateCard(rating: CardRating) {
     const quality = sm2RatingToQuality(rating);
     const prev = cardStates[activeCard.id];
+    const countsAsSuccessfulRecall = rating === "hard" || rating === "good" || rating === "easy";
     const sm2 = computeSM2(
       quality,
       prev?.easeFactor ?? 2.5,
@@ -1302,7 +1235,7 @@ function FlashcardsCanvas({
         easeFactor: sm2.easeFactor,
         intervalDays: sm2.interval,
         repetitions: sm2.repetitions,
-        correctCount: (prev?.correctCount ?? 0) + (rating === "good" || rating === "easy" ? 1 : 0),
+        correctCount: (prev?.correctCount ?? 0) + (countsAsSuccessfulRecall ? 1 : 0),
       },
     };
     setCardStates(newStates);
@@ -1310,7 +1243,7 @@ function FlashcardsCanvas({
 
     // Track session stats
     setSessionReviewed(c => c + 1);
-    if (rating === "good" || rating === "easy") setSessionCorrect(c => c + 1);
+    if (countsAsSuccessfulRecall) setSessionCorrect(c => c + 1);
 
     // Persist to API
     if (artifactDbId) {
@@ -1324,7 +1257,7 @@ function FlashcardsCanvas({
           nextReviewDate: sm2.nextReviewDate,
           lastRating: rating,
           totalReviews: (prev?.reviewCount ?? 0) + 1,
-          correctCount: (prev?.correctCount ?? 0) + (rating === "good" || rating === "easy" ? 1 : 0),
+          correctCount: (prev?.correctCount ?? 0) + (countsAsSuccessfulRecall ? 1 : 0),
         }),
       }).catch(() => {});
     }
@@ -1539,6 +1472,20 @@ function QuizCanvas({
   const totalAnswered = Object.keys(results).length;
   const correctCount = Object.values(results).filter(Boolean).length;
   const incorrectCount = totalAnswered - correctCount;
+  const finalPct = questions.length > 0
+    ? Math.round((correctCount / questions.length) * 100)
+    : 0;
+
+  useEffect(() => {
+    if (!showEnd) {
+      return;
+    }
+    const nextBest = bestScore >= 0 ? Math.max(bestScore, finalPct) : finalPct;
+    if (nextBest !== bestScore) {
+      setBestScore(nextBest);
+      saveToStorage(bestScoreKey, nextBest);
+    }
+  }, [bestScore, bestScoreKey, finalPct, showEnd]);
 
   if (questions.length === 0) {
     return (
@@ -1551,13 +1498,7 @@ function QuizCanvas({
 
   // End screen
   if (showEnd) {
-    const pct = Math.round((correctCount / questions.length) * 100);
-    const isNewBest = bestScore >= 0 ? pct > bestScore : true;
-    if (isNewBest || bestScore < 0) {
-      setBestScore(pct);
-      saveToStorage(bestScoreKey, pct);
-    }
-
+    const pct = finalPct;
     const missedQuestions = questions.filter((q) => results[q.id] === false);
 
     return (
@@ -1875,57 +1816,28 @@ function QuizCanvas({
 
 function DiagramCanvas({ scene }: { scene: DiagramScene }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [renderError, setRenderError] = useState(false);
+  const [renderError, setRenderError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!containerRef.current || !scene.mermaid) return;
 
     const el = containerRef.current;
     el.innerHTML = "";
-    setRenderError(false);
+    setRenderError(null);
     let cancelled = false;
 
     async function renderDiagram() {
-      try {
-        const { default: mermaid } = await import("mermaid");
-        if (cancelled) {
-          return;
-        }
-
-        // Use a unique ID each time to avoid collisions on re-renders
-        const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-        mermaid.initialize({
-          startOnLoad: false,
-          theme: "neutral",
-          fontFamily: "Inter, system-ui, sans-serif",
-          securityLevel: "loose",
-        });
-
-        // Clean the mermaid source — trim whitespace, ensure no leading/trailing issues
-        const cleanedSource = scene.mermaid.trim();
-        const { svg } = await mermaid.render(id, cleanedSource);
-        if (cancelled) {
-          return;
-        }
-
-        el.innerHTML = svg;
-        // Make the SVG responsive
-        const svgEl = el.querySelector("svg");
-        if (svgEl) {
-          svgEl.removeAttribute("height");
-          svgEl.style.maxWidth = "100%";
-          svgEl.style.height = "auto";
-        }
-      } catch (err) {
-        console.error("Mermaid render error:", err);
-        if (cancelled) {
-          return;
-        }
-        setRenderError(true);
-        // Clear the container so the fallback shows cleanly
-        el.innerHTML = "";
+      const { svg, error } = await renderMermaidSvg(scene.mermaid);
+      if (cancelled) {
+        return;
       }
+      if (error || !svg) {
+        console.error("Mermaid render error:", error);
+        setRenderError(error ?? "Diagram error");
+        el.innerHTML = "";
+        return;
+      }
+      el.innerHTML = svg;
     }
 
     void renderDiagram();
@@ -1944,6 +1856,7 @@ function DiagramCanvas({ scene }: { scene: DiagramScene }) {
       {renderError && (
         <div className="diagram-fallback">
           <div className="diagram-fallback-label">Diagram source (could not render)</div>
+          <div className="diagram-fallback-error">{renderError}</div>
           <pre className="diagram-fallback-code">
             <code>{scene.mermaid}</code>
           </pre>
@@ -2042,32 +1955,23 @@ function MockExamCanvas({
   const [scores, setScores] = useState<Record<string, number>>({});
   const startTimeRef = useRef<number>(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const answersRef = useRef<Record<string, string>>({});
 
   const totalMarks = sections.reduce((sum, s) => sum + s.totalMarks, 0);
 
-  // Timer
   useEffect(() => {
-    if (!started || submitted) return;
-    startTimeRef.current = Date.now();
-    timerRef.current = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
-      const remaining = Math.max(0, timeLimitMinutes * 60 - elapsed);
-      setTimeRemaining(remaining);
-      if (remaining <= 0) {
-        handleSubmit();
-      }
-    }, 1000);
-    return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [started, submitted]);
+    answersRef.current = answers;
+  }, [answers]);
 
-  function handleSubmit() {
+  const handleSubmit = useCallback(() => {
     if (timerRef.current) clearInterval(timerRef.current);
+    const currentAnswers = answersRef.current;
     // Auto-mark MCQs
     const autoScores: Record<string, number> = {};
     for (const section of sections) {
       for (const q of section.questions) {
         if (q.questionType === "mcq") {
-          autoScores[q.id] = answers[q.id] === q.correctAnswer ? q.marks : 0;
+          autoScores[q.id] = currentAnswers[q.id] === q.correctAnswer ? q.marks : 0;
         }
       }
     }
@@ -2082,7 +1986,7 @@ function MockExamCanvas({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          answers: JSON.stringify(answers),
+          answers: JSON.stringify(currentAnswers),
           totalMarks,
         }),
       })
@@ -2103,15 +2007,30 @@ function MockExamCanvas({
 
     // Request AI marking for non-MCQ questions
     if (onInlineAsk) {
-      const nonMcq = sections.flatMap(s => s.questions.filter(q => q.questionType !== "mcq" && answers[q.id]));
+      const nonMcq = sections.flatMap(s => s.questions.filter(q => q.questionType !== "mcq" && currentAnswers[q.id]));
       if (nonMcq.length > 0) {
         const markingPrompt = nonMcq.map(q =>
-          `Question (${q.marks} marks): ${q.prompt}\nStudent answer: ${answers[q.id]}\nModel answer: ${q.correctAnswer}${q.markingCriteria ? `\nMarking criteria: ${q.markingCriteria}` : ""}`
+          `Question (${q.marks} marks): ${q.prompt}\nStudent answer: ${currentAnswers[q.id]}\nModel answer: ${q.correctAnswer}${q.markingCriteria ? `\nMarking criteria: ${q.markingCriteria}` : ""}`
         ).join("\n\n");
         onInlineAsk(`Please mark these exam answers and provide a score out of the allocated marks for each:\n\n${markingPrompt}`);
       }
     }
-  }
+  }, [artifactDbId, onInlineAsk, sections, totalMarks]);
+
+  // Timer
+  useEffect(() => {
+    if (!started || submitted) return;
+    startTimeRef.current = Date.now();
+    timerRef.current = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTimeRef.current) / 1000);
+      const remaining = Math.max(0, timeLimitMinutes * 60 - elapsed);
+      setTimeRemaining(remaining);
+      if (remaining <= 0) {
+        handleSubmit();
+      }
+    }, 1000);
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, [handleSubmit, started, submitted, timeLimitMinutes]);
 
   // Pre-exam screen
   if (!started) {
@@ -2376,6 +2295,7 @@ function InteractiveCanvas({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const hasInlineHtml = html.trim().length > 0;
+  const responsivePreviewStyles = `<style>body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;color:#111;background:#f7f7f5;}img,svg,video,canvas{max-width:100%;height:auto;}svg{display:block;}</style>`;
 
   // Write HTML to iframe using srcdoc for full sandboxing
   const sanitizedHtml = useMemo(() => {
@@ -2384,10 +2304,16 @@ function InteractiveCanvas({
     }
     // Ensure it's a complete document
     if (!html.includes("<!DOCTYPE") && !html.includes("<html")) {
-      return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;color:#111;background:#f7f7f5;}</style></head><body>${html}</body></html>`;
+      return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${responsivePreviewStyles}</head><body>${html}</body></html>`;
     }
-    return html;
-  }, [hasInlineHtml, html]);
+    if (html.includes("</head>")) {
+      return html.replace("</head>", `${responsivePreviewStyles}</head>`);
+    }
+    if (html.includes("<head>")) {
+      return html.replace("<head>", `<head>${responsivePreviewStyles}`);
+    }
+    return `${responsivePreviewStyles}${html}`;
+  }, [hasInlineHtml, html, responsivePreviewStyles]);
 
   return (
     <div className={`interactive-canvas${isFullscreen ? " fullscreen" : ""}`}>

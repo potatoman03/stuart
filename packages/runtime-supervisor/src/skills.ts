@@ -7,18 +7,18 @@
  * dedicated, high-quality instructions.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-function loadSkillFile(filename: string): string {
+function loadSkillAsset(relativePath: string): string {
   // In dev, skills are in src/skills/; in dist, they're copied alongside
   // Try multiple paths to be resilient
   const candidates = [
-    join(__dirname, "skills", filename),
-    join(__dirname, "..", "src", "skills", filename),
+    join(__dirname, "skills", relativePath),
+    join(__dirname, "..", "src", "skills", relativePath),
   ];
   for (const path of candidates) {
     try {
@@ -27,6 +27,7 @@ function loadSkillFile(filename: string): string {
       continue;
     }
   }
+  process.stderr.write(`[stuart] failed to load skill asset: ${relativePath}\n`);
   return "";
 }
 
@@ -34,14 +35,154 @@ export interface Skill {
   id: string;
   /** Match the skill against the user's message. */
   match: (message: string) => boolean;
-  /** The full skill prompt injected as context before the user message */
-  prompt: string;
+  /** A static prompt for flat-file skills. */
+  prompt?: string;
+  /** A bundle-aware prompt builder for migrated skills. */
+  buildPrompt?: (message: string) => string;
+  /** Relative skill bundle directory under src/skills. */
+  bundleDir?: string;
   /** Whether this skill requires the Docker sandbox to execute */
   requiresSandbox?: boolean;
   /** Whether this skill writes new files that need re-indexing after the turn */
   triggersReindex?: boolean;
   /** Higher wins when multiple skills match. */
   priority: number;
+}
+
+type SkillBundleReference = {
+  filename: string;
+  includeByDefault?: boolean;
+  when?: (message: string) => boolean;
+};
+
+type SkillBundleDefinition = {
+  dir: string;
+  references?: SkillBundleReference[];
+};
+
+const BUNDLED_SKILLS: Record<string, SkillBundleDefinition> = {
+  research: {
+    dir: "research",
+    references: [
+      { filename: "references/provenance.md", includeByDefault: true },
+      {
+        filename: "references/source-dossiers.md",
+        includeByDefault: true,
+      },
+      {
+        filename: "references/repo-analysis.md",
+        when: (message) => /\bgithub|repo|repository|readme|codebase\b/i.test(message),
+      },
+    ],
+  },
+  interactive: {
+    dir: "interactive",
+    references: [
+      { filename: "references/grounding.md", includeByDefault: true },
+      { filename: "references/visual-quality.md", includeByDefault: true },
+    ],
+  },
+  "study-doc": {
+    dir: "study-doc",
+    references: [
+      { filename: "references/citations.md", includeByDefault: true },
+      { filename: "references/blocks.md", includeByDefault: true },
+    ],
+  },
+  "document-docx": {
+    dir: "document-docx",
+    references: [
+      { filename: "references/layout.md", includeByDefault: true },
+      { filename: "references/ooxml.md", includeByDefault: true },
+    ],
+  },
+  "document-xlsx": {
+    dir: "document-xlsx",
+    references: [
+      { filename: "references/sheets.md", includeByDefault: true },
+      { filename: "references/ooxml.md", includeByDefault: true },
+    ],
+  },
+  "document-pptx": {
+    dir: "document-pptx",
+    references: [
+      { filename: "references/deck-planning.md", includeByDefault: true },
+      { filename: "references/ooxml.md", includeByDefault: true },
+    ],
+  },
+};
+
+function loadBundledSkillPrompt(bundleId: string, message: string): string {
+  const bundle = BUNDLED_SKILLS[bundleId];
+  if (!bundle) {
+    return "";
+  }
+
+  const core = loadSkillAsset(join(bundle.dir, "SKILL.md"));
+  const refs = (bundle.references ?? [])
+    .filter((reference) => reference.includeByDefault || reference.when?.(message))
+    .map((reference) => loadSkillAsset(join(bundle.dir, reference.filename)))
+    .filter(Boolean);
+
+  return [core, ...refs].filter(Boolean).join("\n\n");
+}
+
+function bundleDirForSkill(bundleId: string): string | null {
+  const bundle = BUNDLED_SKILLS[bundleId];
+  if (!bundle) {
+    return null;
+  }
+
+  const candidates = [
+    join(__dirname, "skills", bundle.dir),
+    join(__dirname, "..", "src", "skills", bundle.dir),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+export function resolveSkillPrompt(skill: Skill, message: string): string {
+  if (skill.buildPrompt) {
+    return skill.buildPrompt(message);
+  }
+  return skill.prompt ?? "";
+}
+
+export function listSkillBundleAssets(skill: Skill): Array<{ absolutePath: string; relativePath: string }> {
+  if (!skill.bundleDir) {
+    return [];
+  }
+
+  const bundleRoot = bundleDirForSkill(skill.bundleDir);
+  if (!bundleRoot) {
+    return [];
+  }
+
+  const assetEntries: Array<{ absolutePath: string; relativePath: string }> = [];
+  for (const folderName of ["templates", "scripts"]) {
+    const folderPath = join(bundleRoot, folderName);
+    if (!existsSync(folderPath)) {
+      continue;
+    }
+    const stack = [folderPath];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const absolutePath = join(current, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(absolutePath);
+          continue;
+        }
+        if (entry.isFile()) {
+          assetEntries.push({
+            absolutePath,
+            relativePath: absolutePath.slice(bundleRoot.length + 1),
+          });
+        }
+      }
+    }
+  }
+
+  return assetEntries;
 }
 
 const CREATE_INTENT =
@@ -116,7 +257,8 @@ export const STUDY_SKILLS: Skill[] = [
   {
     id: "research",
     match: (message) => RESEARCH_INTENT.test(message),
-    prompt: loadSkillFile("research.md"),
+    buildPrompt: (message) => loadBundledSkillPrompt("research", message),
+    bundleDir: "research",
     triggersReindex: true,
     priority: 40,
   },
@@ -126,7 +268,7 @@ export const STUDY_SKILLS: Skill[] = [
       artifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|fill[- ]in[- ]the[- ]blank|anki)s?\b/i)
       || politeArtifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|anki)s?\b/i)
       || terseArtifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|anki)s?\b/i),
-    prompt: loadSkillFile("flashcards.md"),
+    prompt: loadSkillAsset("flashcards.md"),
     priority: 80,
   },
   {
@@ -136,7 +278,7 @@ export const STUDY_SKILLS: Skill[] = [
       artifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i)
       || politeArtifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i)
       || terseArtifactRequest(message, /\b(quiz|multiple choice|mcq|assessment|practice test)\b/i),
-    prompt: loadSkillFile("quiz.md"),
+    prompt: loadSkillAsset("quiz.md"),
     priority: 82,
   },
   {
@@ -146,7 +288,7 @@ export const STUDY_SKILLS: Skill[] = [
       artifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i)
       || politeArtifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i)
       || terseArtifactRequest(message, /\b(mind\s*map|concept\s*map|topic\s*map)\b/i),
-    prompt: loadSkillFile("mindmap.md"),
+    prompt: loadSkillAsset("mindmap.md"),
     priority: 79,
   },
   {
@@ -156,7 +298,7 @@ export const STUDY_SKILLS: Skill[] = [
       artifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram|visuali[sz]e)\b/i)
       || politeArtifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram)\b/i)
       || terseArtifactRequest(message, /\b(diagram|flowchart|flow chart|process diagram|sequence diagram|state diagram)\b/i),
-    prompt: loadSkillFile("diagram.md"),
+    prompt: loadSkillAsset("diagram.md"),
     priority: 78,
   },
   {
@@ -165,7 +307,8 @@ export const STUDY_SKILLS: Skill[] = [
       artifactRequest(message, /\b(study\s*doc(?:ument)?|write\s*notes|create\s*notes|note[- ]taking|study\s*notes|rich\s*document|editable\s*doc)\b/i)
       || politeArtifactRequest(message, /\b(study\s*doc(?:ument)?|study\s*notes|rich\s*document|editable\s*doc|note[- ]taking)\b/i)
       || terseArtifactRequest(message, /\b(study\s*doc(?:ument)?|study\s*notes|rich\s*document|editable\s*doc|note[- ]taking)\b/i),
-    prompt: loadSkillFile("study-doc.md"),
+    buildPrompt: (message) => loadBundledSkillPrompt("study-doc", message),
+    bundleDir: "study-doc",
     priority: 83,
   },
   {
@@ -174,7 +317,7 @@ export const STUDY_SKILLS: Skill[] = [
       artifactRequest(message, /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i)
       || politeArtifactRequest(message, /\b(mock\s*exam|practice\s*exam|sample\s*exam|mock\s*test)\b/i)
       || terseArtifactRequest(message, /\b(mock\s*exam|past\s*paper|practice\s*exam|sample\s*exam|mock\s*test)\b/i),
-    prompt: loadSkillFile("mock-exam.md"),
+    prompt: loadSkillAsset("mock-exam.md"),
     priority: 85,
   },
   {
@@ -184,67 +327,39 @@ export const STUDY_SKILLS: Skill[] = [
       politeArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
       terseArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
       /\b(build|make|create)\b.*\b(interactive|simulator?|simulation|visuali[sz]er?|playground)\b/i.test(message),
-    prompt: loadSkillFile("interactive.md"),
+    buildPrompt: (message) => loadBundledSkillPrompt("interactive", message),
+    bundleDir: "interactive",
     priority: 90,
-  },
-  {
-    id: "document-pdf-scripted",
-    match: (message) =>
-      documentRequest(message, /\b(pdf|cheat\s*sheet|reference\s*card|formula\s*sheet|printable)\b/i),
-    prompt: loadSkillFile("document-pdf-scripted.md"),
-    requiresSandbox: true,
-    priority: 92,
-  },
-  {
-    id: "document-docx-scripted",
-    match: (message) =>
-      documentRequest(message, /\b(word\s*doc(?:ument)?|\.docx|docx|study\s*guide|revision\s*notes|summary\s*document|handout)\b/i),
-    prompt: loadSkillFile("document-docx-scripted.md"),
-    requiresSandbox: true,
-    priority: 91,
-  },
-  {
-    id: "document-xlsx-scripted",
-    match: (message) =>
-      documentRequest(message, /\b(spreadsheet|\.xlsx|xlsx|excel|comparison\s*table|data\s*table|tabulate)\b/i),
-    prompt: loadSkillFile("document-xlsx-scripted.md"),
-    requiresSandbox: true,
-    priority: 91,
-  },
-  {
-    id: "document-pptx-scripted",
-    match: (message) =>
-      documentRequest(message, /\b(presentation|\.pptx|pptx|powerpoint|slide\s*deck)\b/i),
-    prompt: loadSkillFile("document-pptx-scripted.md"),
-    requiresSandbox: true,
-    priority: 91,
   },
   {
     id: "document-pdf",
     match: (message) =>
       documentRequest(message, /\b(pdf|cheat\s*sheet|reference\s*card|formula\s*sheet|printable)\b/i),
-    prompt: loadSkillFile("document-pdf.md"),
-    priority: 72,
+    prompt: loadSkillAsset("document-pdf.md"),
+    priority: 92,
   },
   {
     id: "document-docx",
     match: (message) =>
       documentRequest(message, /\b(word\s*doc(?:ument)?|\.docx|docx|study\s*guide|revision\s*notes|summary\s*document|handout)\b/i),
-    prompt: loadSkillFile("document-docx.md"),
+    buildPrompt: (message) => loadBundledSkillPrompt("document-docx", message),
+    bundleDir: "document-docx",
     priority: 71,
   },
   {
     id: "document-xlsx",
     match: (message) =>
       documentRequest(message, /\b(spreadsheet|\.xlsx|xlsx|excel|comparison\s*table|data\s*table|tabulate)\b/i),
-    prompt: loadSkillFile("document-xlsx.md"),
+    buildPrompt: (message) => loadBundledSkillPrompt("document-xlsx", message),
+    bundleDir: "document-xlsx",
     priority: 71,
   },
   {
     id: "document-pptx",
     match: (message) =>
       documentRequest(message, /\b(presentation|\.pptx|pptx|powerpoint|slide\s*deck)\b/i),
-    prompt: loadSkillFile("document-pptx.md"),
+    buildPrompt: (message) => loadBundledSkillPrompt("document-pptx", message),
+    bundleDir: "document-pptx",
     priority: 71,
   },
 ];
