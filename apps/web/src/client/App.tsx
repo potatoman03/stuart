@@ -294,8 +294,8 @@ function App() {
 
   /* ---- UI State ---- */
   const [composerDraft, setComposerDraft] = useState("");
-  const [composerImage, setComposerImage] = useState<string | null>(null);
-  const [composerFile, setComposerFile] = useState<{ name: string; size: number; file: File } | null>(null);
+  const [composerImages, setComposerImages] = useState<string[]>([]);
+  const [composerFiles, setComposerFiles] = useState<{ name: string; size: number; file: File }[]>([]);
   const [composerDragOver, setComposerDragOver] = useState(false);
   const [serverHealth, setServerHealth] = useState<"ok" | "degraded" | "down">("ok");
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1259,12 +1259,12 @@ function App() {
           const ctx = canvas.getContext("2d");
           if (ctx) {
             ctx.drawImage(img, 0, 0, width, height);
-            setComposerImage(canvas.toDataURL("image/jpeg", 0.8));
+            setComposerImages((prev) => [...prev, canvas.toDataURL("image/jpeg", 0.8)]);
           }
         };
         img.src = dataUrl;
       } else {
-        setComposerImage(dataUrl);
+        setComposerImages((prev) => [...prev, dataUrl]);
       }
     };
     reader.readAsDataURL(file);
@@ -1279,20 +1279,20 @@ function App() {
       );
       return;
     }
-    setComposerFile({ name: file.name, size: file.size, file });
+    setComposerFiles((prev) => [...prev, { name: file.name, size: file.size, file }]);
   }
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
     e.target.value = "";
-
-    if (file.type.startsWith("image/")) {
-      processImageFile(file);
-      return;
+    for (const file of Array.from(files)) {
+      if (file.type.startsWith("image/")) {
+        processImageFile(file);
+      } else {
+        processDocumentFile(file);
+      }
     }
-
-    processDocumentFile(file);
   }
 
   function handleComposerPaste(e: React.ClipboardEvent) {
@@ -1325,49 +1325,54 @@ function App() {
     e.preventDefault();
     e.stopPropagation();
     setComposerDragOver(false);
-    const file = e.dataTransfer?.files?.[0];
-    if (!file) return;
-    if (file.type.startsWith("image/")) {
-      processImageFile(file);
-    } else {
-      processDocumentFile(file);
+    const files = e.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      if (file.type.startsWith("image/")) {
+        processImageFile(file);
+      } else {
+        processDocumentFile(file);
+      }
     }
   }
 
   async function handleComposerSubmit(event: React.FormEvent) {
     event.preventDefault();
     const prompt = composerDraft.trim();
-    if (!prompt && !composerImage && !composerFile) return;
+    if (!prompt && composerImages.length === 0 && composerFiles.length === 0) return;
 
     if (selectedTask) {
       try {
         setBusy("message");
 
-        // If a document file is attached, stage it for Codex to read
-        if (composerFile) {
-          setThinkingState({ taskId: selectedTask.id, label: `Staging ${composerFile.name}...`, recentActions: [] });
+        // Upload all attached document files for Codex to read
+        for (const cf of composerFiles) {
+          setThinkingState({ taskId: selectedTask.id, label: `Staging ${cf.name}...`, recentActions: [] });
           await request(`/api/tasks/${selectedTask.id}/upload-file`, {
             method: "POST",
             headers: {
               "Content-Type": "application/octet-stream",
-              "X-Stuart-Filename": composerFile.name,
+              "X-Stuart-Filename": cf.name,
             },
-            body: composerFile.file,
+            body: cf.file,
           });
         }
 
         setThinkingState({ taskId: selectedTask.id, label: "Stuart is thinking...", recentActions: [] });
         const body: Record<string, string> = {};
+        const fileNames = composerFiles.map((f) => f.name);
         if (prompt) {
-          body.content = composerFile
-            ? `${prompt}\n\n(Uploaded file: ${composerFile.name})`
+          body.content = fileNames.length > 0
+            ? `${prompt}\n\n(Uploaded files: ${fileNames.join(", ")})`
             : prompt;
-        } else if (composerFile) {
-          body.content = `I just uploaded ${composerFile.name}. Please read it and tell me what's in it.`;
+        } else if (fileNames.length > 0) {
+          body.content = fileNames.length === 1
+            ? `I just uploaded ${fileNames[0]}. Please read it and tell me what's in it.`
+            : `I just uploaded ${fileNames.length} files: ${fileNames.join(", ")}. Please read them and tell me what's in them.`;
         } else {
           body.content = "(see attached image)";
         }
-        if (composerImage) body.imageBase64 = composerImage;
+        if (composerImages.length > 0 && composerImages[0]) body.imageBase64 = composerImages[0];
         const result = await request<SendMessageResponse>(
           `/api/tasks/${selectedTask.id}/messages`,
           { method: "POST", body: JSON.stringify(body) }
@@ -1380,8 +1385,8 @@ function App() {
           setThinkingState((cur) => (cur?.taskId === selectedTask.id ? null : cur));
         }
         setComposerDraft("");
-        setComposerImage(null);
-        setComposerFile(null);
+        setComposerImages([]);
+        setComposerFiles([]);
       } catch (caughtError) {
         setError(caughtError instanceof Error ? caughtError.message : "Failed to send message");
       } finally {
@@ -1994,39 +1999,43 @@ function App() {
                   </div>
                 )}
                 {/* Image preview strip */}
-                {composerImage && !composerDragOver && (
+                {composerImages.length > 0 && !composerDragOver && (
                   <div className="composer-image-preview">
-                    <img className="composer-image-thumb" src={composerImage} alt="Attached" />
-                    <button
-                      type="button"
-                      className="composer-image-remove"
-                      onClick={() => setComposerImage(null)}
-                      aria-label="Remove attached image"
-                    >
-                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                        <line x1="2" y1="2" x2="10" y2="10" />
-                        <line x1="10" y1="2" x2="2" y2="10" />
-                      </svg>
-                    </button>
+                    {composerImages.map((img, i) => (
+                      <div key={i} className="composer-image-preview-item">
+                        <img className="composer-image-thumb" src={img} alt={`Attached ${i + 1}`} />
+                        <button
+                          type="button"
+                          className="composer-image-remove"
+                          onClick={() => setComposerImages((prev) => prev.filter((_, j) => j !== i))}
+                          aria-label={`Remove image ${i + 1}`}
+                        >
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                            <line x1="2" y1="2" x2="10" y2="10" />
+                            <line x1="10" y1="2" x2="2" y2="10" />
+                          </svg>
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 )}
-                {/* Document file preview */}
-                {composerFile && !composerDragOver && (
-                  <div className="composer-file-preview">
+                {/* Document file previews */}
+                {composerFiles.length > 0 && !composerDragOver && composerFiles.map((cf, i) => (
+                  <div key={i} className="composer-file-preview">
                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                       <path d="M9 1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5z" />
                       <polyline points="9 1 9 5 13 5" />
                     </svg>
-                    <span className="composer-file-name">{composerFile.name}</span>
-                    <span className="composer-file-size">{(composerFile.size / 1024).toFixed(0)}KB</span>
-                    <button type="button" className="composer-image-remove" onClick={() => setComposerFile(null)} aria-label="Remove file">
+                    <span className="composer-file-name">{cf.name}</span>
+                    <span className="composer-file-size">{(cf.size / 1024).toFixed(0)}KB</span>
+                    <button type="button" className="composer-image-remove" onClick={() => setComposerFiles((prev) => prev.filter((_, j) => j !== i))} aria-label={`Remove ${cf.name}`}>
                       <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
                         <line x1="2" y1="2" x2="10" y2="10" />
                         <line x1="10" y1="2" x2="2" y2="10" />
                       </svg>
                     </button>
                   </div>
-                )}
+                ))}
                 <textarea
                   value={composerDraft}
                   onChange={(e) => setComposerDraft(e.target.value)}
@@ -2043,6 +2052,7 @@ function App() {
                   ref={fileInputRef}
                   type="file"
                   accept="image/*,.pdf,.docx,.doc,.xlsx,.xls,.pptx,.ppt,.md,.txt,.csv"
+                  multiple
                   style={{ display: "none" }}
                   onChange={handleFileSelect}
                 />
@@ -2065,7 +2075,7 @@ function App() {
                     <button
                       className="send-button"
                       type="submit"
-                      disabled={busy === "message" || turnInFlight || (!composerDraft.trim() && !composerImage)}
+                      disabled={busy === "message" || turnInFlight || (!composerDraft.trim() && composerImages.length === 0 && composerFiles.length === 0)}
                       aria-label="Send message"
                     >
                       <svg

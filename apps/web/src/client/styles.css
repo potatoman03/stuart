@@ -2853,10 +2853,16 @@ html[data-theme="dark"] .citation-pill:hover {
 }
 
 .composer-image-preview {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
+  gap: 8px;
   padding: 10px 14px 4px;
+}
+
+.composer-image-preview-item {
   position: relative;
+  display: inline-flex;
 }
 
 .composer-image-thumb {
@@ -2880,8 +2886,8 @@ html[data-theme="dark"] .citation-pill:hover {
   color: var(--ink-dim, #666);
   cursor: pointer;
   position: absolute;
-  top: 4px;
-  right: 8px;
+  top: -6px;
+  right: -6px;
   transition: background 120ms, color 120ms, border-color 120ms;
 }
 
@@ -2902,6 +2908,11 @@ html[data-theme="dark"] .citation-pill:hover {
   margin: 6px 12px 0;
   font-size: 12px;
   color: var(--ink);
+}
+
+.composer-file-preview .composer-image-remove {
+  position: static;
+  flex-shrink: 0;
 }
 
 .composer-file-name {

@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { execSync, fork, spawn, type ChildProcess } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from "electron";
 
 type RunningWebServer = {
   port: number;
@@ -449,13 +449,14 @@ function createWindow() {
 }
 
 function showLoadingWindow(): BrowserWindow {
+  const isDark = nativeTheme.shouldUseDarkColors;
   const loading = new BrowserWindow({
     width: 420,
     height: 260,
     frame: false,
     resizable: false,
     transparent: false,
-    backgroundColor: "#f4efe4",
+    backgroundColor: isDark ? "#1a1a1a" : "#f4efe4",
     center: true,
     show: false,
     alwaysOnTop: true,
@@ -485,6 +486,15 @@ animation:pulse 1.2s ease-in-out infinite}
 .loading-step.done .loading-step-dot{background:#1f8f63}
 .loading-step.pending{opacity:0.7}
 @keyframes pulse{0%,100%{opacity:0.3;transform:scale(1)}50%{opacity:1;transform:scale(1.2)}}
+@media(prefers-color-scheme:dark){
+body{background:#1a1a1a;color:#d4d4d4}
+h1{color:#5ac8c8}
+.dot-pulse span{background:#5ac8c8}
+.loading-step{background:rgba(90,200,200,0.08);color:#b0b0b0}
+.loading-step-dot{background:#555}
+.loading-step.active .loading-step-dot{background:#5ac8c8;box-shadow:0 0 0 4px rgba(90,200,200,0.18)}
+.loading-step.done .loading-step-dot{background:#34d399}
+}
 </style></head>
 <body>
 <div class="shell">
