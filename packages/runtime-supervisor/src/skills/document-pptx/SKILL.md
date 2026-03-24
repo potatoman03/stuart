@@ -21,7 +21,7 @@ Return exactly one JSON artifact payload for `document_pptx`. Do not return pros
   "title": "Adversarial Search Overview",
   "presentation": {
     "theme": {
-      "primaryColor": "#2962FF",
+      "primaryColor": "#296767",
       "fontFamily": "Arial"
     },
     "citations": [

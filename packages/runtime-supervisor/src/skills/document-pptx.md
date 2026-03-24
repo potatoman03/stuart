@@ -21,7 +21,7 @@ The presentation must be grounded in the workspace material, visually well-struc
   "title": "Presentation title",
   "presentation": {
     "theme": {
-      "primaryColor": "#2962FF",
+      "primaryColor": "#296767",
       "fontFamily": "Arial"
     },
     "citations": [

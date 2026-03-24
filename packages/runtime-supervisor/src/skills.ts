@@ -78,6 +78,7 @@ const BUNDLED_SKILLS: Record<string, SkillBundleDefinition> = {
   interactive: {
     dir: "interactive",
     references: [
+      { filename: "references/design-system.md", includeByDefault: true },
       { filename: "references/grounding.md", includeByDefault: true },
       { filename: "references/visual-quality.md", includeByDefault: true },
     ],
