@@ -115,6 +115,14 @@ function resolveTarget() {
 }
 
 function resolveCodexBinary(target) {
+  // Packaged desktop builds ship the runtime through extraResources/codex-vendor.
+  // Prefer that location so the app does not depend on copied npm aliases at runtime.
+  const resourcesPath = process.resourcesPath ?? path.resolve(__dirname, "..");
+  const extraResourceCandidate = path.join(resourcesPath, "codex-vendor", target.targetTriple, "codex", target.binaryName);
+  if (existsSync(extraResourceCandidate)) {
+    return extraResourceCandidate;
+  }
+
   const directPackageRoot = resolvePackageRoot(target.packageName);
   if (directPackageRoot) {
     const directCandidate = resolveMaybeUnpacked(
@@ -150,14 +158,6 @@ function resolveCodexBinary(target) {
         }
       }
     }
-  }
-
-  // Check extraResources/codex-vendor (used by packaged desktop builds)
-  // In packaged Electron apps, extraResources are at process.resourcesPath
-  const resourcesPath = process.resourcesPath ?? path.resolve(__dirname, "..");
-  const extraResourceCandidate = path.join(resourcesPath, "codex-vendor", target.targetTriple, "codex", target.binaryName);
-  if (existsSync(extraResourceCandidate)) {
-    return extraResourceCandidate;
   }
 
   // Also check relative to __dirname for dev builds that copy codex-vendor

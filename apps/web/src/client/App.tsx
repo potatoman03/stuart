@@ -511,7 +511,8 @@ function App() {
     tasks.length === 0;
   const codexCliCheck = diagnostics?.checks.find((check) => check.id === "codex-cli") ?? null;
   const codexAuthCheck = diagnostics?.checks.find((check) => check.id === "codex-auth") ?? null;
-  const dockerCheck = diagnostics?.checks.find((check) => check.id === "docker") ?? null;
+  const tesseractCheck = diagnostics?.checks.find((check) => check.id === "tesseract") ?? null;
+  const sofficeCheck = diagnostics?.checks.find((check) => check.id === "soffice") ?? null;
 
   const dismissDiagnostics = useCallback(() => {
     if (!diagnosticsFingerprint) {
@@ -1838,7 +1839,8 @@ function App() {
                     canChooseFolder={Boolean(diagnostics?.requiredReady)}
                     codexCliCheck={codexCliCheck}
                     codexAuthCheck={codexAuthCheck}
-                    dockerCheck={dockerCheck}
+                    tesseractCheck={tesseractCheck}
+                    sofficeCheck={sofficeCheck}
                     onChooseFolder={() => void handleAddStudyMaterials()}
                     onRefresh={() => void refreshDashboard()}
                     onStartCodexLogin={() => void startDesktopCodexLogin()}
@@ -2722,7 +2724,8 @@ function DesktopOnboardingView({
   canChooseFolder,
   codexCliCheck,
   codexAuthCheck,
-  dockerCheck,
+  tesseractCheck,
+  sofficeCheck,
   onChooseFolder,
   onRefresh,
   onStartCodexLogin,
@@ -2738,7 +2741,8 @@ function DesktopOnboardingView({
   canChooseFolder: boolean;
   codexCliCheck: SystemDiagnosticCheck | null;
   codexAuthCheck: SystemDiagnosticCheck | null;
-  dockerCheck: SystemDiagnosticCheck | null;
+  tesseractCheck: SystemDiagnosticCheck | null;
+  sofficeCheck: SystemDiagnosticCheck | null;
   onChooseFolder: () => void;
   onRefresh: () => void;
   onStartCodexLogin: () => void;
@@ -2753,6 +2757,17 @@ function DesktopOnboardingView({
   const showLoginBox =
     Boolean(loginState && loginState.status !== "idle") &&
     (!authReady || loginRecentLines.length > 0);
+  const optionalDocumentChecks = [tesseractCheck, sofficeCheck]
+    .filter((check): check is SystemDiagnosticCheck => Boolean(check));
+  const optionalDocumentMessage =
+    optionalDocumentChecks.length === 0
+      ? "Optional document extras stay hidden until Stuart detects them."
+      : optionalDocumentChecks.every((check) => check.status === "ok")
+        ? "Scanned-material OCR and richer Office document extraction are available."
+        : `Optional only: ${optionalDocumentChecks
+            .filter((check) => check.status !== "ok")
+            .map((check) => check.label)
+            .join(" and ")} can be added later if you need them.`;
 
   return (
     <div className="desktop-onboarding">
@@ -2925,12 +2940,8 @@ function DesktopOnboardingView({
       <div className="desktop-onboarding-footer">
         <div className="desktop-onboarding-footer-card">
           <span className="desktop-onboarding-footer-label">Optional enhancement</span>
-          <strong>Docker sandbox</strong>
-          <p>
-            {dockerCheck?.status === "ok"
-              ? "Available for scripted document generation and sandboxed exports."
-              : "Not required for normal studying. It only unlocks advanced scripted document generation."}
-          </p>
+          <strong>Document extras</strong>
+          <p>{optionalDocumentMessage}</p>
         </div>
         <div className="desktop-onboarding-footer-card">
           <span className="desktop-onboarding-footer-label">Local runtime</span>

@@ -3,14 +3,22 @@
   "productName": "Stuart",
   "asar": true,
   "asarUnpack": [
-    "node_modules/**/vendor/**/*"
+    "node_modules/**/vendor/**/*",
+    "node_modules/@resvg/**/*",
+    "node_modules/**/resvgjs*.node"
   ],
   "directories": {
     "output": "release"
   },
   "files": [
     "dist/**/*",
-    "package.json"
+    "package.json",
+    "!node_modules/@stuart/codex-runtime-darwin-arm64{,/**/*}",
+    "!node_modules/@stuart/codex-runtime-darwin-x64{,/**/*}",
+    "!node_modules/@stuart/codex-runtime-linux-arm64{,/**/*}",
+    "!node_modules/@stuart/codex-runtime-linux-x64{,/**/*}",
+    "!node_modules/@stuart/codex-runtime-win32-arm64{,/**/*}",
+    "!node_modules/@stuart/codex-runtime-win32-x64{,/**/*}"
   ],
   "extraResources": [
     {

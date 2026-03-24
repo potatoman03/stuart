@@ -67,6 +67,24 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
     optionalDependencies:
+      '@resvg/resvg-js-darwin-arm64':
+        specifier: ^2.6.2
+        version: 2.6.2
+      '@resvg/resvg-js-darwin-x64':
+        specifier: ^2.6.2
+        version: 2.6.2
+      '@resvg/resvg-js-linux-arm64-gnu':
+        specifier: ^2.6.2
+        version: 2.6.2
+      '@resvg/resvg-js-linux-x64-gnu':
+        specifier: ^2.6.2
+        version: 2.6.2
+      '@resvg/resvg-js-win32-arm64-msvc':
+        specifier: ^2.6.2
+        version: 2.6.2
+      '@resvg/resvg-js-win32-x64-msvc':
+        specifier: ^2.6.2
+        version: 2.6.2
       '@stuart/codex-runtime-darwin-arm64':
         specifier: npm:@openai/codex@0.116.0-darwin-arm64
         version: '@openai/codex@0.116.0-darwin-arm64'

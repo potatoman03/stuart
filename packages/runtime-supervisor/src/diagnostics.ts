@@ -177,24 +177,24 @@ export async function collectSystemDiagnostics(
         : "Check STUART_DATA_DIR and local filesystem permissions."),
   });
 
-  const dockerVersion = await runCommand("docker", ["--version"]);
-  const dockerInfo = dockerVersion.ok ? await runCommand("docker", ["info", "--format", "{{.ServerVersion}}"]) : dockerVersion;
-  checks.push({
-    id: "docker",
-    label: "Docker sandbox",
-    status: dockerInfo.ok ? "ok" : "warn",
-    required: false,
-    summary: dockerInfo.ok
-      ? `Docker daemon reachable (${firstMeaningfulLine(dockerInfo.stdout, dockerVersion.stdout)})`
-      : "Docker sandbox unavailable.",
-    detail: dockerInfo.ok ? undefined : dockerInfo.detail || firstMeaningfulLine(dockerInfo.stderr, dockerVersion.stdout),
-    command: surface === "developer" ? "docker info --format '{{.ServerVersion}}'" : undefined,
-    resolution: dockerInfo.ok
-      ? undefined
-      : (surface === "desktop"
-        ? "Optional only. Install or start Docker Desktop if you want advanced scripted document generation."
-        : "Start Docker Desktop or another Docker daemon if you want sandboxed scripted artifact generation."),
-  });
+  if (surface === "developer") {
+    const dockerVersion = await runCommand("docker", ["--version"]);
+    const dockerInfo = dockerVersion.ok ? await runCommand("docker", ["info", "--format", "{{.ServerVersion}}"]) : dockerVersion;
+    checks.push({
+      id: "docker",
+      label: "Docker sandbox",
+      status: dockerInfo.ok ? "ok" : "warn",
+      required: false,
+      summary: dockerInfo.ok
+        ? `Docker daemon reachable (${firstMeaningfulLine(dockerInfo.stdout, dockerVersion.stdout)})`
+        : "Docker sandbox unavailable.",
+      detail: dockerInfo.ok ? undefined : dockerInfo.detail || firstMeaningfulLine(dockerInfo.stderr, dockerVersion.stdout),
+      command: "docker info --format '{{.ServerVersion}}'",
+      resolution: dockerInfo.ok
+        ? undefined
+        : "Start Docker Desktop or another Docker daemon if you want sandboxed scripted artifact generation.",
+    });
+  }
 
   if (surface === "developer") {
     const swiftVersion = await runCommand("swift", ["--version"]);
@@ -210,9 +210,15 @@ export async function collectSystemDiagnostics(
   const tesseractVersion = await runCommand("tesseract", ["--version"]);
   checks.push(optionalCommandCheck({
     id: "tesseract",
-    label: "Tesseract OCR",
+    label: surface === "desktop" ? "Scanned document OCR" : "Tesseract OCR",
     command: surface === "developer" ? "tesseract --version" : undefined,
     result: tesseractVersion,
+    successSummary: surface === "desktop"
+      ? "OCR is available for scanned PDFs and image-heavy study material."
+      : undefined,
+    failureSummary: surface === "desktop"
+      ? "OCR for scanned PDFs and image-heavy study material is unavailable."
+      : undefined,
     resolution: surface === "desktop"
       ? "Optional only. Install Tesseract if you want OCR for scanned or image-heavy study material."
       : "Install Tesseract if you want OCR for image-heavy or scanned study material.",
@@ -221,9 +227,15 @@ export async function collectSystemDiagnostics(
   const sofficeVersion = await runCommand("soffice", ["--version"]);
   checks.push(optionalCommandCheck({
     id: "soffice",
-    label: "LibreOffice",
+    label: surface === "desktop" ? "Office document import" : "LibreOffice",
     command: surface === "developer" ? "soffice --version" : undefined,
     result: sofficeVersion,
+    successSummary: surface === "desktop"
+      ? "Richer Word, PowerPoint, and spreadsheet extraction is available."
+      : undefined,
+    failureSummary: surface === "desktop"
+      ? "Richer Office document extraction is unavailable."
+      : undefined,
     resolution: surface === "desktop"
       ? "Optional only. Install LibreOffice if you want richer Word document extraction."
       : "Install LibreOffice if you want richer DOCX to PDF conversion during ingestion.",
@@ -245,7 +257,7 @@ export async function collectSystemDiagnostics(
     });
   }
 
-  if (typeof options.sandboxAvailable === "boolean") {
+  if (surface === "developer" && typeof options.sandboxAvailable === "boolean") {
     checks.push({
       id: "sandbox-runtime",
       label: "Sandbox runtime warm status",
@@ -316,6 +328,8 @@ function optionalCommandCheck(input: {
   label: string;
   command?: string;
   result: CommandResult;
+  successSummary?: string;
+  failureSummary?: string;
   resolution: string;
 }): SystemDiagnosticCheck {
   return {
@@ -325,8 +339,8 @@ function optionalCommandCheck(input: {
     required: false,
     command: input.command,
     summary: input.result.ok
-      ? firstMeaningfulLine(input.result.stdout, `${input.label} is available.`)
-      : `${input.label} is not available.`,
+      ? (input.successSummary ?? firstMeaningfulLine(input.result.stdout, `${input.label} is available.`))
+      : (input.failureSummary ?? `${input.label} is not available.`),
     detail: input.result.ok ? undefined : input.result.detail || firstMeaningfulLine(input.result.stderr),
     resolution: input.result.ok ? undefined : input.resolution,
   };

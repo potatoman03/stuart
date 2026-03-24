@@ -1217,6 +1217,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
 }
 
 .library-kicker {
@@ -1236,6 +1237,7 @@ textarea {
 }
 
 .library-folder {
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1352,13 +1354,16 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  min-width: 0;
 }
 
 .library-session {
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: 4px;
   width: 100%;
+  min-width: 0;
   padding: 8px 10px;
   border: none;
   border-radius: 8px;
@@ -1390,6 +1395,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 6px;
+  min-width: 0;
 }
 
 .library-session-head strong {
@@ -1411,6 +1417,7 @@ textarea {
   overflow: hidden;
   word-break: break-word;
   max-width: 100%;
+  min-width: 0;
   margin: 0;
 }
 

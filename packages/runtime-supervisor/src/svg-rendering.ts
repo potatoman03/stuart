@@ -1,4 +1,26 @@
-import { Resvg } from "@resvg/resvg-js";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+let cachedResvg:
+  | (typeof import("@resvg/resvg-js"))["Resvg"]
+  | null = null;
+
+function resolveResvg() {
+  if (cachedResvg) {
+    return cachedResvg;
+  }
+
+  try {
+    const module = require("@resvg/resvg-js") as typeof import("@resvg/resvg-js");
+    cachedResvg = module.Resvg;
+    return cachedResvg;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `SVG rasterization is unavailable because the native resvg renderer could not be loaded. ${message}`
+    );
+  }
+}
 
 const PX_PER_INCH = 96;
 const PT_PER_INCH = 72;
@@ -125,6 +147,7 @@ export function renderSvgToPng(
   rawSvg: string,
   options: { width?: number; height?: number } = {}
 ): { svg: string; png: Buffer; widthPx: number; heightPx: number } {
+  const Resvg = resolveResvg();
   const svg = normalizeSvgForHtml(rawSvg);
   const { widthPx: intrinsicWidth, heightPx: intrinsicHeight } = getSvgDimensions(svg);
   const width = options.width && options.width > 0 ? Math.round(options.width) : Math.max(1, Math.round(intrinsicWidth));

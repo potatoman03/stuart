@@ -310,6 +310,12 @@ async function startEmbeddedWebServer(onProgress?: (state: LoadingWindowState) =
   child.stdout?.on("data", (chunk: Buffer) => {
     process.stdout.write(chunk);
   });
+  child.once("error", (error) => {
+    process.stderr.write(`[stuart] embedded web server failed to launch: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  });
+  child.once("exit", (code, signal) => {
+    process.stderr.write(`[stuart] embedded web server exited before shutdown (code=${code ?? "null"}, signal=${signal ?? "none"}).\n`);
+  });
 
   runningWebServer = {
     port: apiPort,
