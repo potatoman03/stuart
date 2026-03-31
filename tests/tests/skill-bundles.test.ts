@@ -6,7 +6,7 @@ describe("skill bundles", () => {
     const skill = matchSkill("Build an interactive BFS visualiser for lecture 2.", true);
     expect(skill?.id).toBe("interactive");
     const prompt = resolveSkillPrompt(skill!, "Build an interactive BFS visualiser for lecture 2.");
-    expect(prompt).toContain("Skill Bundle: Interactive Study Artifact");
+    expect(prompt).toContain("Skill Bundle: Interactive Artifact");
     expect(prompt).toContain("Grounding requirements");
     expect(prompt).toContain("Interaction and visual quality");
   });
@@ -43,8 +43,8 @@ describe("skill bundles", () => {
     expect(docxPrompt).toContain('"type": "kv"');
     expect(xlsxPrompt).toContain('"sourceNotes"');
     expect(xlsxPrompt).toContain('"formula"');
-    expect(pptxPrompt).toContain('"layout": "two_column"');
-    expect(pptxPrompt).toContain('"layout": "diagram"');
+    expect(pptxPrompt).toContain("`two_column`");
+    expect(pptxPrompt).toContain("`diagram`");
     expect(pptxPrompt).toContain('"notes"');
   });
 

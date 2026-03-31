@@ -126,4 +126,31 @@ describe("LocalDatabase.searchIngestionChunks", () => {
 
     expect(results.some((result) => result.relativePath === "Chapter 08 Inventory.md")).toBe(true);
   });
+
+  it("can scope retrieval to a single source file", async () => {
+    const db = await createDatabase();
+    seedChunk(db, {
+      documentId: "doc-lecture-1",
+      chunkId: "chunk-lecture-1",
+      relativePath: "Lecture 01 Search.md",
+      heading: "Breadth-first search",
+      text: "Breadth-first search expands nodes in layers using a FIFO queue.",
+    });
+    seedChunk(db, {
+      documentId: "doc-lecture-2",
+      chunkId: "chunk-lecture-2",
+      relativePath: "Lecture 02 Greek Religion.md",
+      heading: "Greek ritual",
+      text: "Greek ritual structured civic and household religious life.",
+    });
+
+    const results = db.searchIngestionChunks("task-1", "ritual civic household", {
+      taskRunId: "run-1",
+      source: "Lecture 02 Greek Religion.md",
+      limit: 5,
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.relativePath).toBe("Lecture 02 Greek Religion.md");
+  });
 });

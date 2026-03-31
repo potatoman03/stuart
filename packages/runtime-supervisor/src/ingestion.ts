@@ -1,17 +1,21 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFile, mkdir, writeFile, rm, mkdtemp, access } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import JSZip from "jszip";
 import mammoth from "mammoth";
 import { XMLParser } from "fast-xml-parser";
+import { extractPptxParagraphsFromXml } from "./document-pipeline.js";
 // Lazy-imported to avoid DOMMatrix reference at load time (crashes in Electron main process).
 type PdfjsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 let _pdfjs: PdfjsModule | null = null;
+let _pdfjsPolyfillsReady = false;
 async function loadPdfjs(): Promise<PdfjsModule> {
   if (!_pdfjs) {
+    await ensurePdfjsNodePolyfills();
     _pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   }
   return _pdfjs;
@@ -45,10 +49,13 @@ export type ParsedIngestionDocument =
 
 type ChunkModality = "text" | "ocr";
 
+type ImageType = "chart" | "diagram" | "screenshot" | "photo" | "slide" | "table" | "unknown";
+
 type ExtractedSection = {
   heading?: string;
   locator?: string;
   modality?: ChunkModality;
+  imageType?: ImageType;
   text: string;
 };
 
@@ -125,10 +132,17 @@ const xmlParser = new XMLParser({
 });
 
 const require_ = createRequire(import.meta.url);
-const pdfStandardFontDataUrl = `${join(
-  dirname(require_.resolve("pdfjs-dist/package.json")),
-  "standard_fonts",
-)}${sep}`;
+const pdfStandardFontDataUrl = (() => {
+  const resolved = join(dirname(require_.resolve("pdfjs-dist/package.json")), "standard_fonts");
+  // In packaged Electron with ELECTRON_RUN_AS_NODE=1, asar is not patched.
+  // Use the .asar.unpacked mirror if the original path is inside an asar.
+  const unpacked = resolved.replace(/app\.asar(?![.])/g, "app.asar.unpacked");
+  try {
+    // Check if the unpacked path exists (prefer it for the forked process)
+    if (unpacked !== resolved && existsSync(unpacked)) return `${unpacked}${sep}`;
+  } catch { /* fall through */ }
+  return `${resolved}${sep}`;
+})();
 
 const renderPdfScriptPath = resolve(
   dirname(new URL(import.meta.url).pathname),
@@ -138,6 +152,33 @@ const renderPdfScriptPath = resolve(
 const previewRoot = resolve(process.env.STUART_DATA_DIR ?? ".stuart-data", "ingestion-previews");
 
 const commandAvailability = new Map<string, Promise<boolean>>();
+
+async function ensurePdfjsNodePolyfills(): Promise<void> {
+  if (_pdfjsPolyfillsReady) {
+    return;
+  }
+  _pdfjsPolyfillsReady = true;
+
+  if (
+    typeof globalThis.DOMMatrix !== "undefined" &&
+    typeof globalThis.ImageData !== "undefined" &&
+    typeof globalThis.Path2D !== "undefined"
+  ) {
+    return;
+  }
+
+  const canvas = await import("@napi-rs/canvas");
+  if (typeof globalThis.DOMMatrix === "undefined" && canvas.DOMMatrix) {
+    // pdfjs expects browser globals even when only extracting text in Node.
+    (globalThis as any).DOMMatrix = canvas.DOMMatrix;
+  }
+  if (typeof globalThis.ImageData === "undefined" && canvas.ImageData) {
+    (globalThis as any).ImageData = canvas.ImageData;
+  }
+  if (typeof globalThis.Path2D === "undefined" && canvas.Path2D) {
+    (globalThis as any).Path2D = canvas.Path2D;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -309,6 +350,51 @@ const convertDocxToPdf = async (filePath: string) => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Image type classification heuristics
+// ---------------------------------------------------------------------------
+
+const classifyImageType = (filename: string, ocrText: string): ImageType => {
+  const lowerFilename = filename.toLowerCase();
+  const lowerText = ocrText.toLowerCase();
+
+  // Filename-based classification (highest confidence)
+  if (/chart/i.test(lowerFilename)) return "chart";
+  if (/graph/i.test(lowerFilename)) return "chart";
+  if (/plot/i.test(lowerFilename)) return "chart";
+  if (/diagram/i.test(lowerFilename)) return "diagram";
+  if (/figure/i.test(lowerFilename) && /\b(axis|data|percent|trend)\b/.test(lowerText)) return "chart";
+  if (/figure/i.test(lowerFilename)) return "diagram";
+  if (/slide/i.test(lowerFilename)) return "slide";
+  if (/screenshot/i.test(lowerFilename)) return "screenshot";
+  if (/photo/i.test(lowerFilename)) return "photo";
+  if (/table/i.test(lowerFilename)) return "table";
+
+  // OCR text-based heuristics
+  if (!ocrText || ocrText.trim().length < 10) return "unknown";
+
+  // Contains numbers + axis-like text → likely a chart
+  const hasNumbers = /\d+(\.\d+)?/.test(ocrText);
+  const hasAxisLabels = /\b(axis|x-axis|y-axis|xlabel|ylabel|percent|%|total|average|mean|median|sum|count|frequency|cumulative)\b/i.test(ocrText);
+  const hasChartKeywords = /\b(bar|pie|line|scatter|histogram|legend|series|scale|tick|grid)\b/i.test(ocrText);
+  if (hasNumbers && (hasAxisLabels || hasChartKeywords)) return "chart";
+
+  // Contains arrows/boxes/flow keywords → likely a diagram
+  const hasDiagramKeywords = /\b(arrow|box|node|edge|flow|process|step|stage|input|output|start|end|decision|branch|loop|component|module|interface|class|entity|relationship)\b/i.test(ocrText);
+  const hasArrowSymbols = /[→←↑↓⟶⟵▶◀►◄]|->|<-|-->|==>/.test(ocrText);
+  if (hasDiagramKeywords || hasArrowSymbols) return "diagram";
+
+  // Has structured text in grid-like pattern → likely a table/screenshot
+  const lines = ocrText.split("\n").filter((l) => l.trim().length > 0);
+  const tabulatedLines = lines.filter((l) => /\t/.test(l) || /\s{3,}/.test(l));
+  if (tabulatedLines.length > 2 && tabulatedLines.length / lines.length > 0.4) return "table";
+
+  // Fallback: if text is very short relative to an image, likely a photo
+  if (ocrText.trim().length < 30) return "photo";
+
+  return "unknown";
+};
+
 const ocrImageBuffers = async (
   relativePath: string,
   entries: Array<{ buffer: Buffer; extension: string; label: string; locator?: string }>,
@@ -334,7 +420,11 @@ const ocrImageBuffers = async (
     preview.textPreview = text.slice(0, 180);
     previews.push(preview);
     if (!text) continue;
-    sections.push({ heading, locator, modality: "ocr", text });
+    const imageType = classifyImageType(entry.label, text);
+    const description = imageType !== "unknown"
+      ? `[Image type: ${imageType}] ${entry.label}`
+      : entry.label;
+    sections.push({ heading: heading || description, locator, modality: "ocr", imageType, text });
   }
 
   return { sections, previews };
@@ -458,32 +548,9 @@ const decodeXmlEntities = (value: string) =>
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
 
-const collectTextNodes = (value: unknown, into: string[]): void => {
-  if (typeof value === "string") {
-    const normalized = decodeXmlEntities(value).trim();
-    if (normalized) into.push(normalized);
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const entry of value) collectTextNodes(entry, into);
-    return;
-  }
-  if (!value || typeof value !== "object") return;
-  for (const [key, child] of Object.entries(value)) {
-    if (key === "a:t" || key === "#text" || key === "w:t") {
-      collectTextNodes(child, into);
-      continue;
-    }
-    collectTextNodes(child, into);
-  }
-};
-
 const extractPptxText = (xml: string) => {
   try {
-    const parsed = xmlParser.parse(xml);
-    const collected: string[] = [];
-    collectTextNodes(parsed, collected);
-    return collected.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+    return extractPptxParagraphsFromXml(xml).join("\n").replace(/\n{3,}/g, "\n\n").trim();
   } catch {
     return decodeXmlEntities(xml.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ")).trim();
   }
@@ -895,7 +962,7 @@ const extractPdfSections = async (
     standardFontDataUrl: pdfStandardFontDataUrl,
   });
   const pdf = await loadingTask.promise;
-  const pages: Array<{ pageNumber: number; text: string; modality: ChunkModality }> = [];
+  const pages: Array<{ pageNumber: number; text: string; modality: ChunkModality; imageType?: ImageType }> = [];
   let sparsePageCount = 0;
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
@@ -954,8 +1021,9 @@ const extractPdfSections = async (
         const ocrText = await runTesseract(renderedPage.imagePath);
         const page = pages.find((e) => e.pageNumber === pageNumber);
         if (!ocrText || (page?.text.length ?? 0) >= ocrText.length) continue;
-        if (page) { page.text = ocrText; page.modality = "ocr"; }
-        else pages.push({ pageNumber, text: ocrText, modality: "ocr" });
+        const pageImageType = classifyImageType(basename(filePath), ocrText);
+        if (page) { page.text = ocrText; page.modality = "ocr"; page.imageType = pageImageType; }
+        else pages.push({ pageNumber, text: ocrText, modality: "ocr", imageType: pageImageType });
       }
 
       await cleanupDir(renderDir);
@@ -966,9 +1034,12 @@ const extractPdfSections = async (
     .filter((p) => p.text)
     .sort((a, b) => a.pageNumber - b.pageNumber)
     .map((p) => ({
-      heading: `Page ${p.pageNumber}`,
+      heading: p.imageType && p.imageType !== "unknown"
+        ? `Page ${p.pageNumber} [${p.imageType}]`
+        : `Page ${p.pageNumber}`,
       locator: `page ${p.pageNumber}`,
       modality: p.modality,
+      imageType: p.imageType,
       text: p.text,
     }));
 

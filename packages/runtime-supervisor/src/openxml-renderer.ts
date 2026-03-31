@@ -1301,7 +1301,7 @@ function buildSlideXml(
           emu(1.3),
           emu(11.7),
           emu(5.0),
-          slide.bullets.map((bullet) => ({
+          (slide.bullets ?? []).map((bullet) => ({
             text: bullet,
             bullet: true,
             fontSize: 15,

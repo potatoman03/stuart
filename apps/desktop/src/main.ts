@@ -2,7 +2,8 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { execSync, fork, spawn, type ChildProcess } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, screen, shell } from "electron";
+import { computeMainWindowSize } from "./window-sizing.js";
 
 type RunningWebServer = {
   port: number;
@@ -413,11 +414,15 @@ async function launchCodexLogin() {
 }
 
 function createWindow() {
+  const { width, height, minWidth, minHeight } = computeMainWindowSize(
+    screen.getPrimaryDisplay().workAreaSize
+  );
+
   const window = new BrowserWindow({
-    width: 1560,
-    height: 980,
-    minWidth: 1180,
-    minHeight: 760,
+    width,
+    height,
+    minWidth,
+    minHeight,
     title: "Stuart",
     backgroundColor: "#f4efe4",
     autoHideMenuBar: true,
@@ -727,8 +732,12 @@ function updateCodexLoginState(patch: Partial<CodexLoginState>) {
   };
 }
 
+function stripAnsi(text: string): string {
+  return text.replace(/\x1B\[[0-9;]*[A-Za-z]/g, "");
+}
+
 function handleCodexLoginOutput(rawChunk: string) {
-  const nextLines = rawChunk
+  const nextLines = stripAnsi(rawChunk)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
@@ -766,7 +775,7 @@ function handleCodexLoginOutput(rawChunk: string) {
 }
 
 function extractDeviceCode(line: string): string | undefined {
-  const codeMatch = line.match(/\b([A-Z0-9]{4}(?:-[A-Z0-9]{4})+|[A-Z0-9]{6,10})\b/);
+  const codeMatch = line.match(/\b([A-Z0-9]{3,5}(?:-[A-Z0-9]{3,6})+|[A-Z0-9]{6,10})\b/);
   return codeMatch?.[1];
 }
 

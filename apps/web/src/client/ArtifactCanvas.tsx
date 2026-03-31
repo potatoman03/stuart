@@ -2297,6 +2297,11 @@ function InteractiveCanvas({
   const hasInlineHtml = html.trim().length > 0;
   const responsivePreviewStyles = `<style>body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:16px;color:#111;background:#f7f7f5;}img,svg,video,canvas{max-width:100%;height:auto;}svg{display:block;}</style>`;
 
+  // Detect CDN URLs to conditionally allow same-origin (needed for CDN script loading)
+  const hasCdnUrls = useMemo(() => {
+    return /(?:unpkg\.com|cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|fonts\.googleapis\.com)/i.test(html);
+  }, [html]);
+
   // Write HTML to iframe using srcdoc for full sandboxing
   const sanitizedHtml = useMemo(() => {
     if (!hasInlineHtml) {
@@ -2355,7 +2360,7 @@ function InteractiveCanvas({
       <iframe
         ref={iframeRef}
         {...(hasInlineHtml ? { srcDoc: sanitizedHtml } : previewUrl ? { src: previewUrl } : {})}
-        sandbox="allow-scripts"
+        sandbox={hasCdnUrls ? "allow-scripts allow-same-origin" : "allow-scripts"}
         className="interactive-iframe"
         title={title}
       />

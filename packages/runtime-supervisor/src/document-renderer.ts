@@ -47,6 +47,18 @@ const CALLOUT_STYLES: Record<string, { bg: string; border: string; text: string;
   important: { bg: "#FEF2F2", border: "#EF4444", text: "#991B1B", icon: "!" },
 };
 
+// Mood-to-color palette mapping
+const MOOD_COLORS: Record<string, { primary: string; light: string; text: string }> = {
+  academic:  { primary: "#1a365d", light: "#E8EDF4", text: "#1a365d" },
+  corporate: { primary: "#1e3a5f", light: "#E8EEF4", text: "#1e3a5f" },
+  creative:  { primary: "#6b21a8", light: "#F3E8FF", text: "#6b21a8" },
+  minimal:   { primary: "#374151", light: "#F3F4F6", text: "#374151" },
+  warm:      { primary: "#92400e", light: "#FEF3C7", text: "#92400e" },
+  playful:   { primary: "#0d9488", light: "#CCFBF1", text: "#0d9488" },
+  technical: { primary: "#0f172a", light: "#E2E8F0", text: "#0f172a" },
+  elegant:   { primary: "#1c1917", light: "#F5F5F4", text: "#1c1917" },
+};
+
 interface PdfColumn {
   x: number;
   width: number;
@@ -66,8 +78,18 @@ async function renderPdf(
   const { createWriteStream } = await import("node:fs");
 
   const doc = payload as {
+    docType?: string;
+    mood?: string;
     pageSize?: string;
     columns?: number;
+    cover?: {
+      title: string;
+      subtitle?: string;
+      author?: string;
+      date?: string;
+      institution?: string;
+      coverPattern?: string;
+    };
     metadata?: { author?: string; subject?: string; description?: string };
     citations?: CitationRef[];
     sections?: Array<{
@@ -76,6 +98,10 @@ async function renderPdf(
       paragraphs: Array<Record<string, unknown>>;
     }>;
   };
+
+  // Resolve mood colors — fall back to academic if not specified
+  const moodKey = doc.mood && doc.mood in MOOD_COLORS ? doc.mood : "academic";
+  const moodColor = MOOD_COLORS[moodKey]!;
 
   const pageSize = doc.pageSize === "letter" ? "LETTER" : "A4";
   const numCols = doc.columns === 2 ? 2 : 1;
@@ -105,24 +131,91 @@ async function renderPdf(
   const h2Size = numCols === 2 ? 9.5 : 16;
   const h3Size = numCols === 2 ? 8.5 : 13;
   const headingSizes: Record<number, number> = { 1: h1Size, 2: h2Size, 3: h3Size };
-  const headingColors: Record<number, string> = { 1: "#1a1a2e", 2: "#16213e", 3: "#0f3460" };
+  const headingColors: Record<number, string> = {
+    1: moodColor.primary,
+    2: moodColor.primary,
+    3: moodColor.text,
+  };
 
-  // Title header
+  // ---- Cover page rendering ----
+  if (doc.cover) {
+    const coverColor = moodColor.primary;
+    const pageH = pdf.page.height;
+
+    // Accent bar at top — full width colored strip
+    pdf.save();
+    pdf.rect(0, 0, pageW, 8).fillColor(coverColor).fill();
+    pdf.restore();
+
+    // Accent sidebar — left edge colored strip
+    pdf.save();
+    pdf.rect(0, 0, 6, pageH).fillColor(coverColor).fill();
+    pdf.restore();
+
+    // Title — large, left-aligned with generous top margin
+    const coverTitleY = pageH * 0.3;
+    pdf.fontSize(32).font("Helvetica-Bold").fillColor(coverColor)
+      .text(doc.cover.title, margin + 20, coverTitleY, { width: usableW - 40 });
+
+    // Accent bar under title
+    const titleBarY = pdf.y + 8;
+    pdf.save();
+    pdf.rect(margin + 20, titleBarY, 80, 4).fillColor(coverColor).fill();
+    pdf.restore();
+    pdf.y = titleBarY + 16;
+
+    // Subtitle
+    if (doc.cover.subtitle) {
+      pdf.fontSize(16).font("Helvetica").fillColor("#4B5563")
+        .text(doc.cover.subtitle, margin + 20, pdf.y, { width: usableW - 40 });
+      pdf.y += 12;
+    }
+
+    // Author
+    if (doc.cover.author) {
+      pdf.fontSize(13).font("Helvetica").fillColor("#6B7280")
+        .text(doc.cover.author, margin + 20, pdf.y, { width: usableW - 40 });
+      pdf.y += 6;
+    }
+
+    // Institution
+    if (doc.cover.institution) {
+      pdf.fontSize(12).font("Helvetica-Oblique").fillColor("#6B7280")
+        .text(doc.cover.institution, margin + 20, pdf.y, { width: usableW - 40 });
+      pdf.y += 6;
+    }
+
+    // Date
+    if (doc.cover.date) {
+      pdf.fontSize(12).font("Helvetica").fillColor("#9CA3AF")
+        .text(doc.cover.date, margin + 20, pdf.y, { width: usableW - 40 });
+    }
+
+    // Bottom accent bar
+    pdf.save();
+    pdf.rect(0, pageH - 8, pageW, 8).fillColor(coverColor).fill();
+    pdf.restore();
+
+    // Start body content on a new page
+    pdf.addPage();
+  }
+
+  // Title header (for documents without a cover page)
   const title = doc.metadata?.subject ?? doc.metadata?.description ?? "";
-  if (title) {
+  if (title && !doc.cover) {
     pdf
       .fontSize(numCols === 2 ? 13 : 22)
       .font("Helvetica-Bold")
       .fillColor("#111111")
       .text(title, margin, margin, { width: usableW, align: "center" });
 
-    // Underline bar
+    // Underline bar — uses mood color
     const barY = pdf.y + 3;
     pdf
       .moveTo(margin, barY)
       .lineTo(pageW - margin, barY)
       .lineWidth(1.5)
-      .strokeColor("#2962FF")
+      .strokeColor(moodColor.primary)
       .stroke();
     pdf.y = barY + (numCols === 2 ? 6 : 12);
   }
@@ -185,8 +278,8 @@ async function renderPdf(
 
     let tableY = pdf.y;
 
-    // Header row background
-    drawRoundedBg(x, tableY, width, rowH, "#2962FF");
+    // Header row background — uses mood color
+    drawRoundedBg(x, tableY, width, rowH, moodColor.primary);
 
     pdf.fontSize(fontSize).font("Helvetica-Bold").fillColor("#FFFFFF");
     for (let ci = 0; ci < nCols; ci++) {
@@ -251,7 +344,7 @@ async function renderPdf(
     if (section.level === 1) {
       const headY = pdf.y;
       pdf.save();
-      pdf.rect(col.x, headY, 3, fontSize + 2).fillColor("#2962FF").fill();
+      pdf.rect(col.x, headY, 3, fontSize + 2).fillColor(moodColor.primary).fill();
       pdf.restore();
       pdf.fontSize(fontSize).font("Helvetica-Bold").fillColor(headingColor)
         .text(section.heading.toUpperCase(), col.x + 8, headY, { width: col.width - 8 });
@@ -292,7 +385,7 @@ async function renderPdf(
           pdf.fontSize(baseFontSize).font("Helvetica").fillColor("#333333");
           // Draw bullet dot
           pdf.save();
-          pdf.circle(col.x + 4, pdf.y + baseFontSize / 2, 1.5).fillColor("#2962FF").fill();
+          pdf.circle(col.x + 4, pdf.y + baseFontSize / 2, 1.5).fillColor(moodColor.primary).fill();
           pdf.restore();
           pdf.fillColor("#333333");
           pdf.text(renderedContent, col.x + 10, pdf.y, { width: col.width - 10, lineGap: 1 });
@@ -302,7 +395,7 @@ async function renderPdf(
         case "numbered":
           numberedCounter++;
           ensureSpace(baseFontSize + 2);
-          pdf.fontSize(baseFontSize).font("Helvetica-Bold").fillColor("#2962FF")
+          pdf.fontSize(baseFontSize).font("Helvetica-Bold").fillColor(moodColor.primary)
             .text(`${numberedCounter}.`, col.x, pdf.y, { continued: false, width: 14 });
           // Go back up to same line
           pdf.y -= baseFontSize + 2;
@@ -502,6 +595,156 @@ async function renderPdf(
           if (headers.length > 0) {
             drawTable(headers, rows, col.x, col.width);
           }
+          break;
+        }
+
+        case "heading": {
+          const hLevel = (para.level as number) ?? 2;
+          const hSize = headingSizes[hLevel] ?? h2Size;
+          const hColor = headingColors[hLevel] ?? moodColor.primary;
+          ensureSpace(hSize + 6);
+          pdf.fontSize(hSize).font("Helvetica-Bold").fillColor(hColor)
+            .text(renderedContent, col.x, pdf.y, { width: col.width });
+          pdf.y += 2;
+          break;
+        }
+
+        case "bibliography": {
+          const entries = (para.entries as string[]) ?? [];
+          if (entries.length === 0) break;
+
+          const bibFontSize = Math.max(baseFontSize - 1, 6);
+          const totalH = (bibFontSize + 6) * entries.length + 20;
+          ensureSpace(totalH);
+
+          // Section header
+          pdf.save();
+          pdf.moveTo(col.x, pdf.y).lineTo(col.x + col.width, pdf.y)
+            .lineWidth(0.5).strokeColor(moodColor.primary).stroke();
+          pdf.restore();
+          pdf.y += 4;
+          pdf.fontSize(bibFontSize + 1).font("Helvetica-Bold").fillColor(moodColor.primary)
+            .text("REFERENCES", col.x, pdf.y, { width: col.width });
+          pdf.y += 4;
+
+          // Entries
+          for (const entry of entries) {
+            const rendered = renderTextWithLatexToPlainText(entry);
+            pdf.fontSize(bibFontSize).font("Helvetica").fillColor("#374151")
+              .text(rendered, col.x + 8, pdf.y, { width: col.width - 8, lineGap: 1 });
+            pdf.y += 2;
+          }
+          pdf.y += 4;
+          break;
+        }
+
+        case "checklist": {
+          const items = (para.items as Array<{ label: string; checked: boolean }>) ?? [];
+          if (items.length === 0) break;
+
+          const checkFontSize = baseFontSize;
+          ensureSpace((checkFontSize + 4) * items.length);
+
+          for (const item of items) {
+            ensureSpace(checkFontSize + 4);
+            const checkY = pdf.y;
+            const boxSize = checkFontSize - 1;
+            const boxX = col.x + 2;
+            const boxY = checkY + 1;
+
+            // Draw checkbox
+            pdf.save();
+            pdf.rect(boxX, boxY, boxSize, boxSize)
+              .lineWidth(0.75).strokeColor(moodColor.primary).stroke();
+            if (item.checked) {
+              // Draw checkmark
+              pdf.moveTo(boxX + 2, boxY + boxSize * 0.5)
+                .lineTo(boxX + boxSize * 0.4, boxY + boxSize - 2)
+                .lineTo(boxX + boxSize - 2, boxY + 2)
+                .lineWidth(1.2).strokeColor(moodColor.primary).stroke();
+            }
+            pdf.restore();
+
+            // Label
+            const labelColor = item.checked ? "#9CA3AF" : "#333333";
+            pdf.fontSize(checkFontSize).font("Helvetica").fillColor(labelColor)
+              .text(renderTextWithLatexToPlainText(item.label), col.x + boxSize + 8, checkY, {
+                width: col.width - boxSize - 8,
+                lineGap: 1,
+              });
+            pdf.y += 2;
+          }
+          pdf.y += 3;
+          break;
+        }
+
+        case "timeline": {
+          const events = (para.events as Array<{ date: string; title: string; description: string }>) ?? [];
+          if (events.length === 0) break;
+
+          const tlFontSize = baseFontSize;
+          const eventH = tlFontSize * 3 + 12;
+          ensureSpace(eventH * Math.min(events.length, 2));
+
+          const lineX = col.x + 6;
+
+          for (let ei = 0; ei < events.length; ei++) {
+            const event = events[ei]!;
+            ensureSpace(eventH);
+            const eventY = pdf.y;
+
+            // Vertical line segment
+            pdf.save();
+            const lineEnd = ei < events.length - 1 ? eventY + eventH : eventY + 8;
+            pdf.moveTo(lineX, eventY).lineTo(lineX, lineEnd)
+              .lineWidth(1.5).strokeColor(moodColor.light).stroke();
+            pdf.restore();
+
+            // Circle marker
+            pdf.save();
+            pdf.circle(lineX, eventY + 5, 4).fillColor(moodColor.primary).fill();
+            pdf.restore();
+
+            // Date label
+            const textX = lineX + 14;
+            const textW = col.width - 20;
+            pdf.fontSize(Math.max(tlFontSize - 1, 6)).font("Helvetica-Bold").fillColor(moodColor.primary)
+              .text(renderTextWithLatexToPlainText(event.date), textX, eventY, { width: textW });
+
+            // Event title
+            pdf.fontSize(tlFontSize).font("Helvetica-Bold").fillColor("#1F2937")
+              .text(renderTextWithLatexToPlainText(event.title), textX, pdf.y, { width: textW });
+
+            // Event description
+            pdf.fontSize(Math.max(tlFontSize - 0.5, 6)).font("Helvetica").fillColor("#4B5563")
+              .text(renderTextWithLatexToPlainText(event.description), textX, pdf.y, { width: textW, lineGap: 1 });
+
+            pdf.y += 6;
+          }
+          pdf.y += 3;
+          break;
+        }
+
+        case "image_placeholder": {
+          const alt = renderTextWithLatexToPlainText((para.alt as string) ?? "Image");
+          const phW = Math.min((para.width as number) ?? col.width * 0.6, col.width);
+          const phH = Math.min((para.height as number) ?? 80, 200);
+          ensureSpace(phH + 8);
+
+          const boxY = pdf.y;
+          const boxX = col.x + (col.width - phW) / 2;
+          pdf.save();
+          pdf.rect(boxX, boxY, phW, phH)
+            .lineWidth(0.75).dash(4, { space: 3 }).strokeColor("#D1D5DB").stroke();
+          pdf.restore();
+
+          // Placeholder text centered
+          pdf.fontSize(Math.max(baseFontSize - 1, 6)).font("Helvetica-Oblique").fillColor("#9CA3AF")
+            .text(`[${alt}]`, boxX + 8, boxY + phH / 2 - baseFontSize / 2, {
+              width: phW - 16,
+              align: "center",
+            });
+          pdf.y = boxY + phH + 4;
           break;
         }
       }

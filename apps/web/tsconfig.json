@@ -4,7 +4,7 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "jsx": "react-jsx",
-    "types": ["node"],
+    "types": ["node", "vite/client"],
     "baseUrl": ".",
     "paths": {
       "@stuart/shared": ["../../packages/shared/src/index.ts"]
@@ -12,4 +12,3 @@
   },
   "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "vite.config.ts"]
 }
-

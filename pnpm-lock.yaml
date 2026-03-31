@@ -181,6 +181,9 @@ importers:
       mermaid:
         specifier: ^11.4.1
         version: 11.13.0
+      pdfjs-dist:
+        specifier: ^5.5.207
+        version: 5.5.207
       react:
         specifier: ^19.0.0
         version: 19.2.4
@@ -282,6 +285,9 @@ importers:
 
   packages/runtime-supervisor:
     dependencies:
+      '@napi-rs/canvas':
+        specifier: ^0.1.97
+        version: 0.1.97
       '@resvg/resvg-js':
         specifier: ^2.6.2
         version: 2.6.2
@@ -5406,7 +5412,6 @@ snapshots:
       '@napi-rs/canvas-linux-x64-musl': 0.1.97
       '@napi-rs/canvas-win32-arm64-msvc': 0.1.97
       '@napi-rs/canvas-win32-x64-msvc': 0.1.97
-    optional: true
 
   '@npmcli/agent@3.0.0':
     dependencies:

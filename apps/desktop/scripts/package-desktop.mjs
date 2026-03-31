@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -188,7 +188,7 @@ function assertSigningReady(identity) {
       ? identity.identity
       : listSigningIdentities()
           .split("\n")
-          .map((line) => line.match(/"(.+Developer ID Application:.+)"/)?.[1] ?? null)
+          .map((line) => line.match(/"(Developer ID Application:.+)"/)?.[1] ?? null)
           .find(Boolean);
 
   if (!signTarget) {
@@ -312,7 +312,24 @@ const packagedAppPath = join(releaseDir, "mac-arm64", "Stuart.app");
 verifyApp(packagedAppPath);
 
 if (mode === "mac") {
-  verifyDmg(findReleaseArtifact(".dmg"));
+  // electron-builder's DMG sometimes comes out empty. Rebuild it from the
+  // verified .app using hdiutil directly as a reliable fallback.
+  const dmgPath = findReleaseArtifact(".dmg");
+  try {
+    verifyDmg(dmgPath);
+  } catch (dmgError) {
+    process.stdout.write(`electron-builder DMG verification failed (${dmgError.message}). Rebuilding DMG from .app...\n`);
+    try { unlinkSync(dmgPath); } catch { /* ignore */ }
+    run("hdiutil", [
+      "create",
+      "-volname", "Stuart",
+      "-srcfolder", packagedAppPath,
+      "-ov",
+      "-format", "UDZO",
+      dmgPath,
+    ]);
+    verifyDmg(dmgPath);
+  }
 }
 
 process.stdout.write(`Packaging finished successfully.\n`);

@@ -16,6 +16,7 @@ import type {
   CreateStudentMemoryInput,
   CreateTaskInput,
   CreateWorkerInput,
+  UpdateProjectInput,
   IngestionDocumentRecord,
   IngestionIndexStats,
   IngestionSearchResult,
@@ -34,7 +35,8 @@ import type {
   TaskSpec,
   TaskWorkerRecord,
   TopicPerformanceRecord,
-  UpdateTaskInput
+  UpdateTaskInput,
+  WorkspaceConfig
 } from "@stuart/shared";
 import {
   DEFAULT_GLOBAL_INSTRUCTION_PROFILE,
@@ -329,6 +331,13 @@ export class LocalDatabase {
       // Column already exists — safe to ignore
     }
 
+    // Workspace onboarding config on projects
+    try {
+      this.db.exec("ALTER TABLE projects ADD COLUMN config_json TEXT");
+    } catch {
+      // Column already exists — safe to ignore
+    }
+
     // Student memory table for cross-session structured memory
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS student_memories (
@@ -471,15 +480,19 @@ export class LocalDatabase {
   }
 
   listProjects(): ProjectRecord[] {
-    return asRows<ProjectRecord>(
+    const rows = asRows<ProjectRecord & { configJson?: string }>(
       this.db
       .prepare(
-        `SELECT id, name, root_path as rootPath, created_at as createdAt, updated_at as updatedAt
+        `SELECT id, name, root_path as rootPath, config_json as configJson, created_at as createdAt, updated_at as updatedAt
          FROM projects
          ORDER BY updated_at DESC`
       )
       .all()
     );
+    return rows.map(({ configJson, ...rest }) => ({
+      ...rest,
+      config: configJson ? JSON.parse(configJson) as WorkspaceConfig : undefined
+    }));
   }
 
   createProject(input: CreateProjectInput): ProjectRecord {
@@ -488,20 +501,22 @@ export class LocalDatabase {
       id: randomUUID(),
       name: input.name,
       rootPath: input.rootPath,
+      config: input.config,
       createdAt: now,
       updatedAt: now
     };
 
     this.db
       .prepare(
-        `INSERT INTO projects (id, name, root_path, created_at, updated_at)
-         VALUES (@id, @name, @rootPath, @createdAt, @updatedAt)`
+        `INSERT INTO projects (id, name, root_path, config_json, created_at, updated_at)
+         VALUES (@id, @name, @rootPath, @configJson, @createdAt, @updatedAt)`
       )
       .run(
         asSqlParams({
           id: record.id,
           name: record.name,
           rootPath: record.rootPath,
+          configJson: record.config ? JSON.stringify(record.config) : null,
           createdAt: record.createdAt,
           updatedAt: record.updatedAt
         })
@@ -511,13 +526,19 @@ export class LocalDatabase {
   }
 
   getProject(projectId: string): ProjectRecord | undefined {
-    return this.db
+    const row = this.db
       .prepare(
-        `SELECT id, name, root_path as rootPath, created_at as createdAt, updated_at as updatedAt
+        `SELECT id, name, root_path as rootPath, config_json as configJson, created_at as createdAt, updated_at as updatedAt
          FROM projects
          WHERE id = ?`
       )
-      .get(projectId) as ProjectRecord | undefined;
+      .get(projectId) as (ProjectRecord & { configJson?: string }) | undefined;
+    if (!row) return undefined;
+    const { configJson, ...rest } = row;
+    return {
+      ...rest,
+      config: configJson ? JSON.parse(configJson) as WorkspaceConfig : undefined
+    };
   }
 
   listTasks(): TaskSpec[] {
@@ -925,6 +946,39 @@ export class LocalDatabase {
   deleteProject(projectId: string): boolean {
     const result = this.db.prepare(`DELETE FROM projects WHERE id = ?`).run(projectId);
     return Number(result.changes ?? 0) > 0;
+  }
+
+  updateProject(projectId: string, input: UpdateProjectInput): ProjectRecord {
+    const current = this.getProject(projectId);
+    if (!current) {
+      throw new Error(`Project ${projectId} not found.`);
+    }
+
+    const now = new Date().toISOString();
+    const updatedName = input.name ?? current.name;
+    const updatedConfig = input.config !== undefined ? input.config : current.config;
+
+    this.db
+      .prepare(
+        `UPDATE projects
+         SET name = @name,
+             config_json = @configJson,
+             updated_at = @updatedAt
+         WHERE id = @id`
+      )
+      .run(asSqlParams({
+        id: projectId,
+        name: updatedName,
+        configJson: updatedConfig ? JSON.stringify(updatedConfig) : null,
+        updatedAt: now
+      }));
+
+    return {
+      ...current,
+      name: updatedName,
+      config: updatedConfig,
+      updatedAt: now
+    };
   }
 
   listTaskMessages(taskId: string): TaskMessageRecord[] {
@@ -1604,6 +1658,7 @@ export class LocalDatabase {
     options?: {
       taskRunId?: string;
       limit?: number;
+      source?: string;
     }
   ): IngestionSearchResult[] {
     const queries = buildFtsQueries(query);
@@ -1613,6 +1668,8 @@ export class LocalDatabase {
 
     const scopeKey = buildIngestionScopeKey(taskId, options?.taskRunId);
     const limit = options?.limit ?? 8;
+    const sourceFilter = options?.source?.trim();
+    const sourceMatch = sourceFilter ? buildSourcePathMatch(sourceFilter) : null;
     const searchStatement = this.db.prepare(
       `SELECT
         chunk_id as chunkId,
@@ -1628,14 +1685,25 @@ export class LocalDatabase {
         snippet(ingestion_chunks, 10, '', '', ' ... ', 20) as snippet,
         bm25(ingestion_chunks) as score
        FROM ingestion_chunks
-       WHERE ingestion_chunks MATCH ? AND scope_key = ?
+       WHERE ingestion_chunks MATCH ? AND scope_key = ?${
+         sourceMatch ? " AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ?)" : ""
+       }
        ORDER BY score ASC
        LIMIT ?`
     );
 
     const merged = new Map<string, IngestionSearchResult>();
     const strictResults = asRows<IngestionSearchResult>(
-      searchStatement.all(queries.strict, scopeKey, limit)
+      sourceMatch
+        ? searchStatement.all(
+            queries.strict,
+            scopeKey,
+            sourceMatch.exact,
+            sourceMatch.stripped,
+            sourceMatch.suffixLike,
+            limit
+          )
+        : searchStatement.all(queries.strict, scopeKey, limit)
     );
     for (const result of strictResults) {
       merged.set(result.chunkId, result);
@@ -1643,7 +1711,16 @@ export class LocalDatabase {
 
     if (merged.size < limit && queries.broad !== queries.strict) {
       const broadResults = asRows<IngestionSearchResult>(
-        searchStatement.all(queries.broad, scopeKey, Math.max(limit * 3, limit))
+        sourceMatch
+          ? searchStatement.all(
+              queries.broad,
+              scopeKey,
+              sourceMatch.exact,
+              sourceMatch.stripped,
+              sourceMatch.suffixLike,
+              Math.max(limit * 3, limit)
+            )
+          : searchStatement.all(queries.broad, scopeKey, Math.max(limit * 3, limit))
       );
       for (const result of broadResults) {
         if (merged.has(result.chunkId)) {
@@ -1657,6 +1734,37 @@ export class LocalDatabase {
     }
 
     return [...merged.values()].slice(0, limit);
+  }
+
+  getChunksBySource(
+    taskId: string,
+    relativePath: string,
+    options?: { taskRunId?: string; limit?: number }
+  ): IngestionSearchResult[] {
+    const scopeKey = buildIngestionScopeKey(taskId, options?.taskRunId);
+    const limit = options?.limit ?? 5;
+    const sourceMatch = buildSourcePathMatch(relativePath);
+    return asRows<IngestionSearchResult>(
+      this.db.prepare(
+        `SELECT
+          chunk_id as chunkId,
+          document_id as documentId,
+          task_id as taskId,
+          task_run_id as taskRunId,
+          source_path as sourcePath,
+          relative_path as relativePath,
+          file_type as fileType,
+          heading,
+          locator,
+          text,
+          '' as snippet,
+          0 as score
+         FROM ingestion_chunks
+         WHERE scope_key = ? AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ?)
+         ORDER BY CAST(REPLACE(REPLACE(locator, 'page ', ''), 'chunk ', '') AS INTEGER) ASC
+         LIMIT ?`
+      ).all(scopeKey, sourceMatch.exact, sourceMatch.stripped, sourceMatch.suffixLike, limit)
+    );
   }
 
   createStudyArtifact(input: {
@@ -3499,6 +3607,20 @@ function asSqlParams(
       typeof current === "boolean" ? Number(current) : current ?? null
     ])
   ) as Record<string, SQLInputValue>;
+}
+
+function buildSourcePathMatch(value: string): {
+  exact: string;
+  stripped: string;
+  suffixLike: string;
+} {
+  const exact = value.trim().replace(/\\/g, "/").replace(/[?#].*$/, "").replace(/^file:\/\//, "");
+  const stripped = exact.replace(/^\.?\//, "");
+  return {
+    exact,
+    stripped,
+    suffixLike: `%/${stripped}`,
+  };
 }
 
 function buildIngestionScopeKey(taskId: string, taskRunId?: string): string {

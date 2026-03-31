@@ -7,6 +7,7 @@ import type {
   CreateProjectInput,
   CreateTaskInput,
   CreateWorkerInput,
+  UpdateProjectInput,
   IngestionDocumentRecord,
   IngestionIndexStats,
   IngestionSearchResult,
@@ -220,6 +221,17 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     response.status(201).json(project);
   });
 
+  router.patch("/projects/:projectId", (request, response) => {
+    const input = request.body as UpdateProjectInput;
+    try {
+      const project = runtime.updateProject(firstParam(request.params.projectId), input);
+      broadcastEvent(eventClients, { type: "project.updated", projectId: project.id });
+      response.json(project);
+    } catch (err) {
+      response.status(404).send((err as Error).message);
+    }
+  });
+
   router.delete("/projects/:projectId", asyncRoute(async (request, response) => {
     const deleted = await runtime.deleteProject(firstParam(request.params.projectId));
     if (!deleted) {
@@ -358,13 +370,33 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
   router.get("/tasks/:taskId/ingestion/search", (request, response) => {
     const taskId = firstParam(request.params.taskId);
     const query = typeof request.query.q === "string" ? request.query.q : "";
+    const source = typeof request.query.source === "string" ? request.query.source : undefined;
     const taskRunId =
       typeof request.query.taskRunId === "string" ? request.query.taskRunId : undefined;
     const limit = typeof request.query.limit === "string" ? Number(request.query.limit) : 8;
     response.json(
       runtime.searchIngestionIndex(taskId, query, {
+        source,
         taskRunId,
         limit: Number.isFinite(limit) && limit > 0 ? limit : 8
+      }) satisfies IngestionSearchResult[]
+    );
+  });
+
+  router.get("/tasks/:taskId/ingestion/chunks", (request, response) => {
+    const taskId = firstParam(request.params.taskId);
+    const source = typeof request.query.source === "string" ? request.query.source : "";
+    const taskRunId =
+      typeof request.query.taskRunId === "string" ? request.query.taskRunId : undefined;
+    const limit = typeof request.query.limit === "string" ? Number(request.query.limit) : 5;
+    if (!source) {
+      response.json([]);
+      return;
+    }
+    response.json(
+      runtime.getChunksBySource(taskId, source, {
+        taskRunId,
+        limit: Number.isFinite(limit) && limit > 0 ? limit : 5
       }) satisfies IngestionSearchResult[]
     );
   });

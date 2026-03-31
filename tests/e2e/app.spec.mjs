@@ -1,12 +1,18 @@
 import path from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
+import { LocalDatabase } from "../../packages/db/dist/index.js";
+import { renderDocument } from "../../packages/runtime-supervisor/dist/index.js";
 
 const apiOrigin = process.env.STUART_E2E_API_ORIGIN ?? "http://127.0.0.1:8877";
 const fixtureWorkspacePath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "fixtures/study-workspace",
 );
+const e2eDataDir = path.resolve(process.cwd(), ".stuart-data-e2e");
+const cleanupPaths = [];
 
 async function json(request, method, url, body) {
   const response = await request.fetch(`${apiOrigin}${url}`, {
@@ -51,9 +57,10 @@ async function resetHarnessState(request) {
 
 async function seedStudySession(request, overrides = {}) {
   const suffix = Math.random().toString(36).slice(2, 8);
+  const workspacePath = overrides.workspacePath ?? fixtureWorkspacePath;
   const project = await json(request, "POST", "/api/projects", {
     name: overrides.projectName ?? `Study Workspace ${suffix}`,
-    rootPath: fixtureWorkspacePath,
+    rootPath: workspacePath,
   });
 
   const task = await json(request, "POST", "/api/tasks", {
@@ -65,7 +72,7 @@ async function seedStudySession(request, overrides = {}) {
     attachments: [
       {
         id: `attachment-${suffix}`,
-        hostPath: fixtureWorkspacePath,
+        hostPath: workspacePath,
         mode: "reference",
       },
     ],
@@ -80,12 +87,74 @@ async function createStudyArtifact(request, taskId, artifact) {
   return json(request, "POST", `/api/tasks/${taskId}/study-artifacts`, artifact);
 }
 
+async function buildGeneratedWorkspace() {
+  const workspacePath = await mkdtemp(path.join(tmpdir(), "stuart-e2e-workspace-"));
+  cleanupPaths.push(workspacePath);
+
+  await renderDocument("document_pdf", {
+    metadata: {
+      subject: "Lecture 02 - Breadth First Search",
+      author: "Stuart",
+    },
+    sections: [
+      {
+        heading: "Breadth-First Search",
+        level: 1,
+        paragraphs: [
+          { type: "text", content: "Breadth-first search uses a FIFO queue as its frontier data structure." },
+          { type: "text", content: "It expands nodes in layers of increasing depth." },
+        ],
+      },
+    ],
+  }, workspacePath, "Lecture 02 - Breadth First Search");
+
+  await renderDocument("document_pptx", {
+    presentation: {
+      slides: [
+        {
+          layout: "title",
+          title: "Breadth-First Search",
+          subtitle: "Queue-based frontier expansion",
+        },
+        {
+          layout: "content",
+          title: "Frontier behavior",
+          bullets: [
+            "Breadth-first search uses a FIFO queue.",
+            "Nodes are expanded in layers of increasing depth.",
+          ],
+        },
+      ],
+    },
+  }, workspacePath, "Lecture 03 - Search Deck");
+
+  return workspacePath;
+}
+
+async function buildIngestion(request, taskId) {
+  await json(request, "POST", `/api/tasks/${taskId}/ingestion/build`, {});
+}
+
+function seedAssistantMessage(taskId, content) {
+  const db = new LocalDatabase(path.join(e2eDataDir, "stuart.sqlite"));
+  try {
+    db.createTaskMessage({
+      taskId,
+      role: "assistant",
+      content,
+    });
+  } finally {
+    db.close();
+  }
+}
+
 test.beforeEach(async ({ request }) => {
   await resetHarnessState(request);
 });
 
 test.afterEach(async ({ request }) => {
   await resetHarnessState(request);
+  await Promise.all(cleanupPaths.splice(0).map((target) => rm(target, { recursive: true, force: true })));
 });
 
 test("seeded workspace renders as a current study session", async ({ page, request }) => {
@@ -203,4 +272,74 @@ test("quiz artifact scaffold opens and supports answer checking", async ({ page,
   await page.getByRole("button", { name: "Check", exact: true }).click();
   await expect(page.getByText("Correct!")).toBeVisible();
   await expect(page.getByRole("button", { name: "See Results" })).toBeVisible();
+});
+
+test("pdf citations resolve excerpts and open a pdf-backed source preview", async ({ page, request }) => {
+  const workspacePath = await buildGeneratedWorkspace();
+  const { task } = await seedStudySession(request, {
+    projectName: "Search Notes",
+    taskTitle: "Study: BFS",
+    workspacePath,
+  });
+
+  await buildIngestion(request, task.id);
+  seedAssistantMessage(
+    task.id,
+    "Breadth-first search uses a FIFO queue as its frontier data structure [Lecture 2](Lecture 02 - Breadth First Search.pdf).",
+  );
+
+  await page.goto("/");
+
+  const citation = page.locator(".citation-pill.clickable", { hasText: "Lecture 2" }).first();
+  await expect(citation).toBeVisible();
+  await citation.click();
+
+  await expect(page.locator(".citation-popover-empty")).toHaveCount(0);
+  await expect(page.locator(".citation-popover-chunk")).toHaveCount(1);
+
+  await page.getByRole("button", { name: "Open source" }).click();
+  const iframe = page.locator(".workspace-preview-iframe");
+  await expect(iframe).toBeVisible();
+  await expect(iframe).toHaveAttribute("src", /workspace-files\/.+\/preview/);
+  await expect(iframe).toHaveAttribute("src", /#page=1$/);
+});
+
+test("pptx citations open an actual preview route instead of the unsupported placeholder", async ({ page, request }) => {
+  const workspacePath = await buildGeneratedWorkspace();
+  const { task } = await seedStudySession(request, {
+    projectName: "Search Slides",
+    taskTitle: "Study: BFS Slides",
+    workspacePath,
+  });
+
+  await buildIngestion(request, task.id);
+  seedAssistantMessage(
+    task.id,
+    "The slide deck also states that breadth-first search uses a FIFO queue [Lecture 3](Lecture 03 - Search Deck.pptx).",
+  );
+
+  await page.goto("/");
+
+  const citation = page.locator(".citation-pill.clickable", { hasText: "Lecture 3" }).first();
+  await expect(citation).toBeVisible();
+  await citation.click();
+
+  await expect(page.locator(".citation-popover-empty")).toHaveCount(0);
+  await page.getByRole("button", { name: "Open source" }).first().click();
+
+  const iframe = page.locator(".workspace-preview-iframe");
+  await expect(iframe).toBeVisible();
+  const src = await iframe.getAttribute("src");
+  expect(src).toContain("/workspace-files/");
+
+  const response = await request.fetch(src.startsWith("http") ? src : `${apiOrigin}${src}`);
+  expect(response.ok()).toBe(true);
+  const contentType = response.headers()["content-type"] ?? "";
+  expect(contentType === "" ? false : /application\/pdf|text\/html/i.test(contentType)).toBe(true);
+
+  if (contentType.includes("text/html")) {
+    const body = await response.text();
+    expect(body).not.toContain("This file type does not have an inline preview yet.");
+    expect(body).not.toContain("No readable slide text was found in this deck.");
+  }
 });

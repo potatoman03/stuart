@@ -1,8 +1,8 @@
-## Interaction and visual quality
+## Visual and interaction quality
 
-- Lead with one clear explorable idea.
-- Show state transitions, not just a static diagram.
-- Controls should be obvious and minimal.
-- Use labels that sound like the course language, not framework jargon.
-- Default view should be informative without requiring clicks.
-- Avoid decorative UI that crowds out the concept being taught.
+- Lead with one clear explorable idea — don't bury it behind setup.
+- Show state transitions, not static diagrams. If something changes, animate the change.
+- Controls should be obvious and minimal. Labels should make sense to the student, not to a developer.
+- Use SVG or Canvas for graphs, trees, and diagrams — not just styled divs.
+- Prefer smooth transitions (300–500ms, ease-out) over instant swaps.
+- Touch targets and click targets should be generous. Hover states on everything clickable.

@@ -4,6 +4,7 @@ export type SkillWorkerPlan = {
   role: string;
   label: string;
   objective: string;
+  model?: string;
 };
 
 function hasSkill(skills: Skill[], ...ids: string[]) {
@@ -14,27 +15,30 @@ export function buildSkillWorkerPlans(question: string, skills: Skill[]): SkillW
   const plans: SkillWorkerPlan[] = [];
 
   if (hasSkill(skills, "interactive")) {
-    plans.push(
-      {
-        role: "concept-grounder",
-        label: "Grounding interactive concept",
-        objective: [
-          `Review the workspace materials for this interactive request: "${question}".`,
-          "Extract the exact concepts, rules, equations, constraints, and worked examples that the final artifact must preserve.",
-          "Write a concise grounded brief to `.stuart/worker-briefs/interactive-grounding.md` with source names and locators.",
-          "Do not design UI yet; focus on subject accuracy and evidence."
-        ].join(" "),
-      },
-      {
-        role: "interaction-designer",
-        label: "Planning interaction model",
-        objective: [
-          `Plan the interaction model for this requested study artifact: "${question}".`,
-          "Define the controls, state transitions, failure cases, and what the student should be able to explore.",
-          "Write the plan to `.stuart/worker-briefs/interactive-design.md` as a compact build brief the main agent can follow."
-        ].join(" "),
-      }
-    );
+    const isStudyGrounded = /\b(from|using|based on|about|explain|teach|concept|lecture|chapter|topic)\b/i.test(question);
+    if (isStudyGrounded) {
+      plans.push(
+        {
+          role: "concept-grounder",
+          label: "Grounding interactive concept",
+          objective: [
+            `Review the workspace materials for this interactive request: "${question}".`,
+            "Extract the exact concepts, rules, equations, constraints, and worked examples that the final artifact must preserve.",
+            "Write a concise grounded brief to `.stuart/worker-briefs/interactive-grounding.md` with source names and locators.",
+            "Do not design UI yet; focus on subject accuracy and evidence."
+          ].join(" "),
+        },
+        {
+          role: "interaction-designer",
+          label: "Planning interaction model",
+          objective: [
+            `Plan the interaction model for this requested study artifact: "${question}".`,
+            "Define the controls, state transitions, failure cases, and what the student should be able to explore.",
+            "Write the plan to `.stuart/worker-briefs/interactive-design.md` as a compact build brief the main agent can follow."
+          ].join(" "),
+        }
+      );
+    }
   }
 
   if (hasSkill(skills, "study-doc")) {
@@ -64,20 +68,32 @@ export function buildSkillWorkerPlans(question: string, skills: Skill[]): SkillW
     plans.push(
       {
         role: "deck-planner",
-        label: "Planning slide deck",
+        label: "Planning presentation structure",
+        model: "gpt-5.4-nano",
         objective: [
-          `Plan a presentation deck for this request: "${question}".`,
-          "Create a slide-by-slide brief with title, layout, key points, and evidence expectations.",
-          "Write the deck brief to `.stuart/worker-briefs/pptx-deck-plan.md`."
+          `Plan the deck structure for this presentation request: "${question}".`,
+          "Determine the number of slides, the type of each slide (cover, toc, section_divider, content, summary), key messages per slide, and visual flow.",
+          "Write the plan to `.stuart/worker-briefs/pptx-deck-plan.md`."
         ].join(" "),
       },
       {
-        role: "slide-curator",
-        label: "Curating slide evidence",
+        role: "content-researcher",
+        label: "Gathering slide content from materials",
+        model: "gpt-5.4-nano",
         objective: [
-          `Find the strongest visual and factual evidence for this presentation request: "${question}".`,
-          "Map source-backed material to the slide plan and identify which slides need comparisons, tables, or diagrams.",
-          "Write the source mapping to `.stuart/worker-briefs/pptx-slide-briefs.md`."
+          `Search workspace materials for key facts, quotes, data points, and examples relevant to this presentation request: "${question}".`,
+          "Extract and organize these into slide-ready content briefs with source references and locators.",
+          "Write to `.stuart/worker-briefs/pptx-content-brief.md`."
+        ].join(" "),
+      },
+      {
+        role: "design-advisor",
+        label: "Choosing presentation design",
+        model: "gpt-5.4-nano",
+        objective: [
+          `Based on the topic and audience for this presentation request: "${question}",`,
+          "recommend a color palette (primary, secondary, accent colors), font pairing, and visual style.",
+          "Write to `.stuart/worker-briefs/pptx-design-brief.md`."
         ].join(" "),
       }
     );

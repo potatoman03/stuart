@@ -28,11 +28,93 @@ export type DocumentArtifactRenderResult = {
   officeSummary?: OfficePackageSummary;
 };
 
+export type UploadedPptxPreviewSlide = {
+  slideNumber: number;
+  paragraphs: string[];
+  notes: string[];
+};
+
 const OFFICE_ENTRYPOINTS: Record<string, string> = {
   document_docx: "word/document.xml",
   document_xlsx: "xl/workbook.xml",
   document_pptx: "ppt/presentation.xml",
 };
+
+const PPTX_PARAGRAPH_PATTERN = /<a:p\b[\s\S]*?<\/a:p>/g;
+const PPTX_TEXT_RUN_PATTERN = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g;
+
+function decodeXmlText(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_match, decimal: string) => String.fromCodePoint(Number(decimal)));
+}
+
+function normalizePreviewText(value: string): string {
+  return decodeXmlText(value)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function extractPptxParagraphsFromXml(xml: string): string[] {
+  const paragraphs = [...xml.matchAll(PPTX_PARAGRAPH_PATTERN)]
+    .map((match) =>
+      normalizePreviewText(
+        [...match[0].matchAll(PPTX_TEXT_RUN_PATTERN)]
+          .map((textMatch) => decodeXmlText(textMatch[1] ?? ""))
+          .join("")
+      )
+    )
+    .filter(Boolean);
+
+  if (paragraphs.length > 0) {
+    return paragraphs;
+  }
+
+  return [...xml.matchAll(PPTX_TEXT_RUN_PATTERN)]
+    .map((match) => normalizePreviewText(match[1] ?? ""))
+    .filter(Boolean);
+}
+
+export async function extractUploadedPptxPreviewSlides(filePath: string): Promise<UploadedPptxPreviewSlide[]> {
+  const buffer = await readFile(filePath);
+  const archive = await JSZip.loadAsync(buffer);
+  const slideEntries = Object.keys(archive.files)
+    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+
+  const slides: UploadedPptxPreviewSlide[] = [];
+  for (const slideEntry of slideEntries) {
+    const slideNumber = Number(slideEntry.match(/slide(\d+)\.xml/i)?.[1] ?? "0");
+    if (!slideNumber) {
+      continue;
+    }
+
+    const slideXml = await archive.file(slideEntry)?.async("string");
+    if (!slideXml) {
+      continue;
+    }
+
+    const notesXml = await archive.file(`ppt/notesSlides/notesSlide${slideNumber}.xml`)?.async("string");
+    const paragraphs = extractPptxParagraphsFromXml(slideXml);
+    const notes = notesXml ? extractPptxParagraphsFromXml(notesXml) : [];
+    if (paragraphs.length === 0 && notes.length === 0) {
+      continue;
+    }
+
+    slides.push({
+      slideNumber,
+      paragraphs,
+      notes,
+    });
+  }
+
+  return slides;
+}
 
 export async function validateOfficePackage(
   filePath: string,
@@ -246,7 +328,7 @@ async function renderPresentationPayloadAsHtml(presentation: PptxPresentationPay
     let body = "";
     switch (slide.layout) {
       case "content":
-        body = `<ul>${(await Promise.all(slide.bullets.map(async (bullet) => `<li>${await renderTextWithLatexToSvgHtml(bullet)}</li>`))).join("")}</ul>`;
+        body = `<ul>${(await Promise.all((slide.bullets ?? []).map(async (bullet) => `<li>${await renderTextWithLatexToSvgHtml(bullet)}</li>`))).join("")}</ul>`;
         break;
       case "two_column":
         body = `<div class="two-col"><div><ul>${(await Promise.all(slide.left.map(async (item) => `<li>${await renderTextWithLatexToSvgHtml(item)}</li>`))).join("")}</ul></div><div><ul>${(await Promise.all(slide.right.map(async (item) => `<li>${await renderTextWithLatexToSvgHtml(item)}</li>`))).join("")}</ul></div></div>`;

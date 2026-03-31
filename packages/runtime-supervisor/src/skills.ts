@@ -14,11 +14,15 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadSkillAsset(relativePath: string): string {
-  // In dev, skills are in src/skills/; in dist, they're copied alongside
-  // Try multiple paths to be resilient
+  // In dev, skills are in src/skills/; in dist, they're copied alongside.
+  // In packaged Electron with ELECTRON_RUN_AS_NODE=1, asar patching is
+  // disabled so we also check the .asar.unpacked mirror path.
   const candidates = [
     join(__dirname, "skills", relativePath),
     join(__dirname, "..", "src", "skills", relativePath),
+    // Electron asar.unpacked: __dirname may contain "app.asar" — replace with "app.asar.unpacked"
+    join(__dirname.replace(/app\.asar(?![.])/g, "app.asar.unpacked"), "skills", relativePath),
+    join(__dirname.replace(/app\.asar(?![.])/g, "app.asar.unpacked"), "..", "src", "skills", relativePath),
   ];
   for (const path of candidates) {
     try {
@@ -27,7 +31,7 @@ function loadSkillAsset(relativePath: string): string {
       continue;
     }
   }
-  process.stderr.write(`[stuart] failed to load skill asset: ${relativePath}\n`);
+  process.stderr.write(`[stuart] failed to load skill asset: ${relativePath} (tried ${candidates.join(", ")})\n`);
   return "";
 }
 
@@ -264,6 +268,15 @@ export const STUDY_SKILLS: Skill[] = [
     priority: 40,
   },
   {
+    id: "vision-analysis",
+    match: (message) =>
+      /\b(analy[sz]e|describe|explain|extract|read|interpret|look at|review)\b.*\b(image|chart|graph|diagram|figure|plot|screenshot|photo|picture|slide|table)\b/i.test(message) ||
+      /\b(what does|what is|tell me about)\b.*\b(chart|graph|diagram|figure|plot|image|screenshot)\b/i.test(message) ||
+      /\b(chart|graph|diagram|figure)\b.*\b(show|mean|represent|display|illustrate)\b/i.test(message),
+    prompt: loadSkillAsset("vision-analysis.md"),
+    priority: 45,
+  },
+  {
     id: "flashcards",
     match: (message) =>
       artifactRequest(message, /\b(flashcard|flash card|study card|review card|cloze|fill[- ]in[- ]the[- ]blank|anki)s?\b/i)
@@ -324,10 +337,10 @@ export const STUDY_SKILLS: Skill[] = [
   {
     id: "interactive",
     match: (message) =>
-      artifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
-      politeArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
-      terseArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i) ||
-      /\b(build|make|create)\b.*\b(interactive|simulator?|simulation|visuali[sz]er?|playground)\b/i.test(message),
+      artifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget|app|tool|calculator|game|demo|dashboard|component)\b/i) ||
+      politeArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget|app|tool|calculator|game|demo|dashboard|component)\b/i) ||
+      terseArtifactRequest(message, /\b(interactive|visuali[sz]er?|simulator?|simulation|explorable|playground|widget|app|tool|calculator|game|demo|dashboard|component)\b/i) ||
+      /\b(build|make|create)\b.*\b(interactive|simulator?|simulation|visuali[sz]er?|playground|app|tool|calculator|game|demo|dashboard|component)\b/i.test(message),
     buildPrompt: (message) => loadBundledSkillPrompt("interactive", message),
     bundleDir: "interactive",
     priority: 90,

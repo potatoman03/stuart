@@ -34,6 +34,7 @@ import type {
   TaskRunRecord,
   TaskSpec,
   TaskWorkerRecord,
+  UpdateProjectInput,
   UpdateTaskInput,
   VmStatus
 } from "@stuart/shared";
@@ -55,6 +56,11 @@ import {
 } from "./diagnostics.js";
 
 export { renderDocument } from "./document-renderer.js";
+export {
+  extractPptxParagraphsFromXml,
+  extractUploadedPptxPreviewSlides,
+  type UploadedPptxPreviewSlide
+} from "./document-pipeline.js";
 export {
   collectSystemDiagnostics,
   ensureLocalEnvFile,
@@ -472,6 +478,10 @@ export class StuartRuntime {
 
   createProject(input: CreateProjectInput) {
     return this.db.createProject(input);
+  }
+
+  updateProject(projectId: string, input: UpdateProjectInput) {
+    return this.db.updateProject(projectId, input);
   }
 
   async deleteProject(projectId: string): Promise<boolean> {
@@ -1221,9 +1231,17 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
   searchIngestionIndex(
     taskId: string,
     query: string,
-    options?: { taskRunId?: string; limit?: number }
+    options?: { taskRunId?: string; limit?: number; source?: string }
   ): IngestionSearchResult[] {
     return this.db.searchIngestionChunks(taskId, query, options);
+  }
+
+  getChunksBySource(
+    taskId: string,
+    relativePath: string,
+    options?: { taskRunId?: string; limit?: number }
+  ): IngestionSearchResult[] {
+    return this.db.getChunksBySource(taskId, relativePath, options);
   }
 
   async buildTaskIngestionIndex(
@@ -3046,7 +3064,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       /\b(visuali[sz]er?|simulator?|simulation|explorable|playground|widget)\b/i.test(message);
     const contextPreamble = isArtifactTurn
       ? "Local retrieved context from the staged workspace. Use these excerpts to determine the exact concepts, labels, rules, examples, and terminology that should appear in the artifact you build. Ground the artifact in this material, and if you need more detail on a specific section, use grep/cat to read the full file. Do not just summarize these excerpts back to the student."
-      : "Local retrieved context from the staged workspace. Use these excerpts as your primary source material. Cite source names when relying on them. If you need more detail on a specific section, use grep/cat to read the full file.";
+      : "Local retrieved context from the staged workspace. Use these excerpts as your PRIMARY source of truth for course-specific claims. You MUST cite sources using **【source name】** for every factual claim derived from these excerpts. Do not state facts from the workspace without citing which source they came from. If the excerpts do not contain the answer, say so — do not fill gaps with plausible-sounding information. If you need more detail on a specific section, use grep/cat to read the full file.";
 
     // Use full chunk text (not snippets) for richer context — truncate only very long chunks
     return [
@@ -3492,7 +3510,15 @@ function buildDeveloperInstructions(task: TaskSpec): string {
     "When present, use `.stuart/skill-assets/<skill-id>/` for skill templates or helper scripts and `.stuart/worker-briefs/` for worker-produced build notes.",
     "Read and write files only inside the staged workspace. Editable and output changes stay staged until the host apply step reviews them.",
     scopeSummary,
-    browserSummary
+    browserSummary,
+    "\n\n## Image and visual analysis\n\n" +
+    "When the student asks about a chart, diagram, graph, or image from their study materials:\n" +
+    "- You have access to the workspace files. Use cat or read commands to examine image files directly.\n" +
+    "- For charts and graphs: describe the data trends, extract approximate values, identify axes and labels.\n" +
+    "- For diagrams: describe the structure, identify components and relationships.\n" +
+    "- For screenshots of slides: extract the key content and any text visible.\n" +
+    "- When describing visual content, be specific about what you observe rather than guessing.\n" +
+    "- If OCR text is available in the ingestion index for an image, use it as a starting point but add visual analysis."
   ].join(" ");
 }
 
@@ -3657,6 +3683,18 @@ function buildArtifactTurnContract(skills: Skill[]): string {
   return lines.join("\n");
 }
 
+function buildWorkspaceConfigContext(project: ProjectRecord): string {
+  const cfg = project.config;
+  if (!cfg) return "";
+  const lines: string[] = [];
+  if (cfg.subject) lines.push(`- Subject: ${cfg.subject}`);
+  if (cfg.teachingStyle) lines.push(`- Teaching style preference: ${cfg.teachingStyle}`);
+  if (cfg.goal) lines.push(`- Goal: ${cfg.goal}`);
+  if (cfg.additionalNotes) lines.push(`- Additional notes: ${cfg.additionalNotes}`);
+  if (lines.length === 0) return "";
+  return `\n\n## Workspace context\n${lines.join("\n")}`;
+}
+
 export function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec, db?: LocalDatabase): string {
   // Build structured student memory context from SQLite
   const memoryContext = buildStudentMemoryContext(db, task.projectId);
@@ -3710,11 +3748,21 @@ export function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec
 - Use your domain expertise to enrich and improve on what the workspace materials provide — add better examples, clearer explanations, and deeper context.
 - When your knowledge conflicts with the workspace evidence, default to the workspace evidence. The student's course materials are the authority for course-specific claims.
 - Diagnose what the student is probably trying to understand, not just the literal wording of the question.
-- If neither the workspace nor your domain knowledge covers the question, say so honestly.
+- If neither the workspace nor your domain knowledge covers the question, say so honestly. Never fill gaps with plausible-sounding content that you are not confident about.
 - When citing a source file, use the format **【short name】** with bold lenticular brackets — e.g. **【CA2 Instructions】**, **【L3 - Process Scheduling】**, **【Guide to Readings】**. Use a short, clean display name: strip folder paths, course codes, dates, and file extensions. Never include the full file path. Never use markdown link syntax like [text](path) for file references.
 - Synthesize concepts clearly instead of listing files or pasting raw excerpts. When summarising what files cover a topic, list them compactly: **【L3】** **【L4】** **【L5】**, not a run-on chain of linked paths.
 - When the student references a specific chapter, lecture, week, or worksheet, search for matching filenames first (e.g. "Lecture 01", "Chapter 1") before exploring broadly.
 - If the question is broad, give the student the clean mental model first, then the most important supporting details.
+
+## Accuracy and grounding (CRITICAL)
+- NEVER fabricate facts, definitions, formulas, dates, case names, or statistics. If you are not confident, say so.
+- For course-specific content (definitions, rules, formulas, examples from lectures/assignments), ALWAYS cite which source the information comes from using **【source name】**.
+- Distinguish clearly between what the workspace says and what is your general domain knowledge. Prefix general knowledge with phrases like "Generally in this field..." or "Outside your course materials...".
+- If the student asks about something specific (e.g. "what does lecture 5 say about X") and you cannot find it in the retrieved context, tell them you could not find it rather than guessing. Offer to search more broadly.
+- Do not invent examples, case studies, or numerical values that are not in the workspace. Use the student's actual course examples when available.
+- When paraphrasing from sources, stay faithful to the original meaning. Do not upgrade hedged claims to definitive ones or add qualifications the source did not include.
+- Do not attribute ideas to a source unless that source EXPLICITLY discusses them. A lecture about "science and values" does not automatically cover "ethics review" just because the topics are conceptually related. Only cite a source for a specific claim if that claim actually appears in the source material. If a topic is thematically adjacent but not directly covered, say so: "【Source】 discusses [related topic], but does not directly address [specific claim]."
+- When mapping student bullet points to sources, be precise about what each source actually says. Do not stretch a loose thematic connection into a direct citation. A source that discusses the philosophy of science does not become a citation for "ethics review and impact assessments" unless it explicitly mentions those terms.
 
 ## Web research
 You have web search enabled. Use it when:
@@ -3736,7 +3784,7 @@ When generating any artifact (quiz, flashcard, mock exam, etc.), every question 
 ## Math notation (CRITICAL)
 ALL mathematical expressions — in chat responses, flashcards, quizzes, mock exams, study docs, and any other output — MUST be wrapped in LaTeX delimiters. Use dollar signs for inline math and double dollar signs for display math. Never output bare math notation like c^T x or x_1 + x_2 — always wrap it in single dollar signs for inline or double dollar signs for display. This applies to variables, equations, inequalities, subscripts, superscripts, Greek letters, operators, and any mathematical symbol. Stuart's renderer uses KaTeX and can only render math inside dollar-sign delimiters.
 
-You can also research new topics, fetch content from URLs and repos, and build structured curricula with saved source files — detailed instructions will be provided when the student asks for this.${memoryContext}${legacyMemoryContext}${buildCurriculumContext(project.rootPath)}${perfSnapshot}`;
+You can also research new topics, fetch content from URLs and repos, and build structured curricula with saved source files — detailed instructions will be provided when the student asks for this.${buildWorkspaceConfigContext(project)}${memoryContext}${legacyMemoryContext}${buildCurriculumContext(project.rootPath)}${perfSnapshot}`;
 }
 
 function buildWorkerDeveloperInstructions(task: TaskSpec, worker: TaskWorkerRecord): string {
@@ -4047,6 +4095,8 @@ function inferPreviewKind(filePath: string): PreviewKind {
       return "pdf";
     case ".docx":
       return "docx";
+    case ".pptx":
+      return "pptx";
     case ".xlsx":
     case ".xls":
       return "xlsx";

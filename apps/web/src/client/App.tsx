@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState, useCallback, type CSSProperties } from "react";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback, type CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -25,13 +25,29 @@ import type {
   TaskWorkerRecord,
   TopicPerformanceRecord,
   UpdateTaskInput,
+  WorkspaceConfig,
   WorkspaceEvent,
-  WorkspaceFileRecord
+  WorkspaceFileRecord,
+  IngestionSearchResult
 } from "@stuart/shared";
 import ArtifactCanvas from "./ArtifactCanvas";
 import { ALL_DEMOS } from "./DemoArtifacts";
 import type { DesktopCodexLoginState } from "./platform";
 import { apiUrl, getDesktopBridge, openExternalUrl } from "./platform";
+import PdfPreview from "./PdfPreview";
+import {
+  cleanFileReferences,
+  cleanSourceName,
+  extractCitationQueryText,
+  FILE_REF_END,
+  FILE_REF_MARKER,
+  fileExtension,
+  findBestCitationDocument,
+  findBestSourcePath,
+  findBestWorkspaceFile,
+  normalizeSourcePathReference,
+  parseFileReferenceMarker,
+} from "./citation-utils";
 
 /* ---- Types ---- */
 
@@ -120,6 +136,14 @@ type WorkspaceSetupState = {
   steps: WorkspaceSetupStep[];
 };
 
+type WorkspacePreviewState = {
+  title: string;
+  relativePath: string;
+  locator?: string;
+  previewHref: string;
+  previewKind: WorkspaceFileRecord["previewKind"];
+};
+
 /* ---- Constants ---- */
 
 const STUDY_TOOL_PROMPTS: Record<string, string> = {
@@ -152,26 +176,28 @@ const WORKSPACE_SETUP_STEP_ORDER: Array<{ id: string; label: string }> = [
   { id: "reading", label: "Reading your materials" },
 ];
 
+/* ---- Citation Context ---- */
+type CitationSearchFn = (
+  sourceName: string,
+  sourcePath?: string | null,
+  queryText?: string | null,
+) => Promise<IngestionSearchResult[]>;
+type CitationOpenFn = (relativePath: string, locator?: string) => void;
+type WorkspaceFileResolveFn = (
+  reference: string,
+  sourcePath?: string | null,
+) => Promise<WorkspaceFileRecord | null>;
+type WorkspaceFileOpenFn = (
+  reference: string,
+  sourcePath?: string | null,
+  locator?: string,
+) => Promise<boolean>;
+const CitationContext = createContext<CitationSearchFn | null>(null);
+const CitationOpenContext = createContext<CitationOpenFn | null>(null);
+const WorkspaceFileResolveContext = createContext<WorkspaceFileResolveFn | null>(null);
+const WorkspaceFileOpenContext = createContext<WorkspaceFileOpenFn | null>(null);
+
 /* ---- Helpers ---- */
-
-function cleanSourceName(rawPath: string): string {
-  // URL-decode first
-  let name = rawPath;
-  try { name = decodeURIComponent(name); } catch { /* ignore */ }
-  // Strip attachments/UUID/ prefix
-  name = name.replace(/^attachments\/[a-f0-9-]+[-/]/i, "");
-  // Get just the filename
-  const parts = name.split("/");
-  name = parts[parts.length - 1] || name;
-  // Remove extension for display
-  name = name.replace(/\.(pdf|docx|pptx|xlsx|txt|md|html|csv|json|epub|jsx|tsx|js|ts)$/i, "");
-  return name;
-}
-
-function fileExtension(rawPath: string): string {
-  const match = rawPath.match(/\.(pdf|docx|pptx|xlsx|txt|md|html|csv|json|epub)$/i);
-  return match ? match[1]!.toUpperCase() : "DOC";
-}
 
 function buildWorkspaceSetupSteps(activeId: string, completedIds: string[] = []): WorkspaceSetupStep[] {
   const completed = new Set(completedIds);
@@ -179,6 +205,41 @@ function buildWorkspaceSetupSteps(activeId: string, completedIds: string[] = [])
     ...step,
     status: completed.has(step.id) ? "done" : step.id === activeId ? "active" : "pending",
   }));
+}
+
+function dedupeCitationResults(results: IngestionSearchResult[]): IngestionSearchResult[] {
+  const seen = new Set<string>();
+  return results.filter((result) => {
+    const key = `${result.relativePath}::${result.locator ?? result.chunkId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function workspaceFileShouldOpenDirectly(file: WorkspaceFileRecord): boolean {
+  return file.sourceKind === "staging"
+    || file.previewKind === "image"
+    || file.previewKind === "html"
+    || file.previewKind === "jsx";
+}
+
+function iconForFileExtension(ext: string): string {
+  return ext === "PDF"
+    ? "picture_as_pdf"
+    : ext === "PPTX" || ext === "PPT"
+      ? "slideshow"
+      : ext === "DOCX" || ext === "DOC"
+        ? "description"
+        : ext === "XLSX" || ext === "XLS"
+          ? "table_chart"
+          : ext === "ZIP"
+            ? "folder_zip"
+            : ext === "PNG" || ext === "JPG" || ext === "JPEG" || ext === "WEBP" || ext === "GIF" || ext === "SVG"
+              ? "image"
+              : ext === "HTML" || ext === "HTM" || ext === "JSX"
+                ? "open_in_browser"
+                : "draft";
 }
 
 /* ---- API Helper ---- */
@@ -309,12 +370,14 @@ function App() {
   );
   const [workspaceSetup, setWorkspaceSetup] = useState<WorkspaceSetupState | null>(null);
   const workspaceSetupDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [onboardingState, setOnboardingState] = useState<{ projectId: string; path: string } | null>(null);
 
   /* ---- Study Artifacts State ---- */
   const [studyArtifacts, setStudyArtifacts] = useState<Record<string, StudyArtifactRecord[]>>({});
   const [openArtifact, setOpenArtifact] = useState<StudyArtifactRecord | null>(null);
   const [pendingDeleteArtifact, setPendingDeleteArtifact] = useState<{ id: string; title: string; taskId: string } | null>(null);
   const [openDemoArtifact, setOpenDemoArtifact] = useState<{ kind: StudyArtifactKind; title: string; payload: string } | null>(null);
+  const [openWorkspacePreview, setOpenWorkspacePreview] = useState<WorkspacePreviewState | null>(null);
   const [customPrompt, setCustomPrompt] = useState("");
 
   /* ---- Study Session Tracking ---- */
@@ -462,6 +525,9 @@ function App() {
   const selectedIngestion = selectedWorkspaceScopeKey
     ? ingestionByScope[selectedWorkspaceScopeKey] ?? null
     : null;
+  const selectedWorkspaceFiles = selectedWorkspaceScopeKey
+    ? workspaceFilesByScope[selectedWorkspaceScopeKey] ?? []
+    : [];
 
   const turnInFlight = Boolean(selectedTask && thinkingState?.taskId === selectedTask.id);
   const isStreaming = Boolean(
@@ -503,16 +569,9 @@ function App() {
     return groups;
   }, [selectedStudyArtifacts]);
 
-  const isArtifactOpen = !!(openArtifact || openDemoArtifact);
-  const isDesktopWelcome =
-    desktopState.isDesktop &&
-    !selectedTask &&
-    projects.length === 0 &&
-    tasks.length === 0;
+  const isArtifactOpen = !!(openArtifact || openDemoArtifact || openWorkspacePreview);
   const codexCliCheck = diagnostics?.checks.find((check) => check.id === "codex-cli") ?? null;
   const codexAuthCheck = diagnostics?.checks.find((check) => check.id === "codex-auth") ?? null;
-  const tesseractCheck = diagnostics?.checks.find((check) => check.id === "tesseract") ?? null;
-  const sofficeCheck = diagnostics?.checks.find((check) => check.id === "soffice") ?? null;
 
   const dismissDiagnostics = useCallback(() => {
     if (!diagnosticsFingerprint) {
@@ -563,8 +622,15 @@ function App() {
       setWorkersByTask((cur) => pruneRecord(cur, payload.tasks.map((t) => t.id)));
       setAgentActivityByTask((cur) => pruneRecord(cur, payload.tasks.map((t) => t.id)));
       setSelectedProjectId(nextProjectId);
-      setSelectedTaskId(nextTask?.id ?? null);
-      setSelectedRunId(nextRunId);
+      // Don't override task selection while onboarding is active — the user
+      // hasn't finished configuring their new workspace yet.
+      setOnboardingState((current) => {
+        if (!current) {
+          setSelectedTaskId(nextTask?.id ?? null);
+          setSelectedRunId(nextRunId);
+        }
+        return current;
+      });
     } catch (caughtError) {
       const message = caughtError instanceof Error ? caughtError.message : "Failed to load workspace dashboard";
       if (message.includes("/api/dashboard") || message === "Failed to fetch") {
@@ -621,6 +687,214 @@ function App() {
     }
   }, [desktopBridge, openCodexHelp, refreshDashboard, refreshDesktopCodexLoginState]);
 
+  const searchCitation = useCallback(async (
+    sourceName: string,
+    sourcePath?: string | null,
+    queryText?: string | null,
+  ): Promise<IngestionSearchResult[]> => {
+    if (!selectedTaskId) return [];
+    try {
+      let docs = selectedIngestion?.documents ?? [];
+      let workspaceFiles = selectedWorkspaceFiles;
+      const scopeParams = new URLSearchParams();
+      if (selectedRunId) {
+        scopeParams.set("taskRunId", selectedRunId);
+      }
+
+      if (docs.length === 0) {
+        const path = scopeParams.size
+          ? `/api/tasks/${selectedTaskId}/ingestion?${scopeParams.toString()}`
+          : `/api/tasks/${selectedTaskId}/ingestion`;
+        const refreshedOverview = await request<IngestionOverview>(path);
+        docs = refreshedOverview.documents ?? [];
+      }
+
+      if (workspaceFiles.length === 0) {
+        const path = scopeParams.size
+          ? `/api/tasks/${selectedTaskId}/workspace-files?${scopeParams.toString()}`
+          : `/api/tasks/${selectedTaskId}/workspace-files`;
+        workspaceFiles = await request<WorkspaceFileRecord[]>(path);
+      }
+
+      const normalizedSourcePath = sourcePath ? normalizeSourcePathReference(sourcePath) : "";
+      const normalizedQueryText = queryText?.replace(/\s+/g, " ").trim() ?? "";
+      const matchedWorkspaceFile = findBestWorkspaceFile(
+        sourceName,
+        workspaceFiles,
+        sourcePath,
+      );
+      const bestDoc =
+        (normalizedSourcePath
+          ? docs.find((doc) => {
+              const normalizedRelativePath = normalizeSourcePathReference(doc.relativePath);
+              return normalizedRelativePath === normalizedSourcePath
+                || normalizedRelativePath.endsWith(`/${normalizedSourcePath}`);
+            }) ?? null
+          : null)
+        ?? findBestCitationDocument(sourceName, docs);
+      const candidateSourcePaths = [...new Set([
+        normalizedSourcePath || null,
+        bestDoc?.relativePath ?? null,
+        matchedWorkspaceFile?.relativePath ?? null,
+        findBestSourcePath(sourceName, docs.map((doc) => doc.relativePath)),
+        findBestSourcePath(sourceName, workspaceFiles.map((file) => file.relativePath)),
+      ].filter((value): value is string => Boolean(value)))];
+
+      const requestScopedSearch = async (source: string, q: string) => {
+        const searchParams = new URLSearchParams(scopeParams);
+        searchParams.set("q", q);
+        searchParams.set("source", source);
+        searchParams.set("limit", "8");
+        return dedupeCitationResults(await request<IngestionSearchResult[]>(
+          `/api/tasks/${selectedTaskId}/ingestion/search?${searchParams.toString()}`
+        ));
+      };
+
+      const requestSourceChunks = async (source: string) => {
+        const chunkParams = new URLSearchParams(scopeParams);
+        chunkParams.set("source", source);
+        chunkParams.set("limit", "5");
+        return dedupeCitationResults(await request<IngestionSearchResult[]>(
+          `/api/tasks/${selectedTaskId}/ingestion/chunks?${chunkParams.toString()}`
+        ));
+      };
+
+      for (const source of candidateSourcePaths) {
+        if (normalizedQueryText) {
+          const searchResults = await requestScopedSearch(source, normalizedQueryText);
+          if (searchResults.length > 0) {
+            return searchResults.slice(0, 3);
+          }
+        }
+
+        const chunks = await requestSourceChunks(source);
+        if (chunks.length > 0) {
+          return chunks.slice(0, 3);
+        }
+      }
+
+      if (normalizedQueryText) {
+        const searchParams = new URLSearchParams(scopeParams);
+        searchParams.set("q", normalizedQueryText);
+        searchParams.set("limit", "8");
+        const queryResults = dedupeCitationResults(await request<IngestionSearchResult[]>(
+          `/api/tasks/${selectedTaskId}/ingestion/search?${searchParams.toString()}`
+        ));
+        const bestPath = findBestSourcePath(
+          sourceName,
+          [...new Set(queryResults.map((result) => result.relativePath))],
+        );
+        if (bestPath) {
+          const matchedResults = queryResults.filter((result) => result.relativePath === bestPath);
+          if (matchedResults.length > 0) {
+            return matchedResults.slice(0, 3);
+          }
+          const chunks = await requestSourceChunks(bestPath);
+          if (chunks.length > 0) {
+            return chunks.slice(0, 3);
+          }
+        }
+        if (queryResults.length > 0) {
+          return queryResults.slice(0, 3);
+        }
+      }
+
+      if (candidateSourcePaths.length > 0) {
+        for (const source of candidateSourcePaths) {
+          const chunks = await requestSourceChunks(source);
+          if (chunks.length > 0) {
+            return chunks.slice(0, 3);
+          }
+        }
+        return [];
+      }
+
+      const searchParams = new URLSearchParams(scopeParams);
+      searchParams.set("q", normalizedQueryText || sourceName);
+      searchParams.set("limit", "8");
+      const results = dedupeCitationResults(await request<IngestionSearchResult[]>(
+        `/api/tasks/${selectedTaskId}/ingestion/search?${searchParams.toString()}`
+      ));
+      const bestPath = findBestSourcePath(
+        sourceName,
+        [...new Set(results.map((result) => result.relativePath))],
+      );
+      return bestPath
+        ? results.filter((result) => result.relativePath === bestPath).slice(0, 3)
+        : [];
+    } catch {
+      return [];
+    }
+  }, [selectedTaskId, selectedIngestion, selectedRunId, selectedWorkspaceFiles]);
+
+  const resolveWorkspaceFileReference = useCallback(async (
+    reference: string,
+    sourcePath?: string | null,
+  ): Promise<WorkspaceFileRecord | null> => {
+    if (!selectedTaskId) {
+      return null;
+    }
+
+    let workspaceFiles = selectedWorkspaceFiles;
+    if (workspaceFiles.length === 0) {
+      const scopeParams = new URLSearchParams();
+      if (selectedRunId) {
+        scopeParams.set("taskRunId", selectedRunId);
+      }
+      const path = scopeParams.size
+        ? `/api/tasks/${selectedTaskId}/workspace-files?${scopeParams.toString()}`
+        : `/api/tasks/${selectedTaskId}/workspace-files`;
+      workspaceFiles = await request<WorkspaceFileRecord[]>(path);
+      setWorkspaceFilesByScope((cur) => ({
+        ...cur,
+        [buildWorkspaceScopeKey(selectedTaskId, selectedRunId ?? null)]: workspaceFiles,
+      }));
+    }
+
+    return findBestWorkspaceFile(reference, workspaceFiles, sourcePath);
+  }, [selectedTaskId, selectedRunId, selectedWorkspaceFiles]);
+
+  const openWorkspaceFileReference = useCallback(async (
+    reference: string,
+    sourcePath?: string | null,
+    locator?: string,
+  ): Promise<boolean> => {
+    if (!selectedTaskId) return false;
+    const matchedFile = await resolveWorkspaceFileReference(reference, sourcePath);
+    if (!matchedFile) return false;
+
+    const search = new URLSearchParams();
+    if (selectedRunId) search.set("taskRunId", selectedRunId);
+    if (locator) search.set("locator", locator);
+    const query = search.toString();
+    const baseHref = apiUrl(
+      `/api/tasks/${selectedTaskId}/workspace-files/${matchedFile.id}/preview${query ? `?${query}` : ""}`
+    );
+    const pageMatch = locator?.match(/^page\s+(\d+)$/i);
+    const slideMatch = locator?.match(/^slide\s+(\d+)$/i);
+    const previewHref =
+      matchedFile.previewKind === "pdf" && pageMatch
+        ? `${baseHref}#page=${pageMatch[1]}`
+        : matchedFile.previewKind === "pptx" && slideMatch
+          ? `${baseHref}#page=${slideMatch[1]}`
+        : baseHref;
+
+    setOpenArtifact(null);
+    setOpenDemoArtifact(null);
+    setOpenWorkspacePreview({
+      title: cleanSourceName(matchedFile.relativePath),
+      relativePath: matchedFile.relativePath,
+      locator,
+      previewHref,
+      previewKind: matchedFile.previewKind,
+    });
+    return true;
+  }, [resolveWorkspaceFileReference, selectedTaskId, selectedRunId]);
+
+  const openCitationSource = useCallback((relativePath: string, locator?: string) => {
+    void openWorkspaceFileReference(relativePath, relativePath, locator);
+  }, [openWorkspaceFileReference]);
+
   async function loadMessages(taskId: string) {
     try {
       const messages = await request<TaskMessageRecord[]>(`/api/tasks/${taskId}/messages`);
@@ -663,6 +937,23 @@ function App() {
       setIngestionByScope((cur) => ({
         ...cur,
         [buildWorkspaceScopeKey(taskId, taskRunId ?? null)]: overview
+      }));
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Something went wrong");
+    }
+  }
+
+  async function loadWorkspaceFiles(taskId: string, taskRunId?: string) {
+    try {
+      const search = new URLSearchParams();
+      if (taskRunId) search.set("taskRunId", taskRunId);
+      const path = search.size
+        ? `/api/tasks/${taskId}/workspace-files?${search.toString()}`
+        : `/api/tasks/${taskId}/workspace-files`;
+      const files = await request<WorkspaceFileRecord[]>(path);
+      setWorkspaceFilesByScope((cur) => ({
+        ...cur,
+        [buildWorkspaceScopeKey(taskId, taskRunId ?? null)]: files,
       }));
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "Something went wrong");
@@ -871,12 +1162,35 @@ function App() {
   useEffect(() => {
     if (!selectedTask) return;
     void loadIngestionOverview(selectedTask.id, selectedRunId ?? undefined);
+    void loadWorkspaceFiles(selectedTask.id, selectedRunId ?? undefined);
   }, [selectedTask, selectedRunId]);
 
   useEffect(() => {
-    if (!threadRef.current) return;
+    setOpenWorkspacePreview(null);
+  }, [selectedTaskId, selectedRunId]);
+
+  const userScrolledUpRef = useRef(false);
+
+  useEffect(() => {
+    const el = threadRef.current;
+    if (!el) return;
+    const handleScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      userScrolledUpRef.current = distanceFromBottom > 150;
+    };
+    el.addEventListener("scroll", handleScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  useEffect(() => {
+    if (!threadRef.current || userScrolledUpRef.current) return;
     threadRef.current.scrollTo({ top: threadRef.current.scrollHeight, behavior: "smooth" });
   }, [selectedTaskId, selectedRunId, thinkingState, messagesByTask, streamingDelta]);
+
+  // Reset scroll lock when switching tasks
+  useEffect(() => {
+    userScrolledUpRef.current = false;
+  }, [selectedTaskId, selectedRunId]);
 
   // Polling fallback: when thinking is active, poll for messages every 3s
   // This catches cases where SSE events are missed (stale connection, tab sleep, etc.)
@@ -1120,53 +1434,40 @@ function App() {
 
   /* ---- Actions ---- */
 
-  async function handleAddStudyMaterials() {
-    const path = await pickFolder("Choose a folder with your study materials");
-    if (!path) return;
-
+  async function continueWorkspaceSetup(projectId: string, path: string, config?: WorkspaceConfig) {
     try {
       setBusy("add-materials");
-      clearWorkspaceSetup();
+      setOnboardingState(null);
+
       setWorkspaceSetup({
         taskId: null,
-        projectId: null,
-        title: "Preparing your workspace",
-        detail: "Nothing is being downloaded. Stuart is creating a local study workspace from this folder and will read the files in the background.",
-        steps: buildWorkspaceSetupSteps("workspace", ["folder"]),
-      });
-      // Create or find project for this folder
-      const existingProject = projects.find((p) => p.rootPath === path);
-      let project: ProjectRecord;
-
-      if (existingProject) {
-        project = existingProject;
-      } else {
-        project = await request<ProjectRecord>("/api/projects", {
-          method: "POST",
-          body: JSON.stringify({
-            name: inferProjectName(path),
-            rootPath: path
-          } satisfies CreateProjectInput)
-        });
-      }
-
-      setSelectedProjectId(project.id);
-      setWorkspaceSetup({
-        taskId: null,
-        projectId: project.id,
+        projectId,
         title: "Preparing your workspace",
         detail: "Workspace created. Stuart is starting your first study session now.",
         steps: buildWorkspaceSetupSteps("session", ["folder", "workspace"]),
       });
 
-      // Create a study session task automatically
+      // Build objective and initial message based on config
       const taskTitle = `Study: ${inferProjectName(path)}`;
-      const objective = "Help me study and understand the materials in this folder. I may ask you to create flashcards, quizzes, mind maps, and summaries.";
+      let objective = "Help me study and understand the materials in this folder. I may ask you to create flashcards, quizzes, mind maps, and summaries.";
+      let initialMessage = "I just added my study materials. Please read through everything and give me a brief overview of what's in there, then ask me what I'd like to focus on.";
+
+      if (config) {
+        const parts: string[] = [];
+        if (config.subject) parts.push(`The subject is ${config.subject}.`);
+        if (config.goal) parts.push(`My goal is: ${config.goal}.`);
+        if (config.teachingStyle) parts.push(`I prefer a ${config.teachingStyle.toLowerCase()} teaching style.`);
+        if (config.additionalNotes) parts.push(config.additionalNotes);
+        if (parts.length > 0) {
+          objective = `Help me study and understand the materials in this folder. ${parts.join(" ")} I may ask you to create flashcards, quizzes, mind maps, and summaries.`;
+          initialMessage = `I just added my study materials. ${parts.join(" ")} Please read through everything and give me a brief overview of what's in there, then ask me what I'd like to focus on.`;
+        }
+      }
 
       const created = await request<TaskSpec>("/api/tasks", {
         method: "POST",
         body: JSON.stringify({
-          projectId: project.id,
+          projectId,
           title: taskTitle,
           objective,
           attachments: [
@@ -1192,9 +1493,7 @@ function App() {
 
       const result = await request<SendMessageResponse>(`/api/tasks/${created.id}/messages`, {
         method: "POST",
-        body: JSON.stringify({
-          content: "I just added my study materials. Please read through everything and give me a brief overview of what's in there, then ask me what I'd like to focus on."
-        })
+        body: JSON.stringify({ content: initialMessage })
       });
 
       setMessagesByTask((cur) => ({
@@ -1228,6 +1527,50 @@ function App() {
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "Could not add materials");
     } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleAddStudyMaterials() {
+    const path = await pickFolder("Choose a folder with your study materials");
+    if (!path) return;
+
+    try {
+      setBusy("add-materials");
+      clearWorkspaceSetup();
+      setWorkspaceSetup({
+        taskId: null,
+        projectId: null,
+        title: "Preparing your workspace",
+        detail: "Nothing is being downloaded. Stuart is creating a local study workspace from this folder and will read the files in the background.",
+        steps: buildWorkspaceSetupSteps("workspace", ["folder"]),
+      });
+      // Create or find project for this folder
+      const existingProject = projects.find((p) => p.rootPath === path);
+      let project: ProjectRecord;
+
+      if (existingProject) {
+        project = existingProject;
+        // Existing project — skip onboarding, go straight to session
+        await continueWorkspaceSetup(project.id, path);
+        return;
+      } else {
+        project = await request<ProjectRecord>("/api/projects", {
+          method: "POST",
+          body: JSON.stringify({
+            name: inferProjectName(path),
+            rootPath: path
+          } satisfies CreateProjectInput)
+        });
+      }
+
+      setSelectedProjectId(project.id);
+      // Show onboarding screen for new projects — clear all progress indicators
+      setWorkspaceSetup(null);
+      setOnboardingState({ projectId: project.id, path });
+      setBusy(null);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Could not add materials");
       setBusy(null);
     }
   }
@@ -1545,6 +1888,61 @@ function App() {
         <WorkspaceSetupIndicator progress={workspaceSetup} />
       ) : null}
 
+      {/* ---- Codex Auth Bar ---- */}
+      {desktopState.isDesktop && codexAuthCheck && codexAuthCheck.status !== "ok" ? (
+        <div className="codex-auth-bar">
+          <div className="codex-auth-bar-content">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="8" cy="8" r="7" />
+              <line x1="8" y1="5" x2="8" y2="8" />
+              <circle cx="8" cy="11" r="0.5" fill="currentColor" />
+            </svg>
+            <span>
+              {desktopCodexLogin?.status === "waiting"
+                ? desktopCodexLogin.message
+                : codexAuthCheck.summary ?? "ChatGPT account not connected."}
+            </span>
+          </div>
+          {desktopCodexLogin?.userCode ? (
+            <div className="codex-auth-bar-code-block">
+              <span className="codex-auth-bar-code-label">Device code</span>
+              <span className="codex-auth-bar-code">{desktopCodexLogin.userCode}</span>
+            </div>
+          ) : null}
+          <div className="codex-auth-bar-actions">
+            {desktopCodexLogin?.verificationUri ? (
+              <a
+                className="codex-auth-link"
+                href={desktopCodexLogin.verificationUri}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => {
+                  e.preventDefault();
+                  void openExternalUrl(desktopCodexLogin.verificationUri!);
+                }}
+              >
+                Open sign-in page
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M7 3H3v10h10V9" /><path d="M9 2h5v5" /><path d="M14 2L6 10" />
+                </svg>
+              </a>
+            ) : null}
+            <button
+              className="accent-button compact"
+              type="button"
+              onClick={() => codexCliCheck?.status === "ok" ? void startDesktopCodexLogin() : void openCodexHelp()}
+              disabled={busy === "codex-login" || desktopAuthPending}
+            >
+              {busy === "codex-login" || desktopAuthPending
+                ? "Signing in..."
+                : codexCliCheck?.status === "ok"
+                  ? "Connect ChatGPT"
+                  : "Repair setup"}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {/* ---- Three-Column Layout ---- */}
       <div
         className={`workspace${studyToolsCollapsed ? " tools-collapsed" : ""}${libraryCollapsed ? " library-collapsed" : ""}${isArtifactOpen ? " artifact-open" : ""}`}
@@ -1821,9 +2219,21 @@ function App() {
             </button>
           )}
           <div className="chat-scroll" ref={threadRef}>
+            <CitationContext.Provider value={searchCitation}>
+            <CitationOpenContext.Provider value={openCitationSource}>
+            <WorkspaceFileResolveContext.Provider value={resolveWorkspaceFileReference}>
+            <WorkspaceFileOpenContext.Provider value={openWorkspaceFileReference}>
             <div className="chat-transcript">
               {!selectedTask ? (
-                projects.length > 0 ? (
+                onboardingState ? (
+                  /* ---- Workspace Onboarding ---- */
+                  <WorkspaceOnboarding
+                    projectId={onboardingState.projectId}
+                    path={onboardingState.path}
+                    onSubmit={(pid, p, cfg) => void continueWorkspaceSetup(pid, p, cfg)}
+                    onSkip={(pid, p) => void continueWorkspaceSetup(pid, p)}
+                  />
+                ) : projects.length > 0 ? (
                   /* ---- Dashboard: shown when projects exist but no task selected ---- */
                   <DashboardView
                     projects={projects}
@@ -1833,47 +2243,43 @@ function App() {
                     onDeleteProject={deleteProject}
                     onOpenCanvas={() => setShowCanvasSettings(true)}
                   />
-                ) : isDesktopWelcome ? (
-                  <DesktopOnboardingView
-                    diagnostics={diagnostics}
-                    desktopState={desktopState}
-                    loginState={desktopCodexLogin}
-                    isRefreshing={busy === "dashboard"}
-                    isSigningIn={busy === "codex-login" || desktopAuthPending}
-                    isChoosingFolder={busy === "add-materials" || busy === "folder"}
-                    canChooseFolder={Boolean(diagnostics?.requiredReady)}
-                    codexCliCheck={codexCliCheck}
-                    codexAuthCheck={codexAuthCheck}
-                    tesseractCheck={tesseractCheck}
-                    sofficeCheck={sofficeCheck}
-                    onChooseFolder={() => void handleAddStudyMaterials()}
-                    onRefresh={() => void refreshDashboard()}
-                    onStartCodexLogin={() => void startDesktopCodexLogin()}
-                    onOpenVerificationUri={(url) => void openExternalUrl(url)}
-                    onOpenCodexHelp={() => void openCodexHelp()}
-                  />
                 ) : (
                   /* ---- Onboarding: Welcome Screen ---- */
                   <div className="welcome-card">
                     <div className="welcome-icon">
-                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
-                        <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+                      <svg width="56" height="56" viewBox="0 0 200 200" fill="var(--accent)">
+                        <path d="m185.2 106.2c-1.38-0.66-1.98-0.93-2.91-1.29 2.31-3.16 3.11-4.01 6.52-4.98 2.22-0.65 1.52-3.85-0.8-3.34-4.19 0.45-5.94 3.18-7.84 7.04-7.14-1.6-16.44-0.84-19.35 7.33-0.54 0.35-0.44 0.27-0.7 0.89-2.35 0.35-6.17 0.86-9.02-0.05-0.77-2.78 1.37-9.79 2.85-11.8 10.06-0.8 18.57-3.43 25.71-10.62 4.37-4.34 8.35-7.22 7.26-12.58-3.85-13.03-10.07-26.79-22.86-34.66-2.04-1.46-4.92-2.48-5.42-2.83-0.87-8.12-4.48-15.3-10.03-18.45-1.64-0.71-2.45-0.25-3.32 0.56-3.36 3.15-5.35 9.31-6.22 14.49-3.31-4.46-5.25-6.94-9.56-11.47-3.26-3.78-7.44-2.71-9.75 1.39-5.19 8.23-4.58 17.04-0.82 24.13-5.71 6.76-6.68 16.05-9.79 20.97-3.36 4.97-6.87 7.74-11.5 10.13 9.45-23.09 5.13-45.64-10.68-60.2-10.05-9.34-22.49-12.91-34.48-12.91-25.97 0-47.92 20.16-47.92 44.97 0 10.19 5.08 18.12 13.54 26.24 2.41 2.11 4.82 1.25 3.75-1.58-2.61-7.08 3.45-17.47 11.96-19.58 6.42-0.66 9.98 3.76 9.98 9.73 0 6.65-4.62 14.62-8.71 21.55-6.94 10.93-12.43 21.33-12.43 39.35 0 25.12 16.26 50.38 45.3 50.23 4.34-0.07 7.5-0.14 10.61 2.58-1.02 5.52 2.78 9.81 7.86 9.81l48.37 0.51c5.08-0.05 5.42-2.8 5.29-5.43l20.9-0.79c5.44-0.46 2.87-7.42-1.24-10.77-3.95-3.24-9.52-4.09-14.43-4.21 6.49-8.28 11.01-16.81 6.9-27.59-1.34-4.01-3.21-6.94-4.3-7.79-0.3-2.26 0.57-2.16 5.47-4.52 1.61-0.67 3.92-1.47 4.22-0.21 0.87 6.03 5.12 9.66 9.12 14.44 0.67 0.75 1.44 0 2.75-0.23 12.13-2.52 17.54-6.46 22.29-19.6 2.88-1.83 4.39-4 3.69-8.42-1.11-5.63-5.81-8.51-10.26-10.44zm-37.25-79.77c4.22 2.73 6.87 7.8 7.34 12.77-4.49-1.07-6.1-1.53-11.34-1.78 0.25-4.36 1.12-7.85 4-10.99zm1.81 120.2c1.51 10.08-7.26 21.7-14 27.11-1.06 1.17-0.4 3.43 1.81 3.02 6.07-1.12 17.86-2.05 22.18 2.92 0.5 0.71 0.6 1.47 0.6 1.47l-20.47 0.31c-3.06-3.92-6.91-5.37-11.86-5.97 11.05-8.44 15.27-21.09 18.89-36.55 1.54 0.91 2.41 4.21 2.85 7.69zm21.4-6.78-1.81 0.35c-3.12-3.93-5.78-5.81-6.92-10 6.52 0 10.13-3.92 9.73-10.45l16.19 5.44c-2.95 7.98-6.28 12.99-17.19 14.66zm19.5-19.34-26.4-11.62c2.47-5.02 12.96-3.49 19.09-0.35 5.27 2.67 8.95 6.07 7.31 11.97zm-6.27-40.5c-1.51-0.51-6.89-1.11-6.23 2.33 0.3 1.51 1.1 3.53 2.61 4.6-3.79 4.41-7.4 5.97-13.59 2.2-1.38-0.76-3.02 0-2.15 1.13 0.77 1.08 2.15 2.19 3.42 3.31-11.48 3.94-25.4 2.64-33.75-4.74-2.75-2.16-4.52-5.19-5.39-4.68-1.31 0.35-0.64 2.52 0.97 4.58 5.48 6.81 12.97 9.23 19.48 10.25-1.81 3.15-2.89 7.07-3.09 10.81-4.82-0.76-7.53-4.69-10.28-7.86-1.54-1.35-2.64-0.23-2.14 2.08 2.51 7.29 10.51 12.17 19 11.92 4.85-0.1 5.62-1.33 9.24-1.08 4.65 0.41 6.56 2.98 6.26 5.96-0.5 4.17-3.49 4.72-8.67 3.22-3.51-0.86-12.97 4.72-22.56 5.43-10.76 0.71-17.28-4.48-22.56-14.86-1.1-2.17-4.99-2.62-4.59 0.82 0.97 6.87 10.5 17.66 24.33 18.12 3.15 0.1 5.32-0.3 8.65-0.91-1.07 14.6-4.55 32.13-19.62 41.66-1.64 0.81-3.28 0.66-4.63 0.35 7.66-8.91 9.87-20.51 6.95-29.09-3.82-11.72-14.97-20.72-26.59-20.37-4.75 0.1-10.13 2.46-10.6 5.34-0.5 1.46 0.81 1.2 1.31 0.9 4.59-2.01 8.34-3.02 13.29-2.57 10.96 1.37 19.26 12.1 20.2 22.48 0.87 10.4-5.66 21.23-15.61 26.81-1.95 1.07-1.75 3.59 0.6 3.19 5.54-1.66 9.8-2.57 18.26-2.47 5.28 0.45 9.03 3.8 9.03 7.29 0 1.41-0.77 1.51-2.05 1.51l-47.04-0.5c-3.55 0-4.02-3.25-3.09-5.51 1.11-2.67 2.01-5.72-0.1-5.62-1.1 0-1.4 1.61-2.61 2.83-11.83-8.82-20.73-22.9-20.73-39.63 0-18.17 10.25-39.3 31.54-51.58 8.71-4.56 17.4-8.91 23.24-18 1.95-4.57 3.39-10.75 6.21-15.97 0.97 0.45 2.71 3.23 4.12 3.78 2.04 0.76 3.04-0.96 2.57-2.77-0.97-3.68-5.95-7.37-6.29-15.76 0-4.87 2.15-10.29 4.5-12 5.71 3.92 12.4 13.11 12.53 19.78 0.1 2.52 2.98 1.92 2.88-0.15 0-1.71-0.1-3.12-0.4-5.59 10.38 0.2 18.83 2.57 25.98 9.14 9.12 7.63 13.3 18.7 17.19 29.89z"/>
+                        <path d="m127.8 32.7c-1.16-0.91-1.73 0.81-0.73 1.82 5.18 5.67 5.38 10.99 3.67 17.88-0.5 2.26 1.94 2.26 2.54 0.45 2.85-7.94 1.24-14.27-5.48-20.15z"/>
+                        <path d="m140.8 66.82c-2.65 2.16-2.45 4.13-0.6 3.27 3.91-1.81 9.26-4.12 14.81 0.6 2.41 2.07 3.08 2.62 3.58 1.92 1.34-1.46-1.17-5.39-5.39-7.1-4.26-1.86-9.09-1.11-12.4 1.31z"/>
+                        <path d="m27.18 138.2c3.11 5.63 8.07 9.06 12.29 11.43-6.66-5.05-12.29-11.82-12.29-22.6 0-13.71 7.14-25.89 13.46-35.93 5.05-7.93 7.07-14.9 6.97-20.81-0.67-8.28-7.2-16.36-16.26-15.9-8.16 0.6-14.64 9.41-15.34 19.13-0.1 0.35-0.1 0.35-0.4 0-4.63-5.63-7.38-10.35-7.38-20.09 0.5-18.77 18.14-42.35 44.59-42.35 26.1 0 46.27 18.95 46.27 45.28 0 9.85-3.31 18.93-7.77 27.06-19.14 11.13-34.75 30.41-34.75 56.35 0 12.54 4.35 25.08 12.81 35.46-19.27-0.45-35.17-13.65-42.2-37.03z"/>
                       </svg>
                     </div>
                     <h1>Welcome to Stuart</h1>
                     <p>Your personal study assistant. Drop a folder of study materials to get started.</p>
-                    <button
-                      className="accent-button welcome-cta"
-                      type="button"
-                      onClick={() => void handleAddStudyMaterials()}
-                      disabled={busy === "add-materials" || busy === "folder"}
-                    >
-                      <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5A1 1 0 0 0 5.8 3H3a1 1 0 0 0-1 1z" />
-                      </svg>
-                      {busy === "add-materials" ? "Setting up..." : "Choose folder"}
-                    </button>
+                    <div className="welcome-actions">
+                      <button
+                        className="accent-button welcome-cta"
+                        type="button"
+                        onClick={() => void handleAddStudyMaterials()}
+                        disabled={busy === "add-materials" || busy === "folder"}
+                      >
+                        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5A1 1 0 0 0 5.8 3H3a1 1 0 0 0-1 1z" />
+                        </svg>
+                        {busy === "add-materials" ? "Setting up..." : "Choose folder"}
+                      </button>
+                      <button
+                        className="secondary-button welcome-cta"
+                        type="button"
+                        onClick={() => setShowCanvasSettings(true)}
+                      >
+                        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M13 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1z" />
+                          <path d="M2 6h12" /><path d="M6 6v8" />
+                        </svg>
+                        Import from Canvas
+                      </button>
+                    </div>
                     {diagnostics ? (
                       diagnosticsDismissed ? (
                         <DiagnosticsDismissedNotice onShow={restoreDiagnostics} />
@@ -1981,6 +2387,10 @@ function App() {
                 </>
               )}
             </div>
+            </WorkspaceFileOpenContext.Provider>
+            </WorkspaceFileResolveContext.Provider>
+            </CitationOpenContext.Provider>
+            </CitationContext.Provider>
           </div>
 
           {/* Composer */}
@@ -2180,6 +2590,7 @@ function App() {
                             ...cur,
                             [selectedTask.id]: [...(cur[selectedTask.id] ?? []), artifact],
                           }));
+                          setOpenWorkspacePreview(null);
                           setOpenArtifact(artifact);
                         } catch (err) {
                           setError(err instanceof Error ? err.message : "Failed to create study doc");
@@ -2291,13 +2702,14 @@ function App() {
                         key={demo.kind}
                         type="button"
                         className={`demo-card ${demo.kind}`}
-                        onClick={() =>
+                        onClick={() => {
+                          setOpenWorkspacePreview(null);
                           setOpenDemoArtifact({
                             kind: demo.draft.kind,
                             title: demo.title,
                             payload: JSON.stringify(demo.draft),
-                          })
-                        }
+                          });
+                        }}
                       >
                         <span className={`kind-badge ${demo.kind}`}>{demo.kind}</span>
                         <span className="demo-card-title">{demo.title}</span>
@@ -2314,7 +2726,10 @@ function App() {
                   artifacts={selectedStudyArtifacts}
                   cardsDue={reviewData.cardsDue}
                   weakTopics={reviewData.weakTopics}
-                  onOpenArtifact={(artifact) => setOpenArtifact(artifact)}
+                  onOpenArtifact={(artifact) => {
+                    setOpenWorkspacePreview(null);
+                    setOpenArtifact(artifact);
+                  }}
                   onError={(msg) => setError(msg)}
                 />
               ) : null}
@@ -2367,7 +2782,10 @@ function App() {
                             <div key={artifact.id} className="artifact-card-row">
                               <button
                                 className={`artifact-card-compact${openArtifact?.id === artifact.id ? " active" : ""}`}
-                                onClick={() => setOpenArtifact(artifact)}
+                                onClick={() => {
+                                  setOpenWorkspacePreview(null);
+                                  setOpenArtifact(artifact);
+                                }}
                               >
                                 <span className="artifact-card-title">{artifact.title || `Untitled ${artifact.kind}`}</span>
                                 <span className="artifact-card-date">{formatDate(artifact.createdAt)}</span>
@@ -2439,53 +2857,60 @@ function App() {
                 setIsArtifactResizing(true);
               }}
             />
-            <ArtifactCanvas
-              title={openArtifact?.title ?? openDemoArtifact?.title ?? ""}
-              kind={openArtifact?.kind ?? openDemoArtifact?.kind ?? "flashcards"}
-              payload={openArtifact?.payload ?? openDemoArtifact?.payload ?? "{}"}
-              onClose={() => { setOpenArtifact(null); setOpenDemoArtifact(null); setInlineResponse(null); setIsInlineLoading(false); void endStudySession(); }}
-              onDelete={openArtifact && selectedTask ? () => {
-                setPendingDeleteArtifact({
-                  id: openArtifact.id,
-                  title: openArtifact.title || `Untitled ${openArtifact.kind}`,
-                  taskId: selectedTask.id,
-                });
-              } : undefined}
-              onExplain={(message) => {
-                if (selectedTaskId) void sendTaskMessage(selectedTaskId, message);
-              }}
-              artifactDbId={openArtifact?.id}
-              taskId={selectedTaskId ?? undefined}
-              onSavePayload={openArtifact ? async (newPayload: string) => {
-                try {
-                  await request(`/api/study-artifacts/${openArtifact.id}`, {
-                    method: "PATCH",
-                    body: JSON.stringify({ payload: newPayload }),
+            {openWorkspacePreview ? (
+              <WorkspacePreviewPanel
+                preview={openWorkspacePreview}
+                onClose={() => setOpenWorkspacePreview(null)}
+              />
+            ) : (
+              <ArtifactCanvas
+                title={openArtifact?.title ?? openDemoArtifact?.title ?? ""}
+                kind={openArtifact?.kind ?? openDemoArtifact?.kind ?? "flashcards"}
+                payload={openArtifact?.payload ?? openDemoArtifact?.payload ?? "{}"}
+                onClose={() => { setOpenArtifact(null); setOpenDemoArtifact(null); setInlineResponse(null); setIsInlineLoading(false); void endStudySession(); }}
+                onDelete={openArtifact && selectedTask ? () => {
+                  setPendingDeleteArtifact({
+                    id: openArtifact.id,
+                    title: openArtifact.title || `Untitled ${openArtifact.kind}`,
+                    taskId: selectedTask.id,
                   });
-                  setStudyArtifacts((cur) => ({
-                    ...cur,
-                    [selectedTaskId!]: (cur[selectedTaskId!] ?? []).map((a) =>
-                      a.id === openArtifact.id ? { ...a, payload: newPayload } : a
-                    ),
-                  }));
-                  setOpenArtifact((cur) => cur ? { ...cur, payload: newPayload } : null);
-                } catch { /* save failed silently */ }
-              } : undefined}
-              onInlineAsk={(message) => {
-                if (!selectedTaskId) return;
-                setInlineResponse(null);
-                setIsInlineLoading(true);
-                void (async () => {
+                } : undefined}
+                onExplain={(message) => {
+                  if (selectedTaskId) void sendTaskMessage(selectedTaskId, message);
+                }}
+                artifactDbId={openArtifact?.id}
+                taskId={selectedTaskId ?? undefined}
+                onSavePayload={openArtifact ? async (newPayload: string) => {
                   try {
-                    await sendTaskMessage(selectedTaskId, message);
-                  } catch {
-                    setIsInlineLoading(false);
-                  }
-                })();
-              }}
-              inlineResponse={inlineResponse}
-              isInlineLoading={isInlineLoading}
-            />
+                    await request(`/api/study-artifacts/${openArtifact.id}`, {
+                      method: "PATCH",
+                      body: JSON.stringify({ payload: newPayload }),
+                    });
+                    setStudyArtifacts((cur) => ({
+                      ...cur,
+                      [selectedTaskId!]: (cur[selectedTaskId!] ?? []).map((a) =>
+                        a.id === openArtifact.id ? { ...a, payload: newPayload } : a
+                      ),
+                    }));
+                    setOpenArtifact((cur) => cur ? { ...cur, payload: newPayload } : null);
+                  } catch { /* save failed silently */ }
+                } : undefined}
+                onInlineAsk={(message) => {
+                  if (!selectedTaskId) return;
+                  setInlineResponse(null);
+                  setIsInlineLoading(true);
+                  void (async () => {
+                    try {
+                      await sendTaskMessage(selectedTaskId, message);
+                    } catch {
+                      setIsInlineLoading(false);
+                    }
+                  })();
+                }}
+                inlineResponse={inlineResponse}
+                isInlineLoading={isInlineLoading}
+              />
+            )}
           </>
         )}
       </div>
@@ -2628,6 +3053,153 @@ function writeDismissedDiagnosticsFingerprint(fingerprint: string | null) {
   }
 }
 
+const TEACHING_STYLES = ["Concise", "Detailed", "Socratic", "Exam-focused"];
+const GOALS = ["Understand material", "Prepare for exam", "Essay writing", "General"];
+
+function WorkspaceOnboarding({
+  projectId,
+  path,
+  onSubmit,
+  onSkip,
+}: {
+  projectId: string;
+  path: string;
+  onSubmit: (projectId: string, path: string, config: WorkspaceConfig) => void;
+  onSkip: (projectId: string, path: string) => void;
+}) {
+  const [subject, setSubject] = useState("");
+  const [teachingStyle, setTeachingStyle] = useState("");
+  const [customStyle, setCustomStyle] = useState("");
+  const [goal, setGoal] = useState("");
+  const [customGoal, setCustomGoal] = useState("");
+  const [additionalNotes, setAdditionalNotes] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const effectiveStyle = teachingStyle === "Custom" ? customStyle : teachingStyle;
+  const effectiveGoal = goal === "Custom" ? customGoal : goal;
+
+  async function handleSubmit() {
+    setSaving(true);
+    const config: WorkspaceConfig = {};
+    if (subject.trim()) config.subject = subject.trim();
+    if (effectiveStyle.trim()) config.teachingStyle = effectiveStyle.trim();
+    if (effectiveGoal.trim()) config.goal = effectiveGoal.trim();
+    if (additionalNotes.trim()) config.additionalNotes = additionalNotes.trim();
+
+    try {
+      await request<ProjectRecord>(`/api/projects/${projectId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ config } satisfies { config: WorkspaceConfig })
+      });
+    } catch {
+      // Continue even if patch fails — config is non-critical
+    }
+    onSubmit(projectId, path, config);
+  }
+
+  return (
+    <div className="onboarding-card">
+      <h2>Set up your workspace</h2>
+      <p className="onboarding-subtitle">Help Stuart tailor its teaching to you. You can always change these later.</p>
+
+      <div className="onboarding-field">
+        <label>Subject</label>
+        <input
+          type="text"
+          placeholder="e.g., Operating Systems, Constitutional Law"
+          value={subject}
+          onChange={(e) => setSubject(e.target.value)}
+        />
+      </div>
+
+      <div className="onboarding-field">
+        <label>Teaching style</label>
+        <div className="onboarding-chips">
+          {TEACHING_STYLES.map((s) => (
+            <button
+              key={s}
+              type="button"
+              className={`onboarding-chip${teachingStyle === s ? " selected" : ""}`}
+              onClick={() => setTeachingStyle(teachingStyle === s ? "" : s)}
+            >{s}</button>
+          ))}
+          <button
+            type="button"
+            className={`onboarding-chip${teachingStyle === "Custom" ? " selected" : ""}`}
+            onClick={() => setTeachingStyle(teachingStyle === "Custom" ? "" : "Custom")}
+          >Custom</button>
+        </div>
+        {teachingStyle === "Custom" && (
+          <input
+            type="text"
+            placeholder="Describe your preferred style"
+            value={customStyle}
+            onChange={(e) => setCustomStyle(e.target.value)}
+            style={{ marginTop: 8 }}
+          />
+        )}
+      </div>
+
+      <div className="onboarding-field">
+        <label>Goal</label>
+        <div className="onboarding-chips">
+          {GOALS.map((g) => (
+            <button
+              key={g}
+              type="button"
+              className={`onboarding-chip${goal === g ? " selected" : ""}`}
+              onClick={() => setGoal(goal === g ? "" : g)}
+            >{g}</button>
+          ))}
+          <button
+            type="button"
+            className={`onboarding-chip${goal === "Custom" ? " selected" : ""}`}
+            onClick={() => setGoal(goal === "Custom" ? "" : "Custom")}
+          >Custom</button>
+        </div>
+        {goal === "Custom" && (
+          <input
+            type="text"
+            placeholder="Describe your goal"
+            value={customGoal}
+            onChange={(e) => setCustomGoal(e.target.value)}
+            style={{ marginTop: 8 }}
+          />
+        )}
+      </div>
+
+      <div className="onboarding-field">
+        <label>Additional notes <span style={{ fontWeight: 400, color: "var(--ink-muted)" }}>(optional)</span></label>
+        <textarea
+          placeholder="Anything else Stuart should know — e.g., exam date, areas of difficulty, preferred examples..."
+          value={additionalNotes}
+          onChange={(e) => setAdditionalNotes(e.target.value)}
+          rows={3}
+        />
+      </div>
+
+      <div className="onboarding-actions">
+        <button
+          className="accent-button"
+          type="button"
+          onClick={() => void handleSubmit()}
+          disabled={saving}
+        >
+          {saving ? "Starting..." : "Start studying"}
+        </button>
+        <button
+          className="onboarding-skip"
+          type="button"
+          onClick={() => onSkip(projectId, path)}
+          disabled={saving}
+        >
+          Skip
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function DiagnosticsCard({
   diagnostics,
   surface = "developer",
@@ -2724,244 +3296,7 @@ function DiagnosticsDismissedNotice({
   );
 }
 
-function DesktopOnboardingView({
-  diagnostics,
-  desktopState,
-  loginState,
-  isRefreshing,
-  isSigningIn,
-  isChoosingFolder,
-  canChooseFolder,
-  codexCliCheck,
-  codexAuthCheck,
-  tesseractCheck,
-  sofficeCheck,
-  onChooseFolder,
-  onRefresh,
-  onStartCodexLogin,
-  onOpenVerificationUri,
-  onOpenCodexHelp,
-}: {
-  diagnostics: SystemDiagnostics | null;
-  desktopState: DesktopBridgeState;
-  loginState: DesktopCodexLoginState | null;
-  isRefreshing: boolean;
-  isSigningIn: boolean;
-  isChoosingFolder: boolean;
-  canChooseFolder: boolean;
-  codexCliCheck: SystemDiagnosticCheck | null;
-  codexAuthCheck: SystemDiagnosticCheck | null;
-  tesseractCheck: SystemDiagnosticCheck | null;
-  sofficeCheck: SystemDiagnosticCheck | null;
-  onChooseFolder: () => void;
-  onRefresh: () => void;
-  onStartCodexLogin: () => void;
-  onOpenVerificationUri: (url: string) => void;
-  onOpenCodexHelp: () => void;
-}) {
-  const checks = diagnostics?.checks ?? [];
-  const { requiredErrors, optionalWarnings } = summarizeDiagnostics(checks);
-  const signInReady = codexCliCheck?.status === "ok";
-  const authReady = codexAuthCheck?.status === "ok";
-  const loginRecentLines = loginState?.recentLines ?? [];
-  const showLoginBox =
-    Boolean(loginState && loginState.status !== "idle") &&
-    (!authReady || loginRecentLines.length > 0);
-  const optionalDocumentChecks = [tesseractCheck, sofficeCheck]
-    .filter((check): check is SystemDiagnosticCheck => Boolean(check));
-  const optionalDocumentMessage =
-    optionalDocumentChecks.length === 0
-      ? "Optional document extras stay hidden until Stuart detects them."
-      : optionalDocumentChecks.every((check) => check.status === "ok")
-        ? "Scanned-material OCR and richer Office document extraction are available."
-        : `Optional only: ${optionalDocumentChecks
-            .filter((check) => check.status !== "ok")
-            .map((check) => check.label)
-            .join(" and ")} can be added later if you need them.`;
-
-  return (
-    <div className="desktop-onboarding">
-      <section className="desktop-onboarding-hero">
-        <div className="desktop-onboarding-kicker-row">
-          <span className="desktop-onboarding-kicker">Stuart Desktop</span>
-          <span className="desktop-onboarding-version">
-            {desktopState.platform} · v{desktopState.appVersion}
-          </span>
-        </div>
-        <h1>Open the app. Sign in once. Pick your study folder.</h1>
-        <p>
-          Stuart runs locally on your machine, uses your ChatGPT account for Codex,
-          and turns a normal course folder into a guided study workspace.
-        </p>
-      </section>
-
-      <div className="desktop-onboarding-grid">
-        <article className={`desktop-step-card${diagnostics?.requiredReady ? " ready" : ""}`}>
-          <div className="desktop-step-meta">
-            <span className="desktop-step-index">01</span>
-            <span className={`desktop-step-status ${diagnostics?.overallStatus ?? "warn"}`}>
-              {diagnostics?.requiredReady ? "Ready" : requiredErrors > 0 ? "Action needed" : "Checking"}
-            </span>
-          </div>
-          <h2>System check</h2>
-          <p>
-            Stuart checks the built-in study engine, your ChatGPT connection,
-            local storage, and a few optional document extras.
-          </p>
-          <div className="desktop-check-list">
-            {checks.slice(0, 5).map((check) => (
-              <div key={check.id} className={`desktop-check-row ${check.status}`}>
-                <span>{check.label}</span>
-                <strong>{check.status === "ok" ? "Ready" : check.status === "warn" ? "Optional" : "Needs setup"}</strong>
-              </div>
-            ))}
-          </div>
-          <div className="desktop-step-actions">
-            <button
-              className="ghost-button compact"
-              type="button"
-              onClick={onRefresh}
-              disabled={isRefreshing}
-            >
-              Refresh checks
-            </button>
-            <span className="desktop-step-note">
-              {requiredErrors > 0
-                ? `${requiredErrors} required issue${requiredErrors === 1 ? "" : "s"} left`
-                : optionalWarnings > 0
-                  ? `${optionalWarnings} optional enhancement${optionalWarnings === 1 ? "" : "s"}`
-                  : "Everything required is ready"}
-            </span>
-          </div>
-        </article>
-
-        <article className={`desktop-step-card${authReady ? " ready" : ""}`}>
-          <div className="desktop-step-meta">
-            <span className="desktop-step-index">02</span>
-            <span className={`desktop-step-status ${authReady ? "ok" : signInReady ? "warn" : "error"}`}>
-              {authReady ? "Connected" : signInReady ? "Needs sign-in" : "Needs repair"}
-            </span>
-          </div>
-          <h2>Connect your ChatGPT account</h2>
-          <p>
-            Stuart uses your ChatGPT account to power Codex locally. You only need
-            to connect once, and Stuart will keep using that session afterward.
-          </p>
-          <div className="desktop-callout">
-            <strong>
-              {authReady
-                ? "Your ChatGPT account is already connected."
-                : loginState?.message ?? codexAuthCheck?.summary ?? "ChatGPT sign-in not detected yet."}
-            </strong>
-            {authReady ? null : (
-              <>
-                {codexAuthCheck?.detail ? <span>{codexAuthCheck.detail}</span> : null}
-                {!signInReady && codexCliCheck?.resolution ? <span>{codexCliCheck.resolution}</span> : null}
-              </>
-            )}
-          </div>
-          {showLoginBox ? (
-            <div className="desktop-login-status">
-              {loginState?.userCode ? (
-                <div className="desktop-login-code">
-                  <span>Verification code</span>
-                  <strong>{loginState.userCode}</strong>
-                </div>
-              ) : null}
-              {loginRecentLines.length > 0 ? (
-                <div className="desktop-login-transcript">
-                  {loginRecentLines.map((line, index) => (
-                    <p key={`${line}-${index}`}>{line}</p>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-          <div className="desktop-step-actions">
-            {loginState?.verificationUri && !authReady ? (
-              <button
-                className="ghost-button compact"
-                type="button"
-                onClick={() => onOpenVerificationUri(loginState.verificationUri!)}
-              >
-                Open sign-in page
-              </button>
-            ) : null}
-            <button
-              className="accent-button"
-              type="button"
-              onClick={signInReady ? onStartCodexLogin : onOpenCodexHelp}
-              disabled={isSigningIn || authReady}
-            >
-              {authReady
-                ? "Connected"
-                : isSigningIn
-                  ? "Waiting for sign-in..."
-                  : signInReady
-                    ? "Connect ChatGPT"
-                    : "Repair setup"}
-            </button>
-            <button
-              className="ghost-button compact"
-              type="button"
-              onClick={onOpenCodexHelp}
-            >
-              Help
-            </button>
-          </div>
-        </article>
-
-        <article className={`desktop-step-card workspace${canChooseFolder ? " ready" : " locked"}`}>
-          <div className="desktop-step-meta">
-            <span className="desktop-step-index">03</span>
-            <span className={`desktop-step-status ${canChooseFolder ? "ok" : "warn"}`}>
-              {canChooseFolder ? "Ready" : "Waiting"}
-            </span>
-          </div>
-          <h2>Select your study folder</h2>
-          <p>
-            Pick any course folder with slides, notes, PDFs, assignments, or readings.
-            Stuart will read it in the background and you can start asking questions immediately.
-          </p>
-          <div className="desktop-folder-hints">
-            <span>Lecture slides</span>
-            <span>Assignments</span>
-            <span>Notes</span>
-            <span>Readings</span>
-          </div>
-          <div className="desktop-step-actions">
-            <button
-              className="accent-button"
-              type="button"
-              onClick={onChooseFolder}
-              disabled={!canChooseFolder || isChoosingFolder}
-            >
-              {isChoosingFolder ? "Opening folder picker..." : "Choose study folder"}
-            </button>
-            <span className="desktop-step-note">
-              {canChooseFolder
-                ? "You can start studying as soon as the folder is selected."
-                : "Finish the required setup above first."}
-            </span>
-          </div>
-        </article>
-      </div>
-
-      <div className="desktop-onboarding-footer">
-        <div className="desktop-onboarding-footer-card">
-          <span className="desktop-onboarding-footer-label">Optional enhancement</span>
-          <strong>Document extras</strong>
-          <p>{optionalDocumentMessage}</p>
-        </div>
-        <div className="desktop-onboarding-footer-card">
-          <span className="desktop-onboarding-footer-label">Local runtime</span>
-          <strong>{desktopState.apiOrigin}</strong>
-          <p>Your workspace, study history, and artifacts stay on this machine.</p>
-        </div>
-      </div>
-    </div>
-  );
-}
+/* DesktopOnboardingView removed — Codex auth status is now shown inline as codex-auth-bar */
 
 /* ================================================================
    Dashboard View
@@ -4559,6 +4894,223 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
+function WorkspacePreviewPanel({
+  preview,
+  onClose,
+}: {
+  preview: WorkspacePreviewState;
+  onClose: () => void;
+}) {
+  const [pdfFallbackKey, setPdfFallbackKey] = useState(0);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const initialPage = parsePreviewPage(preview.previewHref, preview.locator);
+  const shouldAttemptPdfPreview =
+    preview.previewKind === "pdf" || preview.previewKind === "pptx";
+
+  useEffect(() => {
+    setPdfFallbackKey(0);
+  }, [preview.previewHref, preview.previewKind]);
+
+  const handleIframeLoad = useCallback(() => {
+    if (preview.previewKind !== "pptx") {
+      return;
+    }
+
+    const iframe = iframeRef.current;
+    const doc = iframe?.contentDocument;
+    const win = iframe?.contentWindow;
+    if (!iframe || !doc || !win) {
+      return;
+    }
+
+    stabilizePptxIframePreview(doc, preview.locator);
+  }, [preview.locator, preview.previewKind]);
+
+  return (
+    <div className="artifact-canvas-overlay">
+      <div className="artifact-canvas-panel">
+        <div className="artifact-canvas-header">
+          <div>
+            <span className="kind-badge study_doc">source</span>
+            <h2>{preview.title}</h2>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              className="ghost-button compact"
+              type="button"
+              onClick={() => window.open(preview.previewHref, "_blank", "noopener,noreferrer")}
+            >
+              Open in Tab
+            </button>
+            <button className="ghost-button compact" type="button" onClick={onClose}>
+              Close
+            </button>
+          </div>
+        </div>
+        <div className="artifact-canvas-body workspace-preview-body">
+          <div className="workspace-preview-shell">
+            <div className="workspace-preview-meta">
+              <span>{preview.relativePath}</span>
+              {preview.locator ? <span>{preview.locator}</span> : null}
+            </div>
+            {shouldAttemptPdfPreview && pdfFallbackKey === 0 ? (
+              <PdfPreview
+                sourceUrl={preview.previewHref}
+                initialPage={initialPage}
+                onUnavailable={() => setPdfFallbackKey(1)}
+              />
+            ) : (
+              <iframe
+                ref={iframeRef}
+                className="workspace-preview-iframe"
+                src={preview.previewHref}
+                title={preview.title}
+                onLoad={handleIframeLoad}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function parsePreviewPage(previewHref: string, locator?: string): number {
+  const hashMatch = previewHref.match(/#page=(\d+)/i);
+  if (hashMatch) {
+    return Math.max(1, Number(hashMatch[1]) || 1);
+  }
+  const locatorMatch = locator?.match(/\b(?:page|slide)\s+(\d+)\b/i);
+  return Math.max(1, Number(locatorMatch?.[1] ?? "1") || 1);
+}
+
+function stabilizePptxIframePreview(doc: Document, locator?: string) {
+  const targetSlideNumber = parseSlideLocator(locator);
+  ensurePptxIframePreviewStyles(doc);
+
+  const slides = Array.from(doc.querySelectorAll("div.slide"));
+  for (const [index, slideNode] of slides.entries()) {
+    if (!(slideNode instanceof HTMLElement)) continue;
+    if (slideNode.parentElement?.classList.contains("stuart-ql-slide-frame")) continue;
+
+    const slideNumber = index + 1;
+    slideNode.id = slideNode.id || `slide-${slideNumber}`;
+    slideNode.style.position = "absolute";
+    slideNode.style.top = "44px";
+    slideNode.style.left = "16px";
+    slideNode.style.transformOrigin = "top left";
+    slideNode.style.margin = "0";
+
+    const frame = doc.createElement("section");
+    frame.className = "stuart-ql-slide-frame";
+    frame.dataset.slideNumber = String(slideNumber);
+    if (slideNumber === targetSlideNumber) {
+      frame.classList.add("is-target");
+    }
+
+    const label = doc.createElement("div");
+    label.className = "stuart-ql-slide-label";
+    label.textContent = `slide ${slideNumber}`;
+
+    slideNode.parentNode?.insertBefore(frame, slideNode);
+    frame.appendChild(label);
+    frame.appendChild(slideNode);
+  }
+
+  fitPptxIframeSlides(doc);
+
+  const scrollTarget =
+    (targetSlideNumber
+      ? doc.querySelector(`.stuart-ql-slide-frame[data-slide-number="${targetSlideNumber}"], #slide-${targetSlideNumber}`)
+      : null) ?? null;
+  if (scrollTarget instanceof HTMLElement) {
+    window.setTimeout(() => {
+      scrollTarget.scrollIntoView({ block: "start" });
+    }, 50);
+  }
+}
+
+function ensurePptxIframePreviewStyles(doc: Document) {
+  if (doc.getElementById("stuart-pptx-preview-style")) {
+    return;
+  }
+
+  const style = doc.createElement("style");
+  style.id = "stuart-pptx-preview-style";
+  style.textContent = `
+    :root { color-scheme: light; }
+    body {
+      margin: 0 !important;
+      padding: 18px 14px 28px !important;
+      background: linear-gradient(180deg, #eef4fb 0%, #e7eef8 100%) !important;
+      overflow-x: hidden !important;
+    }
+    .stuart-ql-slide-frame {
+      position: relative;
+      width: min(100%, 1180px);
+      margin: 0 auto 20px;
+      padding: 16px;
+      border-radius: 20px;
+      border: 1px solid rgba(108,130,168,0.16);
+      background: rgba(255,255,255,0.82);
+      box-shadow: 0 20px 48px rgba(18,31,56,0.08);
+      overflow: hidden;
+      box-sizing: border-box;
+      scroll-margin-top: 20px;
+    }
+    .stuart-ql-slide-frame.is-target {
+      border-color: rgba(31,93,93,0.42);
+      box-shadow: 0 0 0 3px rgba(31,93,93,0.12), 0 20px 48px rgba(18,31,56,0.08);
+    }
+    .stuart-ql-slide-label {
+      position: absolute;
+      top: 12px;
+      right: 14px;
+      z-index: 3;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(31,93,93,0.09);
+      color: #1f5d5d;
+      font: 700 12px/1 system-ui, sans-serif;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .stuart-ql-slide-frame > .slide {
+      margin: 0 !important;
+      box-shadow: none !important;
+    }
+  `;
+
+  doc.head.appendChild(style);
+}
+
+function fitPptxIframeSlides(doc: Document) {
+  const frames = Array.from(doc.querySelectorAll(".stuart-ql-slide-frame"));
+  for (const frameNode of frames) {
+    if (!(frameNode instanceof HTMLElement)) continue;
+    const slideNode = frameNode.querySelector(".slide");
+    if (!(slideNode instanceof HTMLElement)) continue;
+
+    const computedStyle = doc.defaultView?.getComputedStyle(slideNode);
+    const baseWidth = Number.parseFloat(computedStyle?.width ?? "") || slideNode.scrollWidth || 960;
+    const baseHeight = Number.parseFloat(computedStyle?.height ?? "") || slideNode.scrollHeight || 540;
+    const availableWidth = Math.max(320, frameNode.clientWidth - 32);
+    const scale = Math.min(1, availableWidth / baseWidth);
+
+    slideNode.style.transform = `scale(${scale})`;
+    frameNode.style.minHeight = `${Math.ceil(baseHeight * scale + 60)}px`;
+  }
+}
+
+function parseSlideLocator(locator?: string): number | null {
+  const match = locator?.match(/\bslide\s+(\d+)\b/i);
+  if (!match) {
+    return null;
+  }
+  const slideNumber = Number(match[1]);
+  return Number.isFinite(slideNumber) && slideNumber > 0 ? slideNumber : null;
+}
+
 /**
  * Normalize LaTeX delimiters so remark-math can detect them.
  * Codex uses several formats:
@@ -4572,72 +5124,6 @@ function wrapBareLatex(text: string): string {
   result = result.replace(/\\\((.+?)\\\)/g, (_, inner) => `$${inner}$`);
   // Convert \[ ... \] to $$ ... $$
   result = result.replace(/\\\[(.+?)\\\]/gs, (_, inner) => `$$${inner}$$`);
-  return result;
-}
-
-/**
- * Clean up file references that Codex outputs in various broken formats.
- * Codex often outputs `[Label](path/to/file.pptx)` with spaces in the path
- * which markdown parsers (especially inside GFM tables) render as literal text.
- *
- * Strategy: replace `[label](path)` with a clean inline tag `«label»` that we
- * post-process in the React component into styled pills.
- */
-const FILE_REF_MARKER = "\u00ab"; // «
-const FILE_REF_END = "\u00bb";    // »
-
-function cleanFileReferences(text: string): string {
-  let result = text;
-
-  // 1. Decode URL-encoded strings globally
-  result = result.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
-    try { return decodeURIComponent(m); } catch { return m; }
-  });
-
-  // 2. Convert [label](path) file references to «label::ext» markers.
-  //    Paths can contain nested parens like `CA2 Materials (Inquiry Essay)/file.pdf`
-  //    so we match greedily and find the LAST `)` that ends the reference.
-  result = result.replace(
-    /\[([^\]]+)\]\s*\(([\s\S]+?\.\w{2,5}\s*)\)/g,
-    (_match, label: string, path: string) => {
-      if (/^https?:\/\//i.test(path.trim())) return _match;
-      const cleanLabel = cleanSourceName(label) || cleanSourceName(path);
-      const ext = fileExtension(path.trim());
-      return `${FILE_REF_MARKER}${cleanLabel}::${ext}${FILE_REF_END}`;
-    }
-  );
-
-  // 2b. Catch any remaining [label](path) without file extension (e.g. folder references)
-  result = result.replace(
-    /\[([^\]]+)\]\s*\(\s*([^)]+?)\s*\)/g,
-    (_match, label: string, path: string) => {
-      if (/^https?:\/\//i.test(path.trim())) return _match;
-      // Only convert if path looks like a workspace path (has a slash)
-      if (!path.includes("/") && !path.includes("\\")) return _match;
-      const cleanLabel = cleanSourceName(label) || cleanSourceName(path);
-      return `${FILE_REF_MARKER}${cleanLabel}::DOC${FILE_REF_END}`;
-    }
-  );
-
-  // 3. Clean up separators between file markers: ` ; ` or `, ` between » and «
-  result = result.replace(
-    new RegExp(`${FILE_REF_END}\\s*[;,]\\s*${FILE_REF_MARKER}`, "g"),
-    `${FILE_REF_END} ${FILE_REF_MARKER}`
-  );
-
-  // 4. Clean bare /Users/... paths
-  result = result.replace(/\/Users\/[^\s)"\]]+/gi, (m) => cleanSourceName(m));
-
-  // 5. Clean bare attachments/uuid/... paths
-  result = result.replace(/attachments\/[a-f0-9-]+[-/][^\s)"\]]+/gi, (m) => cleanSourceName(m));
-
-  // 6. Convert 【name】 lenticular bracket citations (new Codex format) to markers
-  //    Strip surrounding bold ** if present: **【name】** → marker
-  result = result.replace(
-    /\*{0,2}【([^】]+)】\*{0,2}/g,
-    (_match, name: string) => `${FILE_REF_MARKER}${name}::DOC${FILE_REF_END}`
-  );
-
   return result;
 }
 
@@ -4660,6 +5146,129 @@ function InlineMermaid({ code }: { code: string }) {
   return <div className="mermaid-inline" dangerouslySetInnerHTML={{ __html: svg }} />;
 }
 
+function CitationPillClickable({
+  label,
+  icon,
+  sourcePath,
+  queryText,
+}: {
+  label: string;
+  icon: string;
+  sourcePath?: string | null;
+  queryText?: string | null;
+}) {
+  const searchCitation = useContext(CitationContext);
+  const openCitationSource = useContext(CitationOpenContext);
+  const resolveWorkspaceFile = useContext(WorkspaceFileResolveContext);
+  const openWorkspaceFile = useContext(WorkspaceFileOpenContext);
+  const [open, setOpen] = useState(false);
+  const [results, setResults] = useState<IngestionSearchResult[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const pillRef = useRef<HTMLSpanElement>(null);
+
+  const handleClick = useCallback(async () => {
+    if (open) { setOpen(false); return; }
+
+    const matchedFile = resolveWorkspaceFile
+      ? await resolveWorkspaceFile(sourcePath || label, sourcePath)
+      : null;
+    if (matchedFile && workspaceFileShouldOpenDirectly(matchedFile) && openWorkspaceFile) {
+      await openWorkspaceFile(sourcePath || label, sourcePath);
+      return;
+    }
+
+    if (!searchCitation) return;
+    setOpen(true);
+    setLoading(true);
+    try {
+      const res = await searchCitation(label, sourcePath, queryText);
+      setResults(res);
+    } catch {
+      setResults([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [label, open, openWorkspaceFile, queryText, resolveWorkspaceFile, searchCitation, sourcePath]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (pillRef.current && !pillRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [open]);
+
+  return (
+    <span ref={pillRef} className={`citation-pill clickable${open ? " active" : ""}`} onClick={handleClick}>
+      <span className="material-symbols-outlined" style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
+      <span className="citation-pill-label">{label}</span>
+      {open && (
+        <div className="citation-popover" onClick={(e) => e.stopPropagation()}>
+          <div className="citation-popover-header">
+            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>{icon}</span>
+            <strong>{label}</strong>
+          </div>
+          {loading ? (
+            <p className="citation-popover-loading">Searching sources...</p>
+          ) : results && results.length > 0 ? (
+            <div className="citation-popover-results">
+              {results.map((r, i) => (
+                <div key={r.chunkId ?? i} className="citation-popover-chunk">
+                  <div className="citation-popover-chunk-meta">
+                    {r.locator ? <span className="citation-popover-locator">{r.locator}</span> : null}
+                    {openCitationSource ? (
+                      <button
+                        type="button"
+                        className="citation-popover-open"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openCitationSource(r.relativePath, r.locator);
+                        }}
+                      >
+                        Open source
+                      </button>
+                    ) : null}
+                  </div>
+                  <p>{r.snippet || r.text.slice(0, 300)}{r.text.length > 300 ? "..." : ""}</p>
+                  <span className="citation-popover-source">{cleanSourceName(r.relativePath)}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="citation-popover-empty">No matching excerpts found.</p>
+          )}
+        </div>
+      )}
+    </span>
+  );
+}
+
+function MarkdownFileLink({
+  href,
+  children,
+}: {
+  href: string;
+  children: React.ReactNode;
+}) {
+  const openWorkspaceFile = useContext(WorkspaceFileOpenContext);
+  const displayName = cleanSourceName(href);
+  const ext = fileExtension(href);
+  const icon = iconForFileExtension(ext);
+
+  return (
+    <button
+      type="button"
+      className="citation-pill clickable"
+      title={href}
+      onClick={() => { void openWorkspaceFile?.(displayName, href); }}
+    >
+      <span className="material-symbols-outlined" style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
+      {children || displayName}
+    </button>
+  );
+}
+
 function MarkdownMessage({ content }: { content: string }) {
   const cleanedContent = cleanFileReferences(wrapBareLatex(content));
 
@@ -4674,13 +5283,17 @@ function MarkdownMessage({ content }: { content: string }) {
       let match: RegExpExecArray | null;
       while ((match = re.exec(node)) !== null) {
         if (match.index > lastIdx) parts.push(node.slice(lastIdx, match.index));
-        const [label, ext] = match[1].split("::");
-        const icon = ext === "PDF" ? "picture_as_pdf" : ext === "PPTX" || ext === "PPT" ? "slideshow" : ext === "DOCX" || ext === "DOC" ? "description" : ext === "XLSX" || ext === "XLS" ? "table_chart" : ext === "ZIP" ? "folder_zip" : "draft";
+        const { label, ext, sourcePath } = parseFileReferenceMarker(match[1] ?? "");
+        const queryText = extractCitationQueryText(node, match.index, re.lastIndex);
+        const icon = iconForFileExtension(ext);
         parts.push(
-          <span key={match.index} className="citation-pill">
-            <span className="material-symbols-outlined" style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
-            {label}
-          </span>
+          <CitationPillClickable
+            key={match.index}
+            label={label}
+            icon={icon}
+            sourcePath={sourcePath}
+            queryText={queryText}
+          />
         );
         lastIdx = re.lastIndex;
       }
@@ -4689,7 +5302,7 @@ function MarkdownMessage({ content }: { content: string }) {
     }
     if (Array.isArray(node)) return node.map((c, i) => <React.Fragment key={i}>{processFileMarkers(c)}</React.Fragment>);
     if (node && typeof node === "object" && "props" in (node as any)) {
-      const el = node as React.ReactElement;
+      const el = node as React.ReactElement<{ children?: React.ReactNode }>;
       if (el.props.children) {
         return React.cloneElement(el, {}, processFileMarkers(el.props.children));
       }
@@ -4721,15 +5334,7 @@ function MarkdownMessage({ content }: { content: string }) {
                 </a>
               );
             }
-            const displayName = cleanSourceName(normalizedHref);
-            const ext = fileExtension(normalizedHref);
-            const icon = ext === "PDF" ? "picture_as_pdf" : ext === "PPTX" || ext === "PPT" ? "slideshow" : ext === "DOCX" || ext === "DOC" ? "description" : ext === "XLSX" || ext === "XLS" ? "table_chart" : ext === "ZIP" ? "folder_zip" : "draft";
-            return (
-              <span className="citation-pill" title={normalizedHref}>
-                <span className="material-symbols-outlined" style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
-                {children || displayName}
-              </span>
-            );
+            return <MarkdownFileLink href={normalizedHref}>{children}</MarkdownFileLink>;
           },
           p: withFileMarkers("p"),
           td: withFileMarkers("td"),

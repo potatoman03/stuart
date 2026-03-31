@@ -70,9 +70,6 @@ export function validateArtifactDraft(kind: string, data: unknown): ArtifactVali
       if (html && !/<(?:script|button|canvas|svg|input|iframe)\b/i.test(html)) {
         warnings.push("Interactive HTML does not appear to include obvious interactive elements.");
       }
-      if (html && !/source|citation|evidence/i.test(html)) {
-        warnings.push("Interactive artifact does not visibly mention sources or evidence.");
-      }
       return success(warnings);
     }
 

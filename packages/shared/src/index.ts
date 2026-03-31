@@ -43,6 +43,7 @@ export type PreviewKind =
   | "pdf"
   | "docx"
   | "xlsx"
+  | "pptx"
   | "html"
   | "jsx"
   | "text"
@@ -58,10 +59,18 @@ export interface ProjectAttachment {
   excludeGlobs?: string[];
 }
 
+export type WorkspaceConfig = {
+  subject?: string;
+  teachingStyle?: string;
+  goal?: string;
+  additionalNotes?: string;
+};
+
 export interface ProjectRecord {
   id: string;
   name: string;
   rootPath: string;
+  config?: WorkspaceConfig;
   createdAt: string;
   updatedAt: string;
 }
@@ -69,7 +78,13 @@ export interface ProjectRecord {
 export interface CreateProjectInput {
   name: string;
   rootPath: string;
+  config?: WorkspaceConfig;
 }
+
+export type UpdateProjectInput = {
+  name?: string;
+  config?: WorkspaceConfig;
+};
 
 export interface TaskSpec {
   id: string;
@@ -408,6 +423,10 @@ export type WorkspaceEvent =
       projectId: string;
     }
   | {
+      type: "project.updated";
+      projectId: string;
+    }
+  | {
       type: "task.created";
       taskId: string;
     }
@@ -581,23 +600,46 @@ export type XlsxWorkbookPayload = {
   sourceNotes?: string[];
 };
 
+export type PptxContentSubtype =
+  | "text_heavy"
+  | "mixed_media"
+  | "data_viz"
+  | "comparison"
+  | "timeline"
+  | "image_showcase";
+
 export type PptxSlide =
-  | { layout: "title"; title: string; subtitle?: string; notes?: string[] }
-  | { layout: "content"; title: string; bullets: string[]; notes?: string[] }
+  | { layout: "cover"; title: string; subtitle?: string; author?: string; date?: string; notes?: string[] }
+  | { layout: "toc"; title: string; entries: string[]; sectionNumber?: number; notes?: string[] }
+  | { layout: "section_divider"; title: string; sectionNumber?: number; subtitle?: string; notes?: string[] }
+  | { layout: "content"; title: string; contentSubtype?: PptxContentSubtype; bullets?: string[]; left?: string[]; right?: string[]; svg?: string; caption?: string; headers?: string[]; rows?: string[][]; notes?: string[] }
   | { layout: "two_column"; title: string; left: string[]; right: string[]; notes?: string[] }
   | { layout: "table"; title: string; headers: string[]; rows: string[][]; notes?: string[] }
   | { layout: "diagram"; title: string; svg: string; caption?: string; notes?: string[] }
-  | { layout: "section"; title: string; notes?: string[] }
-  | { layout: "sources"; entries: string[]; notes?: string[] };
+  | { layout: "summary"; title: string; bullets: string[]; notes?: string[] }
+  | { layout: "sources"; entries: string[]; notes?: string[] }
+  | { layout: "comparison"; title: string; left: string[]; right: string[]; notes?: string[] }
+  | { layout: "timeline"; title: string; bullets: string[]; notes?: string[] }
+  | { layout: "image_showcase"; title: string; svg: string; caption?: string; notes?: string[] }
+  | { layout: "title"; title: string; subtitle?: string; notes?: string[] }
+  | { layout: "section"; title: string; notes?: string[] };
 
 export type PptxPresentationPayload = {
-  theme?: { primaryColor?: string; fontFamily?: string };
+  theme?: {
+    primaryColor?: string;
+    secondaryColor?: string;
+    accentColor?: string;
+    fontHeading?: string;
+    fontBody?: string;
+    fontFamily?: string;
+  };
   citations: CitationRef[];
   slides: PptxSlide[];
 };
 
 export type PdfParagraph =
   | { type: "text"; content: string }
+  | { type: "heading"; content: string; level?: number }
   | { type: "bullet"; content: string }
   | { type: "numbered"; content: string }
   | { type: "table"; headers: string[]; rows: string[][] }
@@ -609,7 +651,11 @@ export type PdfParagraph =
   | { type: "code"; content: string; language?: string }
   | { type: "divider" }
   | { type: "definition"; term: string; definition: string }
-  | { type: "kv"; entries: Array<{ key: string; value: string }> };
+  | { type: "kv"; entries: Array<{ key: string; value: string }> }
+  | { type: "bibliography"; entries: string[] }
+  | { type: "checklist"; items: Array<{ label: string; checked: boolean }> }
+  | { type: "timeline"; events: Array<{ date: string; title: string; description: string }> }
+  | { type: "image_placeholder"; alt: string; width?: number; height?: number };
 
 export type PdfSection = {
   heading: string;
@@ -618,8 +664,18 @@ export type PdfSection = {
 };
 
 export type PdfDocumentPayload = {
+  docType?: string;
+  mood?: string;
   pageSize?: "A4" | "letter";
   columns?: 1 | 2;
+  cover?: {
+    title: string;
+    subtitle?: string;
+    author?: string;
+    date?: string;
+    institution?: string;
+    coverPattern?: string;
+  };
   metadata?: { author?: string; subject?: string; description?: string };
   citations: CitationRef[];
   sections: PdfSection[];
