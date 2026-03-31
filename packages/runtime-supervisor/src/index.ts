@@ -133,7 +133,20 @@ interface ActiveTurnState {
   quizValidation?: { artifactId: string; originalPayload: string };
   /** If set, resolves a quickComplete promise when the turn finishes */
   quickCompleteResolve?: (text: string) => void;
+  /** Turn-scoped Socratic tutoring context */
+  socratic?: {
+    active: boolean;
+    hintLevel: number;
+    exchangeAttempts: number;
+    directOverride: boolean;
+  };
 }
+
+type SocraticTaskState = {
+  hintLevel: number;
+  exchangeAttempts: number;
+  directRequestCount: number;
+};
 
 interface ResolvedWorkspaceFile extends WorkspaceFileRecord {
   absolutePath: string;
@@ -200,6 +213,7 @@ export class StuartRuntime {
   private readonly events = new EventEmitter();
   private readonly loadedThreadIds = new Set<string>();
   private readonly turns = new Map<string, ActiveTurnState>();
+  private readonly socraticStates = new Map<string, SocraticTaskState>();
   private readonly ingestionBuilds = new Map<string, Promise<IngestionIndexStats>>();
   private readonly codex: CodexAppServerClient;
   private readonly vmHelperBinaryPath?: string;
@@ -945,6 +959,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     if (!task) {
       throw new Error(`Task ${taskId} not found.`);
     }
+    const project = this.db.getProject(task.projectId);
 
     // Check if a turn is already in-flight for this task
     const activeTurn = [...this.turns.values()].find(
@@ -987,6 +1002,13 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     }
     const threadId = await this.ensureTaskThread(task, context.cwd);
     const retrievedContext = await this.buildRetrievedContext(task, context.taskRun, trimmed);
+    const socraticContext = project
+      ? buildSocraticTurnContext({
+          project,
+          message: trimmed,
+          previous: this.socraticStates.get(taskId) ?? null,
+        })
+      : { state: null, turn: undefined, contextText: "" };
 
     // For large material sets, add file-targeting hints to the context
     const targetedFiles = extractTargetedFiles(trimmed);
@@ -1063,6 +1085,15 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
             }
           ]
         : []),
+      ...(socraticContext.contextText
+        ? [
+            {
+              type: "text" as const,
+              text: socraticContext.contextText,
+              text_elements: [],
+            }
+          ]
+        : []),
       ...((skills.length > 0)
         ? skills.map((skill) => ({
             type: "text" as const,
@@ -1135,7 +1166,14 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       triggersReindex: skills.some((skill) => skill.triggersReindex),
       userMessage: trimmed,
       retryCount: options.retryCount ?? 0,
+      socratic: socraticContext.turn,
     });
+
+    if (socraticContext.state) {
+      this.socraticStates.set(taskId, socraticContext.state);
+    } else {
+      this.socraticStates.delete(taskId);
+    }
 
     this.emitEvent({
       type: "codex.turn.started",
@@ -2191,7 +2229,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
         state.assistantText += params.delta;
 
         // Stream the delta to the UI for real-time display
-        if (state.kind === "task") {
+        if (state.kind === "task" && !shouldSuppressSocraticStreaming(state.socratic)) {
           this.emitEvent({
             type: "codex.message.delta",
             taskId: state.taskId,
@@ -2365,15 +2403,17 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
         }
 
         // Store the final assistant text for artifact detection in turn/completed
+        const finalAssistantText = sanitizeSocraticCompletion(params.item.text, state?.socratic);
+
         if (state) {
-          state.assistantText = params.item.text;
+          state.assistantText = finalAssistantText;
         }
 
         const message = this.db.upsertTaskMessage({
           id: params.item.id,
           taskId: owner.taskId,
           role: "assistant",
-          content: params.item.text
+          content: finalAssistantText
         });
         this.emitEvent({
           type: "codex.message.completed",
@@ -2415,6 +2455,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
                   memoryExtraction: undefined,
                   quizValidation: undefined,
                   quickCompleteResolve: undefined,
+                  socratic: undefined,
                 }
               : null;
           })();
@@ -2852,6 +2893,18 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
               state.userMessage,
               state.assistantText
             ).catch(() => {});
+          }
+
+          if (state.socratic?.active) {
+            if (state.socratic.directOverride || state.socratic.hintLevel >= 4) {
+              this.socraticStates.set(state.taskId, {
+                hintLevel: 0,
+                exchangeAttempts: 0,
+                directRequestCount: 0,
+              });
+            }
+          } else {
+            this.socraticStates.delete(state.taskId);
           }
         }
 
@@ -3683,6 +3736,189 @@ function buildArtifactTurnContract(skills: Skill[]): string {
   return lines.join("\n");
 }
 
+function isSocraticTeachingStyle(project: ProjectRecord): boolean {
+  return project.config?.teachingStyle?.trim().toLowerCase() === "socratic";
+}
+
+function buildTeachingStyleBlock(project: ProjectRecord): string {
+  if (isSocraticTeachingStyle(project)) {
+    return `## Teaching style
+- Be concise, effective, and digestible by default.
+- Do NOT lead with the final answer when the student is trying to learn or reason something out.
+- Ask the student what they think first when a retrieval attempt or rough guess would help them learn.
+- Probe reasoning before correcting. Prefer one focused question or one hint at a time.
+- Hint before explaining. Move from open question -> category hint -> specific hint -> worked parallel -> direct explanation.
+- Only give the direct explanation immediately when the student clearly asks for it or when the concept is purely factual and a Socratic detour would add no value.
+- If you do explain directly, keep it short and follow with one quick check, teach-back, or parallel retrieval prompt.
+- Avoid walls of text, long preambles, filler, and raw excerpt dumps.
+- When helpful, end with one useful next step, memory hook, or quick check for understanding.`;
+  }
+
+  return `## Teaching style
+- Be concise, effective, and digestible by default.
+- Start with the direct answer or core takeaway in 1 to 2 sentences.
+- Then give a short structured explanation using brief bullets or short paragraphs.
+- Prefer simple language, clean structure, and concrete examples over dense jargon.
+- Break difficult ideas into layers: overview -> key mechanism -> important detail.
+- Avoid walls of text, long preambles, filler, and raw excerpt dumps.
+- Only go deep when the student asks for depth or when the concept genuinely requires it.
+- When helpful, end with one useful next step, memory hook, or quick check for understanding. Do not turn every answer into homework.`;
+}
+
+function looksLikeDirectOverrideRequest(message: string): boolean {
+  return /\b(just explain|explain directly|give me the answer|just tell me|tell me directly|stop hinting)\b/i.test(message);
+}
+
+function looksLikeSocraticOptIn(message: string): boolean {
+  return /\b(coach me|don't just tell me|dont just tell me|guide me|hint me|ask me first|quiz me on this)\b/i.test(message);
+}
+
+function looksStuck(message: string): boolean {
+  return /\b(i don't know|i dont know|idk|no idea|not sure|i'm stuck|im stuck|stuck)\b/i.test(message);
+}
+
+function looksLikeNewQuestion(message: string): boolean {
+  return /\?/.test(message)
+    || /^(what|why|how|when|where|which|who|can|could|would|should|is|are|do|does|did|help me|explain|teach me|walk me through)\b/i.test(message.trim());
+}
+
+function buildSocraticTurnContext(params: {
+  project: ProjectRecord;
+  message: string;
+  previous: SocraticTaskState | null;
+}): {
+  state: SocraticTaskState | null;
+  turn: ActiveTurnState["socratic"];
+  contextText: string;
+} {
+  const { project, message, previous } = params;
+  const baselineSocratic = isSocraticTeachingStyle(project);
+  const socraticOptIn = looksLikeSocraticOptIn(message);
+  const directOverrideRequested = looksLikeDirectOverrideRequest(message);
+  const continuingPriorExchange = Boolean(previous) && !looksLikeNewQuestion(message);
+  const socraticActive = baselineSocratic || socraticOptIn || continuingPriorExchange;
+
+  if (!socraticActive) {
+    return {
+      state: null,
+      turn: undefined,
+      contextText: "",
+    };
+  }
+
+  let state: SocraticTaskState = previous
+    ? { ...previous }
+    : { hintLevel: 0, exchangeAttempts: 0, directRequestCount: 0 };
+
+  if (looksLikeNewQuestion(message) && !looksStuck(message) && !directOverrideRequested) {
+    state = { hintLevel: 0, exchangeAttempts: 0, directRequestCount: 0 };
+  } else {
+    state.exchangeAttempts += 1;
+  }
+
+  if (looksStuck(message)) {
+    state.hintLevel = Math.min(3, Math.max(1, state.hintLevel + 1));
+  } else if (state.exchangeAttempts >= 2 && state.hintLevel < 3) {
+    state.hintLevel += 1;
+  }
+
+  let directOverride = false;
+  if (directOverrideRequested) {
+    if (state.directRequestCount >= 1) {
+      directOverride = true;
+      state.hintLevel = 4;
+      state.directRequestCount = 0;
+    } else {
+      state.directRequestCount += 1;
+      state.hintLevel = Math.max(state.hintLevel, 2);
+    }
+  } else {
+    state.directRequestCount = 0;
+  }
+
+  const turn = {
+    active: true,
+    hintLevel: state.hintLevel,
+    exchangeAttempts: state.exchangeAttempts,
+    directOverride,
+  };
+
+  const hintLevelDescriptions = [
+    "Level 0: ask an open diagnostic question instead of answering.",
+    "Level 1: give a category hint, then ask one focused follow-up question.",
+    "Level 2: give a specific foothold or next-step hint, then ask one focused follow-up question.",
+    "Level 3: give a worked parallel or stronger scaffold, but keep the student doing the next step.",
+    "Level 4: give the direct explanation, then immediately follow with one short retrieval or transfer check.",
+  ];
+
+  const lines = [
+    "## Turn tutoring policy",
+    "- Socratic mode is active for this turn.",
+    `- Current hint level: ${state.hintLevel}. ${hintLevelDescriptions[state.hintLevel]}`,
+    `- Exchange attempts so far: ${state.exchangeAttempts}.`,
+  ];
+
+  if (directOverrideRequested && !directOverride) {
+    lines.push(
+      "- The student asked for a direct explanation, but you should add one speed bump first.",
+      "- Do NOT give the final answer yet. Acknowledge that you can explain it directly, then ask for their best rough guess or next step."
+    );
+  } else if (directOverride) {
+    lines.push(
+      "- The student has insisted on a direct explanation. You may explain directly now.",
+      "- Keep the explanation concise and end with one brief retrieval or transfer prompt."
+    );
+  } else if (state.hintLevel <= 2) {
+    lines.push(
+      "- Do NOT reveal the final answer, full worked solution, or direct definition at this hint level.",
+      "- Ask exactly one focused question or give exactly one hint."
+    );
+  }
+
+  return {
+    state,
+    turn,
+    contextText: lines.join("\n"),
+  };
+}
+
+function shouldSuppressSocraticStreaming(
+  socratic: ActiveTurnState["socratic"] | undefined
+): boolean {
+  return Boolean(socratic?.active && !socratic.directOverride && socratic.hintLevel <= 2);
+}
+
+function looksLikeAnswerLeak(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  const firstWindow = trimmed.slice(0, 220);
+  if (/\?/.test(firstWindow)) return false;
+  return /\b(the answer is|correct answer|priority inheritance|it means|it is|this is|the key idea is|in short)\b/i.test(firstWindow)
+    || firstWindow.split(/\s+/).length >= 10;
+}
+
+function buildSocraticLeakageFallback(hintLevel: number): string {
+  if (hintLevel <= 0) {
+    return "Start with your best rough guess. What concept, rule, or distinction do you think matters most here?";
+  }
+  if (hintLevel === 1) {
+    return "Think about the kind of idea this is testing first. Which category of rule or method seems relevant here?";
+  }
+  return "Take one concrete step before we reveal anything. What specific principle, formula, or move would you try first?";
+}
+
+function sanitizeSocraticCompletion(
+  text: string,
+  socratic: ActiveTurnState["socratic"] | undefined
+): string {
+  if (!shouldSuppressSocraticStreaming(socratic)) {
+    return text;
+  }
+  return looksLikeAnswerLeak(text)
+    ? buildSocraticLeakageFallback(socratic?.hintLevel ?? 0)
+    : text;
+}
+
 function buildWorkspaceConfigContext(project: ProjectRecord): string {
   const cfg = project.config;
   if (!cfg) return "";
@@ -3724,15 +3960,7 @@ export function buildTeachingInstructions(project: ProjectRecord, task: TaskSpec
 - Stay grounded in the student's local material for course-specific claims. If you use general domain knowledge or web research, label that clearly.
 - Your job is to help the student learn efficiently, not to show off or dump everything you know.
 
-## Teaching style
-- Be concise, effective, and digestible by default.
-- Start with the direct answer or core takeaway in 1 to 2 sentences.
-- Then give a short structured explanation using brief bullets or short paragraphs.
-- Prefer simple language, clean structure, and concrete examples over dense jargon.
-- Break difficult ideas into layers: overview -> key mechanism -> important detail.
-- Avoid walls of text, long preambles, filler, and raw excerpt dumps.
-- Only go deep when the student asks for depth or when the concept genuinely requires it.
-- When helpful, end with one useful next step, memory hook, or quick check for understanding. Do not turn every answer into homework.
+${buildTeachingStyleBlock(project)}
 
 ## Presence and tone
 - Sound like a thoughtful human guide: warm, calm, clear, and professionally engaged.

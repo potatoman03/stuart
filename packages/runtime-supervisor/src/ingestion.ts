@@ -8,7 +8,6 @@ import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import JSZip from "jszip";
 import mammoth from "mammoth";
 import { XMLParser } from "fast-xml-parser";
-import { extractPptxParagraphsFromXml } from "./document-pipeline.js";
 // Lazy-imported to avoid DOMMatrix reference at load time (crashes in Electron main process).
 type PdfjsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 let _pdfjs: PdfjsModule | null = null;
@@ -131,6 +130,9 @@ const xmlParser = new XMLParser({
   trimValues: true,
 });
 
+const PPTX_PARAGRAPH_PATTERN = /<a:p\b[\s\S]*?<\/a:p>/g;
+const PPTX_TEXT_RUN_PATTERN = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/g;
+
 const require_ = createRequire(import.meta.url);
 const pdfStandardFontDataUrl = (() => {
   const resolved = join(dirname(require_.resolve("pdfjs-dist/package.json")), "standard_fonts");
@@ -228,6 +230,41 @@ const slugify = (value: string) =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 64);
+
+const decodeXmlText = (value: string) =>
+  value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_match, decimal: string) => String.fromCodePoint(Number(decimal)));
+
+const normalizePptxPreviewText = (value: string) =>
+  decodeXmlText(value)
+    .replace(/\s+/g, " ")
+    .trim();
+
+const extractPptxParagraphsFromXml = (xml: string): string[] => {
+  const paragraphs = [...xml.matchAll(PPTX_PARAGRAPH_PATTERN)]
+    .map((match) =>
+      normalizePptxPreviewText(
+        [...match[0].matchAll(PPTX_TEXT_RUN_PATTERN)]
+          .map((textMatch) => decodeXmlText(textMatch[1] ?? ""))
+          .join("")
+      )
+    )
+    .filter(Boolean);
+
+  if (paragraphs.length > 0) {
+    return paragraphs;
+  }
+
+  return [...xml.matchAll(PPTX_TEXT_RUN_PATTERN)]
+    .map((match) => normalizePptxPreviewText(match[1] ?? ""))
+    .filter(Boolean);
+};
 
 const hasCommand = async (command: string) => {
   const existing = commandAvailability.get(command);

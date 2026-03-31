@@ -91,6 +91,37 @@ function saveToStorage(key: string, value: unknown): void {
   } catch { /* ignore */ }
 }
 
+function buildQuizDebriefPrompt(
+  missedQuestions: QuizQuestion[],
+  answers: Record<string, string>,
+  difficultyFlags: Record<string, string>
+): string {
+  const prioritized = [...missedQuestions]
+    .sort((left, right) => {
+      const leftWeight = difficultyFlags[left.id] === "too_hard" ? 1 : 0;
+      const rightWeight = difficultyFlags[right.id] === "too_hard" ? 1 : 0;
+      return rightWeight - leftWeight;
+    })
+    .slice(0, 3);
+
+  return [
+    "Run a short Socratic debrief on my missed quiz questions.",
+    "Focus on the most important misses below.",
+    "Ask me one question at a time.",
+    "Do not give the final answer immediately unless I stay stuck or ask twice.",
+    "For each miss: ask why I chose it, probe the rule I was using, then correct me concisely and end with a quick transfer check.",
+    "",
+    "Missed questions:",
+    ...prioritized.map((question, index) => [
+      `${index + 1}. Prompt: ${question.prompt}`,
+      `   Correct answer: ${question.answer}`,
+      `   My answer: ${answers[question.id] ?? "No answer recorded"}`,
+      question.explanation ? `   Explanation: ${question.explanation}` : null,
+      difficultyFlags[question.id] ? `   Difficulty flag: ${difficultyFlags[question.id]}` : null,
+    ].filter(Boolean).join("\n"))
+  ].join("\n");
+}
+
 /* ---- SM-2 Spaced Repetition Algorithm ---- */
 
 type SM2Rating = "again" | "hard" | "good" | "easy";
@@ -193,9 +224,10 @@ type ArtifactCanvasProps = {
   inlineResponse?: string | null;
   isInlineLoading?: boolean;
   onSavePayload?: (newPayload: string) => Promise<void> | void;
+  socraticEnabled?: boolean;
 };
 
-export default function ArtifactCanvas({ title, kind, payload, onClose, onExplain, artifactDbId, taskId, onDelete, onInlineAsk, inlineResponse, isInlineLoading, onSavePayload }: ArtifactCanvasProps) {
+export default function ArtifactCanvas({ title, kind, payload, onClose, onExplain, artifactDbId, taskId, onDelete, onInlineAsk, inlineResponse, isInlineLoading, onSavePayload, socraticEnabled }: ArtifactCanvasProps) {
   let parsed: ArtifactDraft | null = null;
   try {
     parsed = JSON.parse(payload) as ArtifactDraft;
@@ -283,7 +315,7 @@ export default function ArtifactCanvas({ title, kind, payload, onClose, onExplai
           ) : kind === "flashcards" && parsed.kind === "flashcards" ? (
             <FlashcardsCanvas cards={parsed.cards} artifactId={artifactId} artifactDbId={artifactDbId} onExplain={onExplain} />
           ) : kind === "quiz" && parsed.kind === "quiz" ? (
-            <QuizCanvas questions={parsed.questions} artifactId={artifactId} artifactDbId={artifactDbId} onExplain={onExplain} onInlineAsk={onInlineAsk} inlineResponse={inlineResponse} isInlineLoading={isInlineLoading} />
+            <QuizCanvas questions={parsed.questions} artifactId={artifactId} artifactDbId={artifactDbId} onExplain={onExplain} onInlineAsk={onInlineAsk} inlineResponse={inlineResponse} isInlineLoading={isInlineLoading} socraticEnabled={socraticEnabled} />
           ) : kind === "diagram" && parsed.kind === "diagram" ? (
             <DiagramCanvas scene={parsed.scene} />
           ) : kind === "custom" && parsed.kind === "custom" ? (
@@ -1407,6 +1439,7 @@ function QuizCanvas({
   onInlineAsk,
   inlineResponse,
   isInlineLoading,
+  socraticEnabled,
 }: {
   questions: QuizQuestion[];
   artifactId: string;
@@ -1415,6 +1448,7 @@ function QuizCanvas({
   onInlineAsk?: (msg: string) => void;
   inlineResponse?: string | null;
   isInlineLoading?: boolean;
+  socraticEnabled?: boolean;
 }) {
   const bestScoreKey = `${artifactId}-quiz-best`;
   const [currentQ, setCurrentQ] = useState(0);
@@ -1431,6 +1465,8 @@ function QuizCanvas({
   const [difficultyFlags, setDifficultyFlags] = useState<Record<string, string>>({});
   const [showInlineExplain, setShowInlineExplain] = useState(false);
   const [attemptCount, setAttemptCount] = useState(1);
+  const autoDebriefSentRef = useRef(false);
+  const [showSocraticDebrief, setShowSocraticDebrief] = useState(false);
 
   // Shuffle options per question with a stable seed so order doesn't change on re-render
   const shuffledOptions = useMemo(() => {
@@ -1487,6 +1523,30 @@ function QuizCanvas({
     }
   }, [bestScore, bestScoreKey, finalPct, showEnd]);
 
+  useEffect(() => {
+    if (!showEnd || autoDebriefSentRef.current || !onExplain || !socraticEnabled) {
+      return;
+    }
+    const missedQuestions = questions.filter((q) => results[q.id] === false);
+    if (missedQuestions.length === 0) {
+      return;
+    }
+    autoDebriefSentRef.current = true;
+    onExplain(buildQuizDebriefPrompt(missedQuestions, answers, difficultyFlags));
+  }, [answers, difficultyFlags, onExplain, questions, results, showEnd, socraticEnabled]);
+
+  const missedQuestions = useMemo(
+    () => questions.filter((q) => results[q.id] === false),
+    [questions, results]
+  );
+
+  useEffect(() => {
+    if (!showEnd) {
+      setShowSocraticDebrief(false);
+      return;
+    }
+  }, [showEnd]);
+
   if (questions.length === 0) {
     return (
       <div className="empty-state">
@@ -1499,7 +1559,6 @@ function QuizCanvas({
   // End screen
   if (showEnd) {
     const pct = finalPct;
-    const missedQuestions = questions.filter((q) => results[q.id] === false);
 
     return (
       <div className="quiz-end-screen">
@@ -1570,10 +1629,23 @@ function QuizCanvas({
               Review Mistakes
             </button>
           )}
+          {missedQuestions.length > 0 && socraticEnabled && onInlineAsk && (
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => {
+                onInlineAsk(buildQuizDebriefPrompt(missedQuestions, answers, difficultyFlags));
+                setShowSocraticDebrief(true);
+              }}
+            >
+              Socratic Debrief
+            </button>
+          )}
           <button
             className="secondary-button"
             type="button"
             onClick={() => {
+              autoDebriefSentRef.current = false;
               setCurrentQ(0);
               setSelected(null);
               setChecked(false);
@@ -1586,6 +1658,10 @@ function QuizCanvas({
             Start Over
           </button>
         </div>
+
+        {showSocraticDebrief && (inlineResponse || isInlineLoading) && (
+          <InlineResponsePanel response={inlineResponse ?? null} isLoading={isInlineLoading} onClose={() => setShowSocraticDebrief(false)} />
+        )}
 
         {/* Difficulty flags summary */}
         {Object.values(difficultyFlags).some(f => f) && (
@@ -1753,9 +1829,21 @@ function QuizCanvas({
                 <button
                   type="button"
                   className="secondary-button compact explain-btn"
-                  onClick={() => onExplain("Explain this to me: " + question.prompt + ". The correct answer is: " + question.answer)}
+                  onClick={() => onExplain(
+                    socraticEnabled
+                      ? [
+                          "Coach me through this quiz question Socratically.",
+                          "Do not give me the final answer immediately.",
+                          "Ask what rule or reasoning I was using, then guide me with hints before correcting me.",
+                          `Question: ${question.prompt}`,
+                          `My answer: ${answers[question.id] ?? "No answer recorded"}`,
+                          `Correct answer: ${question.answer}`,
+                          question.explanation ? `Explanation: ${question.explanation}` : "",
+                        ].filter(Boolean).join("\n")
+                      : "Explain this to me: " + question.prompt + ". The correct answer is: " + question.answer
+                  )}
                 >
-                  Explain this
+                  {socraticEnabled ? "Coach me through this" : "Explain this"}
                 </button>
               )}
               {isIncorrect && onInlineAsk && (
@@ -1763,11 +1851,23 @@ function QuizCanvas({
                   type="button"
                   className="secondary-button compact explain-btn"
                   onClick={() => {
-                    onInlineAsk("Explain this to me: " + question.prompt + ". The correct answer is: " + question.answer + ". I selected: " + (answers[question.id] ?? ""));
+                    onInlineAsk(
+                      socraticEnabled
+                        ? [
+                            "Coach me through this quiz question Socratically.",
+                            "Do not give me the final answer immediately.",
+                            "Ask what rule or reasoning I was using, then guide me with hints before correcting me.",
+                            `Question: ${question.prompt}`,
+                            `My answer: ${answers[question.id] ?? "No answer recorded"}`,
+                            `Correct answer: ${question.answer}`,
+                            question.explanation ? `Explanation: ${question.explanation}` : "",
+                          ].filter(Boolean).join("\n")
+                        : "Explain this to me: " + question.prompt + ". The correct answer is: " + question.answer + ". I selected: " + (answers[question.id] ?? "")
+                    );
                     setShowInlineExplain(true);
                   }}
                 >
-                  Explain Inline
+                  {socraticEnabled ? "Coach Inline" : "Explain Inline"}
                 </button>
               )}
               {showInlineExplain && (

@@ -13,16 +13,20 @@ const fixtureWorkspacePath = path.resolve(
 );
 const e2eDataDir = path.resolve(process.cwd(), ".stuart-data-e2e");
 const cleanupPaths = [];
+const cleanupEntities = [];
 
 async function json(request, method, url, body) {
-  const response = await request.fetch(`${apiOrigin}${url}`, {
-    method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    data: body,
+  const response = await eventually(async () => {
+    const nextResponse = await request.fetch(`${apiOrigin}${url}`, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      data: body,
+    });
+    if (!nextResponse.ok()) {
+      throw new Error(`${method} ${url} failed: ${nextResponse.status()} ${await nextResponse.text()}`);
+    }
+    return nextResponse;
   });
-  if (!response.ok()) {
-    throw new Error(`${method} ${url} failed: ${response.status()} ${await response.text()}`);
-  }
   const contentType = response.headers()["content-type"] ?? "";
   if (response.status() === 204 || !contentType.includes("application/json")) {
     return null;
@@ -43,15 +47,22 @@ async function eventually(fn, attempts = 20, delayMs = 500) {
   throw lastError;
 }
 
-async function resetHarnessState(request) {
-  const dashboard = await eventually(() => json(request, "GET", "/api/dashboard"));
+async function cleanupHarnessState(request) {
+  while (cleanupEntities.length > 0) {
+    const target = cleanupEntities.pop();
+    if (!target) continue;
 
-  for (const task of dashboard.tasks ?? []) {
-    await json(request, "DELETE", `/api/tasks/${task.id}`);
-  }
+    try {
+      await json(request, "DELETE", `/api/tasks/${target.taskId}`);
+    } catch {
+      // Ignore already-removed tasks during cleanup.
+    }
 
-  for (const project of dashboard.projects ?? []) {
-    await json(request, "DELETE", `/api/projects/${project.id}`);
+    try {
+      await json(request, "DELETE", `/api/projects/${target.projectId}`);
+    } catch {
+      // Ignore already-removed projects during cleanup.
+    }
   }
 }
 
@@ -78,6 +89,11 @@ async function seedStudySession(request, overrides = {}) {
     ],
     browserEnabled: false,
     authMode: "chatgpt",
+  });
+
+  cleanupEntities.push({
+    projectId: project.id,
+    taskId: task.id,
   });
 
   return { project, task };
@@ -149,11 +165,11 @@ function seedAssistantMessage(taskId, content) {
 }
 
 test.beforeEach(async ({ request }) => {
-  await resetHarnessState(request);
+  await cleanupHarnessState(request);
 });
 
 test.afterEach(async ({ request }) => {
-  await resetHarnessState(request);
+  await cleanupHarnessState(request);
   await Promise.all(cleanupPaths.splice(0).map((target) => rm(target, { recursive: true, force: true })));
 });
 
@@ -215,6 +231,7 @@ test("flashcard artifact scaffold opens and supports card progression", async ({
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: task.title }).click();
 
   await page.getByRole("button", { name: "Lecture 2 Core Cards" }).click();
 
@@ -262,6 +279,7 @@ test("quiz artifact scaffold opens and supports answer checking", async ({ page,
   });
 
   await page.goto("/");
+  await page.getByRole("button", { name: task.title }).click();
 
   await page.getByRole("button", { name: "Lecture Review Quiz" }).click();
 
@@ -289,6 +307,7 @@ test("pdf citations resolve excerpts and open a pdf-backed source preview", asyn
   );
 
   await page.goto("/");
+  await page.getByRole("button", { name: task.title }).click();
 
   const citation = page.locator(".citation-pill.clickable", { hasText: "Lecture 2" }).first();
   await expect(citation).toBeVisible();
@@ -298,10 +317,9 @@ test("pdf citations resolve excerpts and open a pdf-backed source preview", asyn
   await expect(page.locator(".citation-popover-chunk")).toHaveCount(1);
 
   await page.getByRole("button", { name: "Open source" }).click();
-  const iframe = page.locator(".workspace-preview-iframe");
-  await expect(iframe).toBeVisible();
-  await expect(iframe).toHaveAttribute("src", /workspace-files\/.+\/preview/);
-  await expect(iframe).toHaveAttribute("src", /#page=1$/);
+  await expect(page.locator(".pdf-preview-shell")).toBeVisible();
+  await expect(page.locator(".pdf-preview-status")).toContainText("Page 1 of");
+  await expect(page.locator(".pdf-preview-canvas")).toBeVisible();
 });
 
 test("pptx citations open an actual preview route instead of the unsupported placeholder", async ({ page, request }) => {
@@ -319,6 +337,7 @@ test("pptx citations open an actual preview route instead of the unsupported pla
   );
 
   await page.goto("/");
+  await page.getByRole("button", { name: task.title }).click();
 
   const citation = page.locator(".citation-pill.clickable", { hasText: "Lecture 3" }).first();
   await expect(citation).toBeVisible();

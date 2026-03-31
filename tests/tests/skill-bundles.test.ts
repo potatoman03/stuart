@@ -7,8 +7,8 @@ describe("skill bundles", () => {
     expect(skill?.id).toBe("interactive");
     const prompt = resolveSkillPrompt(skill!, "Build an interactive BFS visualiser for lecture 2.");
     expect(prompt).toContain("Skill Bundle: Interactive Artifact");
-    expect(prompt).toContain("Grounding requirements");
-    expect(prompt).toContain("Interaction and visual quality");
+    expect(prompt).toContain("Grounding in workspace materials");
+    expect(prompt).toContain("Visual and interaction quality");
   });
 
   it("loads repo-analysis guidance only when research mentions repositories", () => {

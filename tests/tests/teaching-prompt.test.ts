@@ -41,4 +41,38 @@ describe("buildTeachingInstructions", () => {
     expect(prompt).toContain("The artifact itself is the primary deliverable");
     expect(prompt).toContain("never stop at a prose description plus a filename mention");
   });
+
+  it("forks the teaching block for Socratic workspaces", () => {
+    const project: ProjectRecord = {
+      id: "project-1",
+      name: "CS2106",
+      rootPath: "/tmp/cs2106",
+      config: {
+        teachingStyle: "Socratic",
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const task: TaskSpec = {
+      id: "task-1",
+      projectId: project.id,
+      title: "OS revision",
+      objective: "Help me revise operating systems",
+      globalInstructionProfileId: "default",
+      folderInstructionIds: [],
+      attachments: [],
+      networkPolicyId: "default",
+      authMode: "chatgpt",
+      browserEnabled: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const prompt = buildTeachingInstructions(project, task);
+
+    expect(prompt).toContain("Do NOT lead with the final answer");
+    expect(prompt).toContain("Hint before explaining");
+    expect(prompt).not.toContain("Start with the direct answer or core takeaway");
+  });
 });

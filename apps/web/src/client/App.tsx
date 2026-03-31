@@ -2895,6 +2895,7 @@ function App() {
                     setOpenArtifact((cur) => cur ? { ...cur, payload: newPayload } : null);
                   } catch { /* save failed silently */ }
                 } : undefined}
+                socraticEnabled={selectedProject?.config?.teachingStyle?.trim().toLowerCase() === "socratic"}
                 onInlineAsk={(message) => {
                   if (!selectedTaskId) return;
                   setInlineResponse(null);
