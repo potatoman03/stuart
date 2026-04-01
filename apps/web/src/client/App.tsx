@@ -249,9 +249,9 @@ function dedupeCitationResults(results: IngestionSearchResult[]): IngestionSearc
   });
 }
 
-function workspaceFileShouldOpenDirectly(file: WorkspaceFileRecord): boolean {
-  return file.sourceKind === "staging"
-    || file.previewKind === "image"
+/** Citation pills: show excerpt popover for PDFs/docs (including staged); only skip for inline previews. */
+function citationPillShouldOpenWorkspaceDirectly(file: WorkspaceFileRecord): boolean {
+  return file.previewKind === "image"
     || file.previewKind === "html"
     || file.previewKind === "jsx";
 }
@@ -5801,7 +5801,7 @@ function CitationPillClickable({
     const matchedFile = resolveWorkspaceFile
       ? await resolveWorkspaceFile(sourcePath || label, sourcePath)
       : null;
-    if (matchedFile && workspaceFileShouldOpenDirectly(matchedFile) && openWorkspaceFile) {
+    if (matchedFile && citationPillShouldOpenWorkspaceDirectly(matchedFile) && openWorkspaceFile) {
       await openWorkspaceFile(sourcePath || label, sourcePath);
       return;
     }

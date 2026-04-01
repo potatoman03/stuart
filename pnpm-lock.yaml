@@ -67,6 +67,24 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
     optionalDependencies:
+      '@esbuild/darwin-arm64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/darwin-x64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/linux-arm64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/linux-x64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/win32-arm64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/win32-x64':
+        specifier: 0.25.12
+        version: 0.25.12
       '@resvg/resvg-js-darwin-arm64':
         specifier: ^2.6.2
         version: 2.6.2
@@ -239,6 +257,25 @@ importers:
       vite:
         specifier: ^6.2.1
         version: 6.4.1(@types/node@25.5.0)(jiti@2.6.1)(lightningcss@1.31.1)(tsx@4.21.0)
+    optionalDependencies:
+      '@esbuild/darwin-arm64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/darwin-x64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/linux-arm64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/linux-x64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/win32-arm64':
+        specifier: 0.25.12
+        version: 0.25.12
+      '@esbuild/win32-x64':
+        specifier: 0.25.12
+        version: 0.25.12
 
   packages/db:
     dependencies:

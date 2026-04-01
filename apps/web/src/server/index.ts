@@ -808,6 +808,7 @@ async function renderJsxPreview(absolutePath: string, title: string): Promise<st
   const source = await readFile(absolutePath, "utf8");
   const shouldWrap = !/createRoot\s*\(|ReactDOM\.render\s*\(/.test(source);
   const virtualEntry = "__stuart_preview_entry__";
+  try {
   const bundle = await buildBundle({
     absWorkingDir: dirname(absolutePath),
     nodePaths: [
@@ -914,6 +915,16 @@ async function renderJsxPreview(absolutePath: string, title: string): Promise<st
       <script>${script}</script>
     </body>
   </html>`;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return buildPreviewDocument(
+      title,
+      `<pre>${escapeHtml(source)}</pre>`,
+      [
+        `Could not bundle this JSX preview (${escapeHtml(detail)}). Showing raw source. Interactive preview needs the esbuild native binary for your platform (included with the desktop app after pnpm install).`,
+      ],
+    );
+  }
 }
 
 function buildPreviewDocument(title: string, content: string, notices: string[] = []): string {

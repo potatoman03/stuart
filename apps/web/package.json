@@ -51,6 +51,14 @@
     "tiptap-markdown": "^0.8.10",
     "xlsx": "^0.18.5"
   },
+  "optionalDependencies": {
+    "@esbuild/darwin-arm64": "0.25.12",
+    "@esbuild/darwin-x64": "0.25.12",
+    "@esbuild/linux-arm64": "0.25.12",
+    "@esbuild/linux-x64": "0.25.12",
+    "@esbuild/win32-arm64": "0.25.12",
+    "@esbuild/win32-x64": "0.25.12"
+  },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.1",

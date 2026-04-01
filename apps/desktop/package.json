@@ -32,6 +32,12 @@
     "typescript": "^5.9.3"
   },
   "optionalDependencies": {
+    "@esbuild/darwin-arm64": "0.25.12",
+    "@esbuild/darwin-x64": "0.25.12",
+    "@esbuild/linux-arm64": "0.25.12",
+    "@esbuild/linux-x64": "0.25.12",
+    "@esbuild/win32-arm64": "0.25.12",
+    "@esbuild/win32-x64": "0.25.12",
     "@resvg/resvg-js-darwin-arm64": "^2.6.2",
     "@resvg/resvg-js-darwin-x64": "^2.6.2",
     "@resvg/resvg-js-linux-arm64-gnu": "^2.6.2",
