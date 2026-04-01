@@ -241,6 +241,30 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     response.status(204).end();
   }));
 
+  router.post("/projects/:projectId/archive", (request, response) => {
+    const archived = runtime.archiveProject(firstParam(request.params.projectId));
+    if (!archived) {
+      response.status(404).send("Project not found or already archived.");
+      return;
+    }
+    broadcastEvent(eventClients, { type: "project.updated", projectId: firstParam(request.params.projectId) });
+    response.json({ ok: true });
+  });
+
+  router.post("/projects/:projectId/unarchive", (request, response) => {
+    const unarchived = runtime.unarchiveProject(firstParam(request.params.projectId));
+    if (!unarchived) {
+      response.status(404).send("Project not found or not archived.");
+      return;
+    }
+    broadcastEvent(eventClients, { type: "project.updated", projectId: firstParam(request.params.projectId) });
+    response.json({ ok: true });
+  });
+
+  router.get("/projects/archived", (_request, response) => {
+    response.json(runtime.listArchivedProjects());
+  });
+
   router.get("/tasks", (_request, response) => {
     response.json(runtime.listTasks());
   });
@@ -272,6 +296,30 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
     }
     response.status(204).end();
   }));
+
+  router.post("/tasks/:taskId/archive", (request, response) => {
+    const archived = runtime.archiveTask(firstParam(request.params.taskId));
+    if (!archived) {
+      response.status(404).send("Task not found or already archived.");
+      return;
+    }
+    broadcastEvent(eventClients, { type: "task.updated", taskId: firstParam(request.params.taskId) });
+    response.json({ ok: true });
+  });
+
+  router.post("/tasks/:taskId/unarchive", (request, response) => {
+    const unarchived = runtime.unarchiveTask(firstParam(request.params.taskId));
+    if (!unarchived) {
+      response.status(404).send("Task not found or not archived.");
+      return;
+    }
+    broadcastEvent(eventClients, { type: "task.updated", taskId: firstParam(request.params.taskId) });
+    response.json({ ok: true });
+  });
+
+  router.get("/tasks/archived", (_request, response) => {
+    response.json(runtime.listArchivedTasks());
+  });
 
   router.get("/tasks/:taskId/messages", (request, response) => {
     response.json(runtime.listTaskMessages(firstParam(request.params.taskId)));

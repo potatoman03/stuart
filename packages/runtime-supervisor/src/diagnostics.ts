@@ -148,6 +148,34 @@ export async function collectSystemDiagnostics(
         : `Run \`${codexCommand.displayCommand} login\` and complete authentication.`),
   });
 
+  const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
+  checks.push({
+    id: "gemini-native",
+    label: "Gemini native runtime",
+    status: geminiApiKey ? "ok" : "warn",
+    required: false,
+    summary: geminiApiKey
+      ? "Gemini native startup is configured via GEMINI_API_KEY."
+      : "Gemini native startup is not configured.",
+    detail: geminiApiKey ? undefined : "Set GEMINI_API_KEY to enable direct Gemini API startup.",
+    resolution: geminiApiKey ? undefined : "Add GEMINI_API_KEY to your environment or .env before choosing Gemini native in workspace setup.",
+  });
+
+  const minimaxCredential = process.env.MINIMAX_API_KEY?.trim() || process.env.MINIMAX_ACCESS_TOKEN?.trim();
+  checks.push({
+    id: "minimax-native",
+    label: "MiniMax native runtime",
+    status: minimaxCredential ? "ok" : "warn",
+    required: false,
+    summary: minimaxCredential
+      ? "MiniMax native startup is configured."
+      : "MiniMax native startup is not configured.",
+    detail: minimaxCredential
+      ? undefined
+      : "Set MINIMAX_API_KEY for direct API access. MiniMax's public docs also show an OAuth setup flow inside OpenClaw, but Stuart does not yet depend on that flow.",
+    resolution: minimaxCredential ? undefined : "Add MINIMAX_API_KEY to your environment or .env before choosing MiniMax native in workspace setup.",
+  });
+
   if (surface === "developer") {
     const envPresent = existsSync(envFilePath);
     checks.push({

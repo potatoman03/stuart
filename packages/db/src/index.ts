@@ -39,6 +39,7 @@ import type {
   WorkspaceConfig
 } from "@stuart/shared";
 import {
+  DEFAULT_TASK_RUNTIME_PROFILE,
   DEFAULT_GLOBAL_INSTRUCTION_PROFILE,
   DEFAULT_NETWORK_POLICY
 } from "@stuart/shared";
@@ -46,6 +47,7 @@ import {
 type DbTaskRow = Omit<TaskSpec, "attachments" | "folderInstructionIds"> & {
   attachmentsJson: string;
   folderInstructionIdsJson: string;
+  runtimeProfileJson?: string | null;
 };
 
 type DbTaskWorkerRow = Omit<TaskWorkerRecord, "attachmentIds" | "parentTaskId"> & {
@@ -338,6 +340,23 @@ export class LocalDatabase {
       // Column already exists — safe to ignore
     }
 
+    // Archive support for projects and tasks
+    try {
+      this.db.exec("ALTER TABLE projects ADD COLUMN archived_at TEXT");
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN archived_at TEXT");
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN runtime_profile_json TEXT");
+    } catch {
+      // Column already exists — safe to ignore
+    }
+
     // Student memory table for cross-session structured memory
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS student_memories (
@@ -480,12 +499,30 @@ export class LocalDatabase {
   }
 
   listProjects(): ProjectRecord[] {
-    const rows = asRows<ProjectRecord & { configJson?: string }>(
+    const rows = asRows<ProjectRecord & { configJson?: string; archivedAt?: string | null }>(
       this.db
       .prepare(
-        `SELECT id, name, root_path as rootPath, config_json as configJson, created_at as createdAt, updated_at as updatedAt
+        `SELECT id, name, root_path as rootPath, config_json as configJson, archived_at as archivedAt, created_at as createdAt, updated_at as updatedAt
          FROM projects
+         WHERE archived_at IS NULL
          ORDER BY updated_at DESC`
+      )
+      .all()
+    );
+    return rows.map(({ configJson, ...rest }) => ({
+      ...rest,
+      config: configJson ? JSON.parse(configJson) as WorkspaceConfig : undefined
+    }));
+  }
+
+  listArchivedProjects(): ProjectRecord[] {
+    const rows = asRows<ProjectRecord & { configJson?: string; archivedAt?: string | null }>(
+      this.db
+      .prepare(
+        `SELECT id, name, root_path as rootPath, config_json as configJson, archived_at as archivedAt, created_at as createdAt, updated_at as updatedAt
+         FROM projects
+         WHERE archived_at IS NOT NULL
+         ORDER BY archived_at DESC`
       )
       .all()
     );
@@ -528,7 +565,7 @@ export class LocalDatabase {
   getProject(projectId: string): ProjectRecord | undefined {
     const row = this.db
       .prepare(
-        `SELECT id, name, root_path as rootPath, config_json as configJson, created_at as createdAt, updated_at as updatedAt
+        `SELECT id, name, root_path as rootPath, config_json as configJson, archived_at as archivedAt, created_at as createdAt, updated_at as updatedAt
          FROM projects
          WHERE id = ?`
       )
@@ -555,12 +592,45 @@ export class LocalDatabase {
           attachments_json as attachmentsJson,
           network_policy_id as networkPolicyId,
           auth_mode as authMode,
+          runtime_profile_json as runtimeProfileJson,
           browser_enabled as browserEnabled,
           schedule_rrule as scheduleRRule,
+          archived_at as archivedAt,
           created_at as createdAt,
           updated_at as updatedAt
          FROM tasks
+         WHERE archived_at IS NULL
          ORDER BY updated_at DESC`
+      )
+      .all()
+    );
+
+    return rows.map((row) => this.mapTask(row));
+  }
+
+  listArchivedTasks(): TaskSpec[] {
+    const rows = asRows<DbTaskRow>(
+      this.db
+      .prepare(
+        `SELECT
+          id,
+          project_id as projectId,
+          title,
+          objective,
+          global_instruction_profile_id as globalInstructionProfileId,
+          folder_instruction_ids_json as folderInstructionIdsJson,
+          attachments_json as attachmentsJson,
+          network_policy_id as networkPolicyId,
+          auth_mode as authMode,
+          runtime_profile_json as runtimeProfileJson,
+          browser_enabled as browserEnabled,
+          schedule_rrule as scheduleRRule,
+          archived_at as archivedAt,
+          created_at as createdAt,
+          updated_at as updatedAt
+         FROM tasks
+         WHERE archived_at IS NOT NULL
+         ORDER BY archived_at DESC`
       )
       .all()
     );
@@ -582,8 +652,10 @@ export class LocalDatabase {
             attachments_json as attachmentsJson,
             network_policy_id as networkPolicyId,
             auth_mode as authMode,
+            runtime_profile_json as runtimeProfileJson,
             browser_enabled as browserEnabled,
             schedule_rrule as scheduleRRule,
+            archived_at as archivedAt,
             created_at as createdAt,
             updated_at as updatedAt
            FROM tasks
@@ -609,8 +681,10 @@ export class LocalDatabase {
           attachments_json as attachmentsJson,
           network_policy_id as networkPolicyId,
           auth_mode as authMode,
+          runtime_profile_json as runtimeProfileJson,
           browser_enabled as browserEnabled,
           schedule_rrule as scheduleRRule,
+          archived_at as archivedAt,
           created_at as createdAt,
           updated_at as updatedAt
          FROM tasks
@@ -623,6 +697,7 @@ export class LocalDatabase {
 
   createTask(input: CreateTaskInput): TaskSpec {
     const now = new Date().toISOString();
+    const runtimeProfile = normalizeTaskRuntimeProfile(input.runtimeProfile, input.authMode);
     const record: TaskSpec = {
       id: randomUUID(),
       projectId: input.projectId,
@@ -633,7 +708,8 @@ export class LocalDatabase {
       folderInstructionIds: input.folderInstructionIds ?? [],
       attachments: input.attachments,
       networkPolicyId: input.networkPolicyId ?? DEFAULT_NETWORK_POLICY,
-      authMode: input.authMode ?? "chatgpt",
+      authMode: runtimeProfile.authMode,
+      runtimeProfile,
       browserEnabled: input.browserEnabled ?? false,
       scheduleRRule: input.scheduleRRule,
       createdAt: now,
@@ -652,6 +728,7 @@ export class LocalDatabase {
           attachments_json,
           network_policy_id,
           auth_mode,
+          runtime_profile_json,
           browser_enabled,
           schedule_rrule,
           created_at,
@@ -667,6 +744,7 @@ export class LocalDatabase {
           @attachmentsJson,
           @networkPolicyId,
           @authMode,
+          @runtimeProfileJson,
           @browserEnabled,
           @scheduleRRule,
           @createdAt,
@@ -684,6 +762,7 @@ export class LocalDatabase {
         attachmentsJson: JSON.stringify(record.attachments),
         networkPolicyId: record.networkPolicyId,
         authMode: record.authMode,
+        runtimeProfileJson: JSON.stringify(record.runtimeProfile),
         scheduleRRule: record.scheduleRRule ?? null,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt
@@ -698,11 +777,14 @@ export class LocalDatabase {
       throw new Error(`Task ${taskId} not found.`);
     }
 
+    const runtimeProfile = normalizeTaskRuntimeProfile(input.runtimeProfile ?? current.runtimeProfile, input.authMode ?? current.authMode);
     const updated: TaskSpec = {
       ...current,
       ...input,
       attachments: input.attachments ?? current.attachments,
       folderInstructionIds: input.folderInstructionIds ?? current.folderInstructionIds,
+      authMode: runtimeProfile.authMode,
+      runtimeProfile,
       updatedAt: new Date().toISOString()
     };
 
@@ -717,6 +799,7 @@ export class LocalDatabase {
              attachments_json = @attachmentsJson,
              network_policy_id = @networkPolicyId,
              auth_mode = @authMode,
+             runtime_profile_json = @runtimeProfileJson,
              browser_enabled = @browserEnabled,
              schedule_rrule = @scheduleRRule,
              updated_at = @updatedAt
@@ -732,6 +815,7 @@ export class LocalDatabase {
         attachmentsJson: JSON.stringify(updated.attachments),
         networkPolicyId: updated.networkPolicyId,
         authMode: updated.authMode,
+        runtimeProfileJson: JSON.stringify(updated.runtimeProfile),
         browserEnabled: updated.browserEnabled ? 1 : 0,
         scheduleRRule: updated.scheduleRRule ?? null,
         updatedAt: updated.updatedAt
@@ -945,6 +1029,34 @@ export class LocalDatabase {
 
   deleteProject(projectId: string): boolean {
     const result = this.db.prepare(`DELETE FROM projects WHERE id = ?`).run(projectId);
+    return Number(result.changes ?? 0) > 0;
+  }
+
+  archiveProject(projectId: string): boolean {
+    const result = this.db
+      .prepare(`UPDATE projects SET archived_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND archived_at IS NULL`)
+      .run(projectId);
+    return Number(result.changes ?? 0) > 0;
+  }
+
+  unarchiveProject(projectId: string): boolean {
+    const result = this.db
+      .prepare(`UPDATE projects SET archived_at = NULL, updated_at = datetime('now') WHERE id = ? AND archived_at IS NOT NULL`)
+      .run(projectId);
+    return Number(result.changes ?? 0) > 0;
+  }
+
+  archiveTask(taskId: string): boolean {
+    const result = this.db
+      .prepare(`UPDATE tasks SET archived_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND archived_at IS NULL`)
+      .run(taskId);
+    return Number(result.changes ?? 0) > 0;
+  }
+
+  unarchiveTask(taskId: string): boolean {
+    const result = this.db
+      .prepare(`UPDATE tasks SET archived_at = NULL, updated_at = datetime('now') WHERE id = ? AND archived_at IS NOT NULL`)
+      .run(taskId);
     return Number(result.changes ?? 0) > 0;
   }
 
@@ -3541,8 +3653,13 @@ export class LocalDatabase {
       attachments: JSON.parse(row.attachmentsJson),
       networkPolicyId: row.networkPolicyId,
       authMode: row.authMode,
+      runtimeProfile: normalizeTaskRuntimeProfile(
+        row.runtimeProfileJson ? JSON.parse(row.runtimeProfileJson) : undefined,
+        row.authMode
+      ),
       browserEnabled: Boolean(row.browserEnabled),
       scheduleRRule: row.scheduleRRule,
+      archivedAt: row.archivedAt ?? null,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt
     };
@@ -3566,6 +3683,36 @@ export class LocalDatabase {
       completedAt: row.completedAt
     };
   }
+}
+
+function normalizeTaskRuntimeProfile(
+  value: TaskSpec["runtimeProfile"] | undefined,
+  authMode?: TaskSpec["authMode"] | null
+): TaskSpec["runtimeProfile"] {
+  const base = DEFAULT_TASK_RUNTIME_PROFILE;
+  const provider = value?.provider ?? base.provider;
+  const native = value?.native ?? (provider !== "codex");
+  const fallbackAuthMode = provider === "codex"
+    ? "chatgpt"
+    : provider === "minimax" && authMode === "oauth"
+      ? "oauth"
+      : "api_key";
+  return {
+    provider,
+    authMode: value?.authMode ?? authMode ?? fallbackAuthMode,
+    model: value?.model ?? defaultModelForProvider(provider),
+    native,
+  };
+}
+
+function defaultModelForProvider(provider: TaskSpec["runtimeProfile"]["provider"]): string {
+  if (provider === "gemini") {
+    return "gemini-2.5-flash";
+  }
+  if (provider === "minimax") {
+    return "MiniMax-M2.7";
+  }
+  return DEFAULT_TASK_RUNTIME_PROFILE.model;
 }
 
 function asRows<T>(rows: unknown): T[] {

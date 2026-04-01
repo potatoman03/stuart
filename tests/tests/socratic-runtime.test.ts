@@ -111,6 +111,40 @@ describe("Socratic runtime flow", () => {
     }
   });
 
+  it("keeps the first-pass workspace overview direct even in Socratic workspaces", async () => {
+    const { runtime, workspaceRoot, requests } = await createStubbedRuntime();
+    try {
+      const project = runtime.createProject({
+        name: "OS",
+        rootPath: workspaceRoot,
+        config: { teachingStyle: "Socratic" },
+      });
+      const task = runtime.createTask({
+        projectId: project.id,
+        title: "Study",
+        objective: "Learn OS",
+        attachments: [],
+      });
+
+      await runtime.sendTaskMessage(
+        task.id,
+        "I just added my study materials. Please read through everything and give me a brief overview of what's in there. For this first reply, just give me a concise high-level summary of the workspace and then ask me what I'd like to focus on."
+      );
+
+      const turnStart = requests.find((entry) => entry.method === "turn/start");
+      const input = (turnStart?.params.input ?? []) as Array<{ text?: string }>;
+      expect(input.some((item) => item.text?.includes("## Turn tutoring policy"))).toBe(false);
+
+      const turns = (runtime as unknown as {
+        turns: Map<string, { socratic?: { active: boolean; hintLevel: number } }>;
+      }).turns;
+      const activeTurn = [...turns.values()][0];
+      expect(activeTurn?.socratic).toBeUndefined();
+    } finally {
+      await runtime.close();
+    }
+  });
+
   it("requires two direct-answer requests before enabling direct override", async () => {
     const { runtime, workspaceRoot, requests } = await createStubbedRuntime();
     try {

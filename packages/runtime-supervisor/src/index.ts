@@ -54,6 +54,11 @@ import {
   collectSystemDiagnostics,
   type SystemDiagnostics
 } from "./diagnostics.js";
+import {
+  buildTurnExecutionPlan,
+  buildWorkerExecutionPlan,
+  resolveTaskRuntimeProfile,
+} from "./runtime-planning.js";
 
 export { renderDocument } from "./document-renderer.js";
 export {
@@ -506,6 +511,30 @@ export class StuartRuntime {
     return this.db.deleteProject(projectId);
   }
 
+  archiveProject(projectId: string): boolean {
+    return this.db.archiveProject(projectId);
+  }
+
+  unarchiveProject(projectId: string): boolean {
+    return this.db.unarchiveProject(projectId);
+  }
+
+  archiveTask(taskId: string): boolean {
+    return this.db.archiveTask(taskId);
+  }
+
+  unarchiveTask(taskId: string): boolean {
+    return this.db.unarchiveTask(taskId);
+  }
+
+  listArchivedProjects() {
+    return this.db.listArchivedProjects();
+  }
+
+  listArchivedTasks() {
+    return this.db.listArchivedTasks();
+  }
+
   listTasks() {
     return this.db.listTasks();
   }
@@ -565,11 +594,12 @@ export class StuartRuntime {
         text_elements: []
       }
     ];
+    const workerPlan = buildWorkerExecutionPlan(task);
     const turn = await this.codex.request<{ turn: { id: string } }>("turn/start", {
       threadId,
       cwd: context.cwd,
       approvalPolicy: "never",
-      effort: "medium",
+      effort: workerPlan.effort,
       input: inputItems
     });
 
@@ -1027,27 +1057,15 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     }
     await this.stageSkillBundleAssets(context.cwd, skills);
 
-    // Determine model + effort per turn based on what's needed.
-    // Sandbox scripts (Python/JS doc gen) → flagship gpt-5.4 + high effort.
-    // Research, interactive, artifacts → gpt-5.4-mini at high effort.
-    // Everything else → gpt-5.4-mini (set on thread) with dynamic effort.
-    const needsFlagship = skills.some((skill) =>
-      skill.requiresSandbox
-    );
-    const isResearch = skills.some((skill) => skill.id === "research");
-    const isCodeGen = skills.some((skill) => skill.id === "interactive");
-    const isArtifactTurn = skills.some((skill) => skill.id !== "research");
-    const isSimpleQuery = /^explain|^what is|^define|^describe|^tell me about/i.test(trimmed) && trimmed.length < 200;
-    const turnModel = needsFlagship ? "gpt-5.4" : undefined; // undefined = use thread default (mini)
-    const effort = needsFlagship ? "high"
-      : (isResearch || isCodeGen) ? "high"
-      : isSimpleQuery ? "low"
-      : isLargeMaterialSet && !targetedFiles.length ? "high"
-      : "medium";
-    const stallTimeoutMs =
-      isResearch || isArtifactTurn || isLargeMaterialSet
-        ? complexTurnStallMs
-        : defaultTurnStallMs;
+    const executionPlan = buildTurnExecutionPlan({
+      task,
+      message: trimmed,
+      skills,
+      isLargeMaterialSet: Boolean(isLargeMaterialSet),
+      hasTargetedFiles: targetedFiles.length > 0,
+      defaultTurnStallMs,
+      complexTurnStallMs,
+    });
 
     // Detect weak-topic intent and inject performance context
     const isWeakTopicRequest = /\bweak\s*(topic|area)s?\b|\bstruggl|\bfocus.*weak|\bworst\b/i.test(trimmed);
@@ -1129,8 +1147,8 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       threadId,
       cwd: context.cwd,
       approvalPolicy: "never",
-      ...(turnModel ? { model: turnModel } : {}),
-      effort,
+      ...(executionPlan.turnModel ? { model: executionPlan.turnModel } : {}),
+      effort: executionPlan.effort,
       input
     });
 
@@ -1138,14 +1156,14 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
     const spawnedSkillWorkers = await this.spawnSkillWorkers(task, context, trimmed, skills).catch(
       () => false
     );
-    if (!spawnedSkillWorkers && isLargeMaterialSet && !targetedFiles.length && !isSimpleQuery && !isResearch) {
+    if (!spawnedSkillWorkers && executionPlan.shouldSpawnExploreWorkers) {
       void this.spawnExploreWorkers(task, context, trimmed).catch(() => {
         // Non-critical — the main turn will still work
       });
     }
 
     // For research tasks, spawn research workers to fetch content in parallel
-    if (isResearch) {
+    if (executionPlan.shouldSpawnResearchWorkers) {
       void this.spawnResearchWorkers(task, context, trimmed).catch(() => {
         // Non-critical — the main turn will still handle research
       });
@@ -1161,7 +1179,7 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
       assistantText: "",
       thinkingLabel: inferThinkingLabel(task, trimmed),
       startedEmitted: true,
-      stallTimeoutMs,
+      stallTimeoutMs: executionPlan.stallTimeoutMs,
       cwd: context.cwd,
       triggersReindex: skills.some((skill) => skill.triggersReindex),
       userMessage: trimmed,
@@ -2048,6 +2066,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
   }
 
   private async startTaskThread(task: TaskSpec, cwd: string): Promise<string> {
+    const runtimeProfile = resolveTaskRuntimeProfile(task);
     const project = this.db.getProject(task.projectId);
     const started = await this.codex.request<{
       thread: { id: string };
@@ -2056,7 +2075,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       approvalPolicy: "never",
       sandbox: "danger-full-access",
       personality: "pragmatic",
-      model: "gpt-5.4-mini",
+      model: runtimeProfile.provider === "codex" ? runtimeProfile.model : "gpt-5.4-mini",
       developerInstructions: buildTeachingInstructions(project ?? { id: "", name: "Study", rootPath: cwd, createdAt: "", updatedAt: "" }, task, this.db),
       serviceName: "Stuart",
       persistExtendedHistory: true,
@@ -2104,6 +2123,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
     worker: TaskWorkerRecord,
     cwd: string
   ): Promise<string> {
+    const workerPlan = buildWorkerExecutionPlan(task);
     const started = await this.codex.request<{
       thread: { id: string };
     }>("thread/start", {
@@ -2111,7 +2131,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       approvalPolicy: "never",
       sandbox: "danger-full-access",
       personality: "pragmatic",
-      model: "gpt-5.4-mini",
+      model: workerPlan.threadModel,
       developerInstructions: buildWorkerDeveloperInstructions(task, worker),
       serviceName: `Stuart Worker:${worker.role}`,
       persistExtendedHistory: true
@@ -3238,6 +3258,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       `- ${attachment.mode}: ${attachment.hostPath} -> ${relative(run.stagingPath, attachment.stagingPath)}`
     );
 
+    const runtimeProfile = resolveTaskRuntimeProfile(task);
     const memorySections = [
       "# Stuart Workspace Memory",
       "",
@@ -3246,7 +3267,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       "## Task",
       `- Title: ${task.title}`,
       `- Objective: ${task.objective}`,
-      `- Auth: ${task.authMode === "chatgpt" ? "ChatGPT sign-in" : "API key"}`,
+      `- Runtime: ${formatRuntimeProfile(runtimeProfile)}`,
       `- Browser: ${task.browserEnabled ? "enabled" : "disabled"}`,
       "",
       "## Scope",
@@ -3744,6 +3765,8 @@ function buildTeachingStyleBlock(project: ProjectRecord): string {
   if (isSocraticTeachingStyle(project)) {
     return `## Teaching style
 - Be concise, effective, and digestible by default.
+- Use a direct, concise overview for workspace summaries, first-pass reports, administrative updates, and orientation turns.
+- Switch into Socratic teaching only when the student is asking to understand, explain, reason through, or solve something.
 - Do NOT lead with the final answer when the student is trying to learn or reason something out.
 - Ask the student what they think first when a retrieval attempt or rough guess would help them learn.
 - Probe reasoning before correcting. Prefer one focused question or one hint at a time.
@@ -3773,6 +3796,12 @@ function looksLikeSocraticOptIn(message: string): boolean {
   return /\b(coach me|don't just tell me|dont just tell me|guide me|hint me|ask me first|quiz me on this)\b/i.test(message);
 }
 
+function looksLikeTeachingRequest(message: string): boolean {
+  const trimmed = message.trim();
+  if (!trimmed) return false;
+  return /\b(explain|help me understand|teach me|walk me through|work through|reason through|coach me|guide me|quiz me|test me|why\b|how\b|what does\b|what is\b|what are\b|solve\b|derive\b|prove\b|compare\b|clarify\b)\b/i.test(trimmed);
+}
+
 function looksStuck(message: string): boolean {
   return /\b(i don't know|i dont know|idk|no idea|not sure|i'm stuck|im stuck|stuck)\b/i.test(message);
 }
@@ -3792,7 +3821,7 @@ function buildSocraticTurnContext(params: {
   contextText: string;
 } {
   const { project, message, previous } = params;
-  const baselineSocratic = isSocraticTeachingStyle(project);
+  const baselineSocratic = isSocraticTeachingStyle(project) && looksLikeTeachingRequest(message);
   const socraticOptIn = looksLikeSocraticOptIn(message);
   const directOverrideRequested = looksLikeDirectOverrideRequest(message);
   const continuingPriorExchange = Boolean(previous) && !looksLikeNewQuestion(message);
@@ -3919,6 +3948,20 @@ function sanitizeSocraticCompletion(
     : text;
 }
 
+function formatRuntimeProfile(profile: { provider: string; authMode: string; model: string; native: boolean }): string {
+  const providerLabel = profile.provider === "codex"
+    ? "Codex"
+    : profile.provider === "gemini"
+      ? "Gemini"
+      : "MiniMax";
+  const authLabel = profile.authMode === "chatgpt"
+    ? "ChatGPT sign-in"
+    : profile.authMode === "oauth"
+      ? "OAuth"
+      : "API key";
+  return `${providerLabel} ${profile.native ? "native" : "managed"} / ${profile.model} / ${authLabel}`;
+}
+
 function buildWorkspaceConfigContext(project: ProjectRecord): string {
   const cfg = project.config;
   if (!cfg) return "";
@@ -3927,6 +3970,8 @@ function buildWorkspaceConfigContext(project: ProjectRecord): string {
   if (cfg.teachingStyle) lines.push(`- Teaching style preference: ${cfg.teachingStyle}`);
   if (cfg.goal) lines.push(`- Goal: ${cfg.goal}`);
   if (cfg.additionalNotes) lines.push(`- Additional notes: ${cfg.additionalNotes}`);
+  if (cfg.runtimeProfile) lines.push(`- Preferred runtime: ${formatRuntimeProfile(cfg.runtimeProfile)}`);
+  if (cfg.startupPreferences?.startMode) lines.push(`- Preferred workspace start mode: ${cfg.startupPreferences.startMode}`);
   if (lines.length === 0) return "";
   return `\n\n## Workspace context\n${lines.join("\n")}`;
 }

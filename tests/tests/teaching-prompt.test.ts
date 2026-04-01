@@ -71,6 +71,8 @@ describe("buildTeachingInstructions", () => {
 
     const prompt = buildTeachingInstructions(project, task);
 
+    expect(prompt).toContain("Use a direct, concise overview for workspace summaries");
+    expect(prompt).toContain("Switch into Socratic teaching only when the student is asking to understand, explain, reason through, or solve something");
     expect(prompt).toContain("Do NOT lead with the final answer");
     expect(prompt).toContain("Hint before explaining");
     expect(prompt).not.toContain("Start with the direct answer or core takeaway");

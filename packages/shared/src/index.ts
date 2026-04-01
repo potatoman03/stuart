@@ -1,4 +1,8 @@
 export type AttachmentMode = "reference" | "editable" | "output";
+export type RuntimeProvider = "codex" | "gemini" | "minimax";
+export type RuntimeAuthMode = "chatgpt" | "api_key" | "oauth";
+export type RuntimeEffort = "low" | "medium" | "high";
+export type WorkspaceStartMode = "guided" | "direct";
 
 export type TaskRunStatus =
   | "draft"
@@ -64,13 +68,27 @@ export type WorkspaceConfig = {
   teachingStyle?: string;
   goal?: string;
   additionalNotes?: string;
+  runtimeProfile?: TaskRuntimeProfile;
+  startupPreferences?: WorkspaceStartupPreferences;
 };
+
+export interface TaskRuntimeProfile {
+  provider: RuntimeProvider;
+  authMode: RuntimeAuthMode;
+  model: string;
+  native: boolean;
+}
+
+export interface WorkspaceStartupPreferences {
+  startMode?: WorkspaceStartMode;
+}
 
 export interface ProjectRecord {
   id: string;
   name: string;
   rootPath: string;
   config?: WorkspaceConfig;
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -95,9 +113,11 @@ export interface TaskSpec {
   folderInstructionIds: string[];
   attachments: ProjectAttachment[];
   networkPolicyId: string;
-  authMode: "chatgpt" | "api_key";
+  authMode: RuntimeAuthMode;
+  runtimeProfile: TaskRuntimeProfile;
   browserEnabled: boolean;
   scheduleRRule?: string;
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -110,7 +130,8 @@ export interface CreateTaskInput {
   folderInstructionIds?: string[];
   attachments: ProjectAttachment[];
   networkPolicyId?: string;
-  authMode?: "chatgpt" | "api_key";
+  authMode?: RuntimeAuthMode;
+  runtimeProfile?: TaskRuntimeProfile;
   browserEnabled?: boolean;
   scheduleRRule?: string;
 }
@@ -123,7 +144,8 @@ export interface UpdateTaskInput {
   folderInstructionIds?: string[];
   attachments?: ProjectAttachment[];
   networkPolicyId?: string;
-  authMode?: "chatgpt" | "api_key";
+  authMode?: RuntimeAuthMode;
+  runtimeProfile?: TaskRuntimeProfile;
   browserEnabled?: boolean;
   scheduleRRule?: string;
 }
@@ -524,6 +546,12 @@ export type WorkspaceEvent =
 
 export const DEFAULT_GLOBAL_INSTRUCTION_PROFILE = "default";
 export const DEFAULT_NETWORK_POLICY = "ask";
+export const DEFAULT_TASK_RUNTIME_PROFILE: TaskRuntimeProfile = {
+  provider: "codex",
+  authMode: "chatgpt",
+  model: "gpt-5.4-mini",
+  native: false,
+};
 
 export type StudyArtifactKind =
   | "mindmap" | "flashcards" | "quiz" | "diagram" | "custom" | "mock_exam" | "interactive"

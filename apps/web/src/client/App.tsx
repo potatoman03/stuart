@@ -4,6 +4,9 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { renderMermaidSvg } from "./study-doc/rendering";
+import {
+  DEFAULT_TASK_RUNTIME_PROFILE,
+} from "@stuart/shared";
 import type {
   ApprovalRecord,
   ArtifactDraft,
@@ -15,10 +18,12 @@ import type {
   ProjectAttachment,
   ProjectLearningSummary,
   ProjectRecord,
+  RuntimeProvider,
   StudyArtifactKind,
   StudyArtifactRecord,
   StudyTimelineEntry,
   TaskMessageRecord,
+  TaskRuntimeProfile,
   TaskPerformanceBreakdown,
   TaskRunRecord,
   TaskSpec,
@@ -28,6 +33,7 @@ import type {
   WorkspaceConfig,
   WorkspaceEvent,
   WorkspaceFileRecord,
+  WorkspaceStartMode,
   IngestionSearchResult
 } from "@stuart/shared";
 import ArtifactCanvas from "./ArtifactCanvas";
@@ -110,6 +116,32 @@ type IngestionOverview = {
   stats: IngestionIndexStats;
   documents: IngestionDocumentRecord[];
 };
+
+type LibraryContextMenuState =
+  | {
+      kind: "project";
+      projectId: string;
+      projectName: string;
+      x: number;
+      y: number;
+    }
+  | {
+      kind: "task";
+      taskId: string;
+      x: number;
+      y: number;
+    };
+
+type LibraryContextMenuInput =
+  | {
+      kind: "project";
+      projectId: string;
+      projectName: string;
+    }
+  | {
+      kind: "task";
+      taskId: string;
+    };
 
 type AgentStatus = "running" | "completed" | "failed";
 
@@ -379,6 +411,8 @@ function App() {
   const [openDemoArtifact, setOpenDemoArtifact] = useState<{ kind: StudyArtifactKind; title: string; payload: string } | null>(null);
   const [openWorkspacePreview, setOpenWorkspacePreview] = useState<WorkspacePreviewState | null>(null);
   const [customPrompt, setCustomPrompt] = useState("");
+  const [libraryContextMenu, setLibraryContextMenu] = useState<LibraryContextMenuState | null>(null);
+  const libraryContextMenuRef = useRef<HTMLDivElement>(null);
 
   /* ---- Study Session Tracking ---- */
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -445,6 +479,26 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!libraryContextMenu) return;
+    function handleMouseDown(event: MouseEvent) {
+      if (libraryContextMenuRef.current && !libraryContextMenuRef.current.contains(event.target as Node)) {
+        setLibraryContextMenu(null);
+      }
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setLibraryContextMenu(null);
+      }
+    }
+    document.addEventListener("mousedown", handleMouseDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [libraryContextMenu]);
+
   // Start session when artifact opens (flashcard/quiz/mock_exam)
   useEffect(() => {
     const artifact = openArtifact;
@@ -462,6 +516,18 @@ function App() {
   useEffect(() => {
     void endStudySession();
   }, [selectedTaskId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const openLibraryContextMenu = useCallback((
+    event: React.MouseEvent,
+    menu: LibraryContextMenuInput
+  ) => {
+    event.preventDefault();
+    const menuWidth = 196;
+    const menuHeight = 112;
+    const x = Math.max(12, Math.min(event.clientX, window.innerWidth - menuWidth - 12));
+    const y = Math.max(12, Math.min(event.clientY, window.innerHeight - menuHeight - 12));
+    setLibraryContextMenu({ ...menu, x, y });
+  }, []);
 
   /* ---- Inline AI Response State ---- */
   const [inlineResponse, setInlineResponse] = useState<string | null>(null);
@@ -495,6 +561,16 @@ function App() {
       projects.find((project) => project.id === (selectedTask?.projectId ?? selectedProjectId)) ??
       null,
     [projects, selectedProjectId, selectedTask]
+  );
+
+  const activeProjects = useMemo(
+    () => projects.filter((project) => !project.archivedAt),
+    [projects]
+  );
+
+  const activeTasks = useMemo(
+    () => tasks.filter((task) => !task.archivedAt),
+    [tasks]
   );
 
   const selectedRuns = selectedTask ? taskRuns[selectedTask.id] ?? [] : [];
@@ -1438,29 +1514,49 @@ function App() {
     try {
       setBusy("add-materials");
       setOnboardingState(null);
+      const runtimeProfile = resolveWorkspaceRuntimeProfile(config);
+      const startMode = resolveWorkspaceStartMode(config);
 
       setWorkspaceSetup({
         taskId: null,
         projectId,
         title: "Preparing your workspace",
-        detail: "Workspace created. Stuart is starting your first study session now.",
+        detail: startMode === "guided"
+          ? "Workspace created. Stuart is starting a guided first pass now."
+          : "Workspace created. Stuart is preparing a direct start so you can jump in faster.",
         steps: buildWorkspaceSetupSteps("session", ["folder", "workspace"]),
       });
 
       // Build objective and initial message based on config
       const taskTitle = `Study: ${inferProjectName(path)}`;
       let objective = "Help me study and understand the materials in this folder. I may ask you to create flashcards, quizzes, mind maps, and summaries.";
-      let initialMessage = "I just added my study materials. Please read through everything and give me a brief overview of what's in there, then ask me what I'd like to focus on.";
+      let initialMessage = startMode === "guided"
+        ? "I just added my study materials. Please read through everything and give me a brief overview of what's in there. For this first reply, just give me a concise high-level summary of the workspace and then ask me what I'd like to focus on."
+        : "I just added my study materials. Do a quiet first pass of the workspace so you understand the folder structure and core materials. For this first reply, do not summarize everything. Just confirm in one concise sentence that you're ready, mention the subject or folder theme if it's obvious, and ask what I want to work on first.";
 
       if (config) {
-        const parts: string[] = [];
-        if (config.subject) parts.push(`The subject is ${config.subject}.`);
-        if (config.goal) parts.push(`My goal is: ${config.goal}.`);
-        if (config.teachingStyle) parts.push(`I prefer a ${config.teachingStyle.toLowerCase()} teaching style.`);
-        if (config.additionalNotes) parts.push(config.additionalNotes);
-        if (parts.length > 0) {
-          objective = `Help me study and understand the materials in this folder. ${parts.join(" ")} I may ask you to create flashcards, quizzes, mind maps, and summaries.`;
-          initialMessage = `I just added my study materials. ${parts.join(" ")} Please read through everything and give me a brief overview of what's in there, then ask me what I'd like to focus on.`;
+        const objectiveParts: string[] = [];
+        const startupParts: string[] = [];
+        if (config.subject) {
+          objectiveParts.push(`The subject is ${config.subject}.`);
+          startupParts.push(`The subject is ${config.subject}.`);
+        }
+        if (config.goal) {
+          objectiveParts.push(`My goal is: ${config.goal}.`);
+          startupParts.push(`My goal is: ${config.goal}.`);
+        }
+        if (config.teachingStyle) {
+          objectiveParts.push(`I prefer a ${config.teachingStyle.toLowerCase()} teaching style.`);
+        }
+        if (config.additionalNotes) {
+          objectiveParts.push(config.additionalNotes);
+          startupParts.push(config.additionalNotes);
+        }
+        if (objectiveParts.length > 0 || startupParts.length > 0) {
+          const objectiveContext = objectiveParts.length > 0 ? `${objectiveParts.join(" ")} ` : "";
+          const startupContext = startupParts.length > 0 ? `${startupParts.join(" ")} ` : "";
+          objective = `Help me study and understand the materials in this folder. ${objectiveContext}I may ask you to create flashcards, quizzes, mind maps, and summaries.`;
+          initialMessage = `I just added my study materials. ${startupContext}Please read through everything and give me a brief overview of what's in there. For this first reply, just give me a concise high-level summary of the workspace and then ask me what I'd like to focus on.`;
         }
       }
 
@@ -1470,11 +1566,12 @@ function App() {
           projectId,
           title: taskTitle,
           objective,
+          runtimeProfile,
           attachments: [
             { id: crypto.randomUUID(), hostPath: path, mode: "reference" as const }
           ],
           browserEnabled: false,
-          authMode: "chatgpt"
+          authMode: runtimeProfile.authMode
         } satisfies CreateTaskInput)
       });
 
@@ -1484,7 +1581,9 @@ function App() {
         taskId: created.id,
         projectId: created.projectId,
         title: "Preparing your workspace",
-        detail: "Stuart is staging your files so Codex can start with a grounded first pass.",
+        detail: startMode === "guided"
+          ? "Stuart is staging your files for a grounded first pass."
+          : "Stuart is staging your files so the workspace is ready before you ask the first question.",
         steps: buildWorkspaceSetupSteps("staging", ["folder", "workspace", "session"]),
       });
 
@@ -1516,7 +1615,9 @@ function App() {
           taskId: created.id,
           projectId: created.projectId,
           title: "Preparing your workspace",
-          detail: "Stuart has started the first reading pass. You can begin asking questions while background indexing warms up.",
+          detail: startMode === "guided"
+            ? "Stuart has started the guided first reading pass. You can begin asking questions while background indexing warms up."
+            : "Stuart has started a quiet readiness pass. You can begin asking questions while background indexing warms up.",
           steps: buildWorkspaceSetupSteps("reading", ["folder", "workspace", "session", "staging"]),
         });
       }
@@ -1551,9 +1652,18 @@ function App() {
 
       if (existingProject) {
         project = existingProject;
-        // Existing project — skip onboarding, go straight to session
-        await continueWorkspaceSetup(project.id, path);
-        return;
+        const hasSavedSetup = Boolean(
+          project.config?.subject
+          || project.config?.goal
+          || project.config?.teachingStyle
+          || project.config?.additionalNotes
+          || project.config?.runtimeProfile?.provider
+          || project.config?.startupPreferences?.startMode
+        );
+        if (hasSavedSetup) {
+          await continueWorkspaceSetup(project.id, path, project.config);
+          return;
+        }
       } else {
         project = await request<ProjectRecord>("/api/projects", {
           method: "POST",
@@ -1812,7 +1922,7 @@ function App() {
   }
 
   async function deleteProject(projectId: string, projectName: string) {
-    const confirmed = window.confirm(`Remove workspace "${projectName}" and all its study sessions?`);
+    const confirmed = window.confirm(`Permanently delete workspace "${projectName}" and all its study sessions? This cannot be undone.`);
     if (!confirmed) return;
     try {
       setBusy(`delete-project-${projectId}`);
@@ -1824,6 +1934,51 @@ function App() {
       setError(caughtError instanceof Error ? caughtError.message : "Something went wrong");
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function archiveProject(projectId: string) {
+    try {
+      await request<void>(`/api/projects/${projectId}/archive`, { method: "POST" });
+      const archivedAt = new Date().toISOString();
+      setProjects((current) => current.map((project) => (
+        project.id === projectId ? { ...project, archivedAt } : project
+      )));
+      setTasks((current) => current.map((task) => (
+        task.projectId === projectId ? { ...task, archivedAt } : task
+      )));
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Failed to archive workspace");
+    }
+  }
+
+  async function unarchiveProject(projectId: string) {
+    try {
+      await request<void>(`/api/projects/${projectId}/unarchive`, { method: "POST" });
+      await refreshDashboard();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Failed to unarchive workspace");
+    }
+  }
+
+  async function archiveTask(taskId: string) {
+    try {
+      await request<void>(`/api/tasks/${taskId}/archive`, { method: "POST" });
+      const archivedAt = new Date().toISOString();
+      setTasks((current) => current.map((task) => (
+        task.id === taskId ? { ...task, archivedAt } : task
+      )));
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Failed to archive session");
+    }
+  }
+
+  async function unarchiveTask(taskId: string) {
+    try {
+      await request<void>(`/api/tasks/${taskId}/unarchive`, { method: "POST" });
+      await refreshDashboard();
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : "Failed to unarchive session");
     }
   }
 
@@ -2107,27 +2262,36 @@ function App() {
             ) : null}
 
             {/* Projects as study folders */}
-            {projects.length > 0 ? (
+            {activeProjects.length > 0 ? (
               <div className="library-section">
                 <span className="library-kicker">Your folders</span>
                 <div className="library-folder-list">
-                  {projects.map((project) => (
-                    <button
+                  {activeProjects.map((project) => (
+                    <div
                       key={project.id}
-                      className={`library-folder${project.id === selectedProjectId ? " active" : ""}`}
-                      type="button"
-                      onClick={() => {
-                        setSelectedProjectId(project.id);
-                        // Select first task in this project
-                        const firstTask = tasks.find((t) => t.projectId === project.id);
-                        if (firstTask) setSelectedTaskId(firstTask.id);
-                      }}
+                      className={`library-row${project.id === selectedProjectId ? " active" : ""}`}
+                      onContextMenu={(event) => openLibraryContextMenu(event, {
+                        kind: "project",
+                        projectId: project.id,
+                        projectName: project.name,
+                      })}
                     >
-                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5A1 1 0 0 0 5.8 3H3a1 1 0 0 0-1 1z" />
-                      </svg>
-                      <span>{project.name}</span>
-                    </button>
+                      <button
+                        className={`library-folder${project.id === selectedProjectId ? " active" : ""}`}
+                        type="button"
+                        onClick={() => {
+                          setLibraryContextMenu(null);
+                          setSelectedProjectId(project.id);
+                          const firstTask = activeTasks.find((t) => t.projectId === project.id);
+                          if (firstTask) setSelectedTaskId(firstTask.id);
+                        }}
+                      >
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M2 4v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5A1 1 0 0 0 5.8 3H3a1 1 0 0 0-1 1z" />
+                        </svg>
+                        <span>{project.name}</span>
+                      </button>
+                    </div>
                   ))}
                 </div>
               </div>
@@ -2157,33 +2321,42 @@ function App() {
             ) : null}
 
             {/* Study sessions (tasks, but we don't call them that) */}
-            {tasks.length > 0 ? (
+            {activeTasks.length > 0 ? (
               <div className="library-section">
                 <span className="library-kicker">Study sessions</span>
                 <div className="library-session-list">
-                  {tasks.map((task) => {
+                  {activeTasks.map((task) => {
                     const isActive = task.id === selectedTaskId;
                     const isWorking = thinkingState?.taskId === task.id;
                     return (
-                      <button
+                      <div
                         key={task.id}
-                        type="button"
-                        className={`library-session${isActive ? " active" : ""}`}
-                        onClick={() => {
-                          setSelectedTaskId(task.id);
-                          setSelectedProjectId(task.projectId);
-                        }}
+                        className={`library-row${isActive ? " active" : ""}`}
+                        onContextMenu={(event) => openLibraryContextMenu(event, {
+                          kind: "task",
+                          taskId: task.id,
+                        })}
                       >
-                        <div className="library-session-head">
-                          <strong>{task.title}</strong>
-                          {isWorking ? (
-                            <span className="working-badge">
-                              <span className="working-dot" />
-                            </span>
-                          ) : null}
-                        </div>
-                        <p>{task.objective}</p>
-                      </button>
+                        <button
+                          type="button"
+                          className={`library-session${isActive ? " active" : ""}`}
+                          onClick={() => {
+                            setLibraryContextMenu(null);
+                            setSelectedTaskId(task.id);
+                            setSelectedProjectId(task.projectId);
+                          }}
+                        >
+                          <div className="library-session-head">
+                            <strong>{task.title}</strong>
+                            {isWorking ? (
+                              <span className="working-badge">
+                                <span className="working-dot" />
+                              </span>
+                            ) : null}
+                          </div>
+                          <p>{task.objective}</p>
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -2193,6 +2366,45 @@ function App() {
             )}
           </div>
         </aside>
+
+        {libraryContextMenu ? (
+          <div
+            ref={libraryContextMenuRef}
+            className="library-context-menu"
+            style={{ left: libraryContextMenu.x, top: libraryContextMenu.y }}
+          >
+            <button
+              type="button"
+              className="library-context-item"
+              onClick={() => {
+                const menu = libraryContextMenu;
+                setLibraryContextMenu(null);
+                if (menu.kind === "project") {
+                  void archiveProject(menu.projectId);
+                  return;
+                }
+                void archiveTask(menu.taskId);
+              }}
+            >
+              {libraryContextMenu.kind === "project" ? "Archive workspace" : "Archive session"}
+            </button>
+            <button
+              type="button"
+              className="library-context-item destructive-text"
+              onClick={() => {
+                const menu = libraryContextMenu;
+                setLibraryContextMenu(null);
+                if (menu.kind === "project") {
+                  void deleteProject(menu.projectId, menu.projectName);
+                  return;
+                }
+                void deleteStudySession(menu.taskId);
+              }}
+            >
+              {libraryContextMenu.kind === "project" ? "Delete workspace" : "Delete session"}
+            </button>
+          </div>
+        ) : null}
 
         {/* ======== CENTER: Chat or Canvas Settings ======== */}
         {showCanvasSettings ? (
@@ -2225,15 +2437,7 @@ function App() {
             <WorkspaceFileOpenContext.Provider value={openWorkspaceFileReference}>
             <div className="chat-transcript">
               {!selectedTask ? (
-                onboardingState ? (
-                  /* ---- Workspace Onboarding ---- */
-                  <WorkspaceOnboarding
-                    projectId={onboardingState.projectId}
-                    path={onboardingState.path}
-                    onSubmit={(pid, p, cfg) => void continueWorkspaceSetup(pid, p, cfg)}
-                    onSkip={(pid, p) => void continueWorkspaceSetup(pid, p)}
-                  />
-                ) : projects.length > 0 ? (
+                projects.length > 0 ? (
                   /* ---- Dashboard: shown when projects exist but no task selected ---- */
                   <DashboardView
                     projects={projects}
@@ -2241,6 +2445,10 @@ function App() {
                     onSelectTask={(taskId) => setSelectedTaskId(taskId)}
                     onAddWorkspace={() => handleAddStudyMaterials()}
                     onDeleteProject={deleteProject}
+                    onArchiveProject={archiveProject}
+                    onUnarchiveProject={unarchiveProject}
+                    onArchiveTask={archiveTask}
+                    onUnarchiveTask={unarchiveTask}
                     onOpenCanvas={() => setShowCanvasSettings(true)}
                   />
                 ) : (
@@ -2821,12 +3029,11 @@ function App() {
               {selectedTask ? (
                 <div className="tools-section tools-session-actions">
                   <button
-                    className="ghost-button compact destructive-text"
+                    className="ghost-button compact"
                     type="button"
-                    disabled={busy === `delete-task-${selectedTask.id}`}
-                    onClick={() => void deleteStudySession(selectedTask.id)}
+                    onClick={() => void archiveTask(selectedTask.id)}
                   >
-                    Remove session
+                    Archive session
                   </button>
                 </div>
               ) : null}
@@ -2946,6 +3153,20 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* ---- Onboarding Modal Overlay ---- */}
+      {onboardingState && (
+        <div className="onboarding-overlay">
+          <WorkspaceOnboarding
+            projectId={onboardingState.projectId}
+            path={onboardingState.path}
+            diagnostics={diagnostics}
+            initialConfig={projects.find((project) => project.id === onboardingState.projectId)?.config}
+            onSubmit={(pid, p, cfg) => void continueWorkspaceSetup(pid, p, cfg)}
+            onSkip={(pid, p) => void continueWorkspaceSetup(pid, p)}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -3054,30 +3275,184 @@ function writeDismissedDiagnosticsFingerprint(fingerprint: string | null) {
   }
 }
 
+function getProviderOption(provider: RuntimeProvider) {
+  return PROVIDER_OPTIONS.find((option) => option.id === provider) ?? PROVIDER_OPTIONS[0]!;
+}
+
+function getDefaultRuntimeProfile(provider: RuntimeProvider): TaskRuntimeProfile {
+  const option = getProviderOption(provider);
+  return {
+    provider: option.id,
+    authMode: option.authMode,
+    model: option.models[0]?.id ?? DEFAULT_TASK_RUNTIME_PROFILE.model,
+    native: option.native,
+  };
+}
+
+function resolveWorkspaceRuntimeProfile(config?: WorkspaceConfig | null): TaskRuntimeProfile {
+  if (!config?.runtimeProfile?.provider) {
+    return { ...DEFAULT_TASK_RUNTIME_PROFILE };
+  }
+  const fallback = getDefaultRuntimeProfile(config.runtimeProfile.provider);
+  return {
+    provider: config.runtimeProfile.provider,
+    authMode: config.runtimeProfile.authMode ?? fallback.authMode,
+    model: config.runtimeProfile.model ?? fallback.model,
+    native: config.runtimeProfile.native ?? fallback.native,
+  };
+}
+
+function resolveWorkspaceStartMode(config?: WorkspaceConfig | null): WorkspaceStartMode {
+  return config?.startupPreferences?.startMode ?? "guided";
+}
+
+function getDiagnosticCheck(diagnostics: SystemDiagnostics | null | undefined, id: string) {
+  return diagnostics?.checks.find((check) => check.id === id) ?? null;
+}
+
+function getProviderSetupState(
+  provider: RuntimeProvider,
+  diagnostics: SystemDiagnostics | null | undefined
+): {
+  ready: boolean;
+  tone: "ok" | "warn" | "error";
+  summary: string;
+  detail?: string;
+} {
+  if (provider === "codex") {
+    const cli = getDiagnosticCheck(diagnostics, "codex-cli");
+    const auth = getDiagnosticCheck(diagnostics, "codex-auth");
+    if (cli?.status === "ok" && auth?.status === "ok") {
+      return { ready: true, tone: "ok", summary: "Ready", detail: "Codex runtime and authentication are both available." };
+    }
+    if (cli?.status === "error") {
+      return { ready: false, tone: "error", summary: "Setup needed", detail: cli.resolution ?? cli.detail ?? cli.summary };
+    }
+    return { ready: false, tone: "warn", summary: "Auth needed", detail: auth?.resolution ?? auth?.detail ?? auth?.summary ?? "Connect ChatGPT before starting with Codex." };
+  }
+
+  const checkId = provider === "gemini" ? "gemini-native" : "minimax-native";
+  const check = getDiagnosticCheck(diagnostics, checkId);
+  return {
+    ready: check?.status === "ok",
+    tone: check?.status === "ok" ? "ok" : "warn",
+    summary: check?.status === "ok" ? "Configured" : "Config missing",
+    detail: check?.resolution ?? check?.detail ?? check?.summary,
+  };
+}
+
 const TEACHING_STYLES = ["Concise", "Detailed", "Socratic", "Exam-focused"];
 const GOALS = ["Understand material", "Prepare for exam", "Essay writing", "General"];
+const START_MODES: Array<{
+  id: WorkspaceStartMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    id: "guided",
+    label: "Guided start",
+    description: "Stuart maps the workspace first, gives a concise overview, then asks where to focus.",
+  },
+  {
+    id: "direct",
+    label: "Direct start",
+    description: "Stuart prepares quietly, confirms the workspace is ready, and waits for your first real question.",
+  },
+];
+const PROVIDER_OPTIONS: Array<{
+  id: RuntimeProvider;
+  label: string;
+  native: boolean;
+  authMode: TaskRuntimeProfile["authMode"];
+  description: string;
+  note: string;
+  models: Array<{ id: string; label: string; detail: string }>;
+}> = [
+  {
+    id: "codex",
+    label: "Codex",
+    native: false,
+    authMode: "chatgpt",
+    description: "Best integrated path for Stuart today. Strong tooling, web access, and workspace continuity.",
+    note: "Uses Stuart's managed Codex runtime.",
+    models: [
+      { id: "gpt-5.4-mini", label: "Balanced", detail: "Fast default for normal study turns." },
+      { id: "gpt-5.4", label: "Deep reasoning", detail: "Use when you want heavier planning and harder artifact turns." },
+    ],
+  },
+  {
+    id: "gemini",
+    label: "Gemini Native",
+    native: true,
+    authMode: "api_key",
+    description: "Direct Gemini API profile for lower-friction native integration work.",
+    note: "Configured via API key. Stuart stores this profile while native transport hardening continues.",
+    models: [
+      { id: "gemini-2.5-flash", label: "Flash", detail: "Best price-performance for high-volume study flows." },
+      { id: "gemini-2.5-pro", label: "Pro", detail: "Stronger for complex reasoning and longer synthesis turns." },
+    ],
+  },
+  {
+    id: "minimax",
+    label: "MiniMax Native",
+    native: true,
+    authMode: "api_key",
+    description: "Direct MiniMax API profile aimed at lightweight native model routing.",
+    note: "Public docs clearly expose API-key auth; the OAuth flow I found is currently documented through OpenClaw setup.",
+    models: [
+      { id: "MiniMax-M2.7", label: "M2.7", detail: "Current general-purpose flagship listed in MiniMax docs." },
+      { id: "MiniMax-M2.5", label: "M2.5", detail: "Conservative fallback profile for existing integrations." },
+    ],
+  },
+];
 
 function WorkspaceOnboarding({
   projectId,
   path,
+  diagnostics,
+  initialConfig,
   onSubmit,
   onSkip,
 }: {
   projectId: string;
   path: string;
+  diagnostics: SystemDiagnostics | null;
+  initialConfig?: WorkspaceConfig;
   onSubmit: (projectId: string, path: string, config: WorkspaceConfig) => void;
   onSkip: (projectId: string, path: string) => void;
 }) {
-  const [subject, setSubject] = useState("");
-  const [teachingStyle, setTeachingStyle] = useState("");
-  const [customStyle, setCustomStyle] = useState("");
-  const [goal, setGoal] = useState("");
-  const [customGoal, setCustomGoal] = useState("");
-  const [additionalNotes, setAdditionalNotes] = useState("");
+  const initialRuntimeProfile = resolveWorkspaceRuntimeProfile(initialConfig);
+  const initialTeachingStyle = initialConfig?.teachingStyle ?? "";
+  const initialGoal = initialConfig?.goal ?? "";
+  const [subject, setSubject] = useState(initialConfig?.subject ?? "");
+  const [teachingStyle, setTeachingStyle] = useState(
+    initialTeachingStyle && !TEACHING_STYLES.includes(initialTeachingStyle) ? "Custom" : initialTeachingStyle
+  );
+  const [customStyle, setCustomStyle] = useState(
+    initialTeachingStyle && !TEACHING_STYLES.includes(initialTeachingStyle) ? initialTeachingStyle : ""
+  );
+  const [goal, setGoal] = useState(
+    initialGoal && !GOALS.includes(initialGoal) ? "Custom" : initialGoal
+  );
+  const [customGoal, setCustomGoal] = useState(
+    initialGoal && !GOALS.includes(initialGoal) ? initialGoal : ""
+  );
+  const [additionalNotes, setAdditionalNotes] = useState(initialConfig?.additionalNotes ?? "");
+  const [provider, setProvider] = useState<RuntimeProvider>(initialRuntimeProfile.provider);
+  const [selectedModel, setSelectedModel] = useState(initialRuntimeProfile.model);
+  const [startMode, setStartMode] = useState<WorkspaceStartMode>(resolveWorkspaceStartMode(initialConfig));
   const [saving, setSaving] = useState(false);
 
   const effectiveStyle = teachingStyle === "Custom" ? customStyle : teachingStyle;
   const effectiveGoal = goal === "Custom" ? customGoal : goal;
+  const providerOption = getProviderOption(provider);
+  const providerSetup = getProviderSetupState(provider, diagnostics);
+
+  useEffect(() => {
+    if (!providerOption.models.some((model) => model.id === selectedModel)) {
+      setSelectedModel(providerOption.models[0]?.id ?? DEFAULT_TASK_RUNTIME_PROFILE.model);
+    }
+  }, [providerOption, selectedModel]);
 
   async function handleSubmit() {
     setSaving(true);
@@ -3086,6 +3461,13 @@ function WorkspaceOnboarding({
     if (effectiveStyle.trim()) config.teachingStyle = effectiveStyle.trim();
     if (effectiveGoal.trim()) config.goal = effectiveGoal.trim();
     if (additionalNotes.trim()) config.additionalNotes = additionalNotes.trim();
+    config.runtimeProfile = {
+      provider,
+      authMode: providerOption.authMode,
+      model: selectedModel,
+      native: providerOption.native,
+    };
+    config.startupPreferences = { startMode };
 
     try {
       await request<ProjectRecord>(`/api/projects/${projectId}`, {
@@ -3100,8 +3482,84 @@ function WorkspaceOnboarding({
 
   return (
     <div className="onboarding-card">
-      <h2>Set up your workspace</h2>
-      <p className="onboarding-subtitle">Help Stuart tailor its teaching to you. You can always change these later.</p>
+      <div className="onboarding-header">
+        <div>
+          <h2>Set up your workspace</h2>
+          <p className="onboarding-subtitle">Pick the runtime target, how the first session should begin, and how Stuart should teach. You can change this later.</p>
+        </div>
+        <div className="onboarding-runtime-pill">Workspace runtime</div>
+      </div>
+
+      <div className="onboarding-section">
+        <div className="onboarding-section-head">
+          <strong>Runtime target</strong>
+          <span>{providerOption.note}</span>
+        </div>
+        <div className="onboarding-provider-grid">
+          {PROVIDER_OPTIONS.map((option) => {
+            const setup = getProviderSetupState(option.id, diagnostics);
+            return (
+              <button
+                key={option.id}
+                type="button"
+                className={`onboarding-provider${provider === option.id ? " selected" : ""}`}
+                onClick={() => {
+                  setProvider(option.id);
+                  setSelectedModel(option.models[0]?.id ?? DEFAULT_TASK_RUNTIME_PROFILE.model);
+                }}
+              >
+                <div className="onboarding-provider-topline">
+                  <strong>{option.label}</strong>
+                  <span className={`onboarding-status-badge ${setup.tone}`}>{setup.summary}</span>
+                </div>
+                <p>{option.description}</p>
+                <span className="onboarding-provider-note">{setup.detail ?? option.note}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="onboarding-section">
+        <div className="onboarding-section-head">
+          <strong>Model selection</strong>
+          <span>Keep this simple: balanced for normal study, deeper model for heavier synthesis.</span>
+        </div>
+        <div className="onboarding-model-grid">
+          {providerOption.models.map((model) => (
+            <button
+              key={model.id}
+              type="button"
+              className={`onboarding-model${selectedModel === model.id ? " selected" : ""}`}
+              onClick={() => setSelectedModel(model.id)}
+            >
+              <strong>{model.label}</strong>
+              <span>{model.id}</span>
+              <p>{model.detail}</p>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="onboarding-section">
+        <div className="onboarding-section-head">
+          <strong>How Stuart should start</strong>
+          <span>This changes the first reply and the amount of onboarding friction.</span>
+        </div>
+        <div className="onboarding-start-grid">
+          {START_MODES.map((mode) => (
+            <button
+              key={mode.id}
+              type="button"
+              className={`onboarding-start-option${startMode === mode.id ? " selected" : ""}`}
+              onClick={() => setStartMode(mode.id)}
+            >
+              <strong>{mode.label}</strong>
+              <p>{mode.description}</p>
+            </button>
+          ))}
+        </div>
+      </div>
 
       <div className="onboarding-field">
         <label>Subject</label>
@@ -3179,14 +3637,21 @@ function WorkspaceOnboarding({
         />
       </div>
 
+      {!providerSetup.ready ? (
+        <div className={`onboarding-inline-note ${providerSetup.tone}`}>
+          <strong>{providerOption.label} needs setup.</strong>
+          <span>{providerSetup.detail ?? "Finish the runtime setup before starting with this profile."}</span>
+        </div>
+      ) : null}
+
       <div className="onboarding-actions">
         <button
           className="accent-button"
           type="button"
           onClick={() => void handleSubmit()}
-          disabled={saving}
+          disabled={saving || !providerSetup.ready}
         >
-          {saving ? "Starting..." : "Start studying"}
+          {saving ? "Starting..." : startMode === "guided" ? "Start guided session" : "Start direct session"}
         </button>
         <button
           className="onboarding-skip"
@@ -4282,6 +4747,10 @@ function DashboardView({
   onSelectTask,
   onAddWorkspace,
   onDeleteProject,
+  onArchiveProject,
+  onUnarchiveProject,
+  onArchiveTask,
+  onUnarchiveTask,
   onOpenCanvas,
 }: {
   projects: ProjectRecord[];
@@ -4289,16 +4758,41 @@ function DashboardView({
   onSelectTask: (taskId: string) => void;
   onAddWorkspace: () => void;
   onDeleteProject: (projectId: string, projectName: string) => void;
+  onArchiveProject: (projectId: string) => void;
+  onUnarchiveProject: (projectId: string) => void;
+  onArchiveTask: (taskId: string) => void;
+  onUnarchiveTask: (taskId: string) => void;
   onOpenCanvas: () => void;
 }) {
   const [summaries, setSummaries] = useState<Record<string, ProjectLearningSummary>>({});
   const [timelines, setTimelines] = useState<Record<string, StudyTimelineEntry[]>>({});
   const [curriculumFlags, setCurriculumFlags] = useState<Record<string, boolean>>({});
   const [dashWeakTopics, setDashWeakTopics] = useState<Record<string, Array<{ topic: string; totalAttempts: number; correctCount: number }>>>({});
+  const [archivedProjects, setArchivedProjects] = useState<ProjectRecord[]>([]);
+  const [archivedTasks, setArchivedTasks] = useState<TaskSpec[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
+  const activeProjects = useMemo(() => projects.filter((project) => !project.archivedAt), [projects]);
+  const activeTasks = useMemo(() => tasks.filter((task) => !task.archivedAt), [tasks]);
+  const visibleArchivedProjects = useMemo(() => {
+    const merged = new Map<string, ProjectRecord>();
+    for (const project of archivedProjects) merged.set(project.id, project);
+    for (const project of projects) {
+      if (project.archivedAt) merged.set(project.id, project);
+    }
+    return [...merged.values()].sort((left, right) => (right.archivedAt ?? "").localeCompare(left.archivedAt ?? ""));
+  }, [archivedProjects, projects]);
+  const visibleArchivedTasks = useMemo(() => {
+    const merged = new Map<string, TaskSpec>();
+    for (const task of archivedTasks) merged.set(task.id, task);
+    for (const task of tasks) {
+      if (task.archivedAt) merged.set(task.id, task);
+    }
+    return [...merged.values()].sort((left, right) => (right.archivedAt ?? "").localeCompare(left.archivedAt ?? ""));
+  }, [archivedTasks, tasks]);
 
   // Fetch summaries + timelines for all projects
   useEffect(() => {
-    for (const project of projects) {
+    for (const project of activeProjects) {
       fetch(apiUrl(`/api/projects/${project.id}/learning-summary`))
         .then((r) => r.json())
         .then((data: ProjectLearningSummary) => {
@@ -4320,11 +4814,11 @@ function DashboardView({
         })
         .catch(() => {});
     }
-  }, [projects]);
+  }, [activeProjects]);
 
   // Check curriculum existence for each task (first task per project)
   useEffect(() => {
-    for (const task of tasks) {
+    for (const task of activeTasks) {
       if (curriculumFlags[task.id] !== undefined) continue;
       fetch(apiUrl(`/api/tasks/${task.id}/curriculum`))
         .then((r) => r.json())
@@ -4333,7 +4827,20 @@ function DashboardView({
         })
         .catch(() => {});
     }
-  }, [tasks, curriculumFlags]);
+  }, [activeTasks, curriculumFlags]);
+
+  // Fetch archived projects and tasks when section is shown
+  useEffect(() => {
+    if (!showArchived) return;
+    fetch(apiUrl("/api/projects/archived"))
+      .then((r) => r.ok ? r.json() : [])
+      .then((data: ProjectRecord[]) => setArchivedProjects(data))
+      .catch(() => {});
+    fetch(apiUrl("/api/tasks/archived"))
+      .then((r) => r.ok ? r.json() : [])
+      .then((data: TaskSpec[]) => setArchivedTasks(data))
+      .catch(() => {});
+  }, [showArchived, projects, tasks]);
 
   // Merge all timelines into a 30-day aggregate
   const aggregatedTimeline = useMemo(() => {
@@ -4369,14 +4876,14 @@ function DashboardView({
 
   // Build workspace card data
   const workspaces = useMemo(() => {
-    return projects.map((project) => {
+    return activeProjects.map((project) => {
       const summary = summaries[project.id];
-      const projectTasks = tasks.filter((t) => t.projectId === project.id);
+      const projectTasks = activeTasks.filter((t) => t.projectId === project.id);
       const firstTask = projectTasks[0] ?? null;
       const hasCurriculum = firstTask ? curriculumFlags[firstTask.id] === true : false;
       return { project, summary, firstTask, hasCurriculum };
     });
-  }, [projects, summaries, tasks, curriculumFlags]);
+  }, [activeProjects, summaries, activeTasks, curriculumFlags]);
 
   const maxReviews = useMemo(
     () => Math.max(...aggregatedTimeline.map((d) => d.reviews), 1),
@@ -4418,7 +4925,7 @@ function DashboardView({
           <div className="zen-stat-group">
             <div className="zen-stat">
               <span className="zen-section-label">Workspaces</span>
-              <span className="zen-stat-value">{projects.length}</span>
+              <span className="zen-stat-value">{activeProjects.length}</span>
             </div>
           </div>
         </div>
@@ -4427,7 +4934,7 @@ function DashboardView({
       {/* Review panel — aggregate weak areas across all workspaces */}
       {(() => {
         const allWeak = Object.entries(dashWeakTopics).flatMap(([pid, topics]) =>
-          topics.map((t) => ({ ...t, projectId: pid, projectName: projects.find((p) => p.id === pid)?.name ?? "" }))
+          topics.map((t) => ({ ...t, projectId: pid, projectName: activeProjects.find((p) => p.id === pid)?.name ?? "" }))
         );
         const totalDue = Object.values(summaries).reduce((s, v) => s + (v.cardsDue ?? 0), 0);
         if (allWeak.length === 0 && totalDue === 0) return null;
@@ -4525,10 +5032,10 @@ function DashboardView({
               <button
                 type="button"
                 className="zen-card-delete"
-                title="Remove workspace"
-                onClick={(e) => { e.stopPropagation(); onDeleteProject(project.id, project.name); }}
+                title="Archive workspace"
+                onClick={(e) => { e.stopPropagation(); onArchiveProject(project.id); }}
               >
-                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>archive</span>
               </button>
             </div>
           );
@@ -4555,6 +5062,81 @@ function DashboardView({
           <span className="zen-add-title">Import from Canvas</span>
           <span className="zen-add-desc">Pull course files from your LMS.</span>
         </button>
+      </section>
+
+      <section className="zen-archive-section">
+        <button
+          type="button"
+          className={`zen-archive-toggle${showArchived ? " open" : ""}`}
+          onClick={() => setShowArchived((current) => !current)}
+        >
+          <span className="zen-archive-toggle-left">
+            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>archive</span>
+            Archived
+          </span>
+          <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+            {showArchived ? "expand_less" : "expand_more"}
+          </span>
+        </button>
+
+        {showArchived ? (
+          <div className="zen-archive-panel">
+            {visibleArchivedProjects.length === 0 && visibleArchivedTasks.length === 0 ? (
+              <p className="zen-archive-empty">Nothing is archived right now.</p>
+            ) : null}
+
+            {visibleArchivedProjects.length > 0 ? (
+              <div className="zen-archive-group">
+                <span className="zen-section-label">Archived workspaces</span>
+                <div className="zen-archive-list">
+                  {visibleArchivedProjects.map((project) => (
+                    <div key={project.id} className="zen-archive-item">
+                      <div className="zen-archive-item-copy">
+                        <strong>{project.name}</strong>
+                        <span>{project.rootPath}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="ghost-button compact"
+                        onClick={() => void onUnarchiveProject(project.id)}
+                      >
+                        Unarchive
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            {visibleArchivedTasks.length > 0 ? (
+              <div className="zen-archive-group">
+                <span className="zen-section-label">Archived sessions</span>
+                <div className="zen-archive-list">
+                  {visibleArchivedTasks.map((task) => {
+                    const projectName = projects.find((project) => project.id === task.projectId)?.name
+                      ?? visibleArchivedProjects.find((project) => project.id === task.projectId)?.name
+                      ?? "Archived workspace";
+                    return (
+                      <div key={task.id} className="zen-archive-item">
+                        <div className="zen-archive-item-copy">
+                          <strong>{task.title}</strong>
+                          <span>{projectName}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="ghost-button compact"
+                          onClick={() => void onUnarchiveTask(task.id)}
+                        >
+                          Unarchive
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </section>
     </div>
   );
@@ -4617,6 +5199,29 @@ function ArtifactMenu({ onDelete }: { onDelete: () => void }) {
       )}
     </div>
   );
+}
+
+function toPlainClipboardText(content: string): string {
+  return content
+    .replace(/\*{0,2}【[^】]+】\*{0,2}/g, "")
+    .replace(/«[^»]+»/g, "")
+    .replace(/```(?:[\w-]+)?\n?([\s\S]*?)```/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/^>\s?/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/__(.*?)__/g, "$1")
+    .replace(/(^|[^\*])\*([^\*]+)\*(?!\*)/g, "$1$2")
+    .replace(/(^|[^_])_([^_]+)_(?!_)/g, "$1$2")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
 }
 
 function ChatBubble({ message }: { message: TaskMessageRecord }) {
@@ -4807,6 +5412,16 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
     displayContent = beforeJson ? `${beforeJson}\n\n${summary}` : summary;
   }
 
+  const [copied, setCopied] = useState(false);
+
+  function copyWithoutCitations() {
+    const plain = toPlainClipboardText(displayContent);
+    void navigator.clipboard.writeText(plain).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
   return (
     <article
       className={
@@ -4821,6 +5436,19 @@ function ChatBubble({ message }: { message: TaskMessageRecord }) {
         </span>
         <span className="chat-time">{formatDate(message.createdAt)}</span>
       </div>
+      {message.role === "assistant" && (
+        <button
+          className={`chat-copy-btn${copied ? " copied" : ""}`}
+          type="button"
+          onClick={copyWithoutCitations}
+          title="Copy without citations"
+        >
+          <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
+            {copied ? "check" : "content_copy"}
+          </span>
+          {copied ? "Copied" : "Copy"}
+        </button>
+      )}
       <div className="chat-content">
         {message.role === "assistant" ? (
           <MarkdownMessage content={displayContent} />
@@ -5202,7 +5830,7 @@ function CitationPillClickable({
 
   return (
     <span ref={pillRef} className={`citation-pill clickable${open ? " active" : ""}`} onClick={handleClick}>
-      <span className="material-symbols-outlined" style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
+      <span className="material-symbols-outlined" style={{ fontSize: 11, flexShrink: 0 }}>{icon}</span>
       <span className="citation-pill-label">{label}</span>
       {open && (
         <div className="citation-popover" onClick={(e) => e.stopPropagation()}>
