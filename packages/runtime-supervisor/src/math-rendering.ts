@@ -96,6 +96,39 @@ function convertAsciiScriptSequence(value: string, scriptMap: Record<string, str
     .join("");
 }
 
+/** Strip KaTeX HTML to readable plain text for PDF / non-HTML consumers. */
+function stripKatexHtmlToPlain(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#x([0-9A-Fa-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** When Unicode replacement leaves stray \\commands, render with KaTeX and strip to plain text. */
+function katexPlainTextFallback(latex: string): string | null {
+  const trimmed = latex.trim();
+  if (!trimmed || trimmed.length > 12_000) {
+    return null;
+  }
+  try {
+    const html = katex.renderToString(trimmed, {
+      throwOnError: false,
+      strict: "ignore",
+      displayMode: false,
+    });
+    const plain = stripKatexHtmlToPlain(html);
+    return plain || null;
+  } catch {
+    return null;
+  }
+}
+
 function looksLikeBareMathText(text: string): boolean {
   return (
     /\\[A-Za-z]+/.test(text) ||
@@ -111,17 +144,54 @@ function normalizeBareMathLikeText(text: string): string {
     return text;
   }
 
-  return replaceLatexWithUnicode(text)
+  const unicode = replaceLatexWithUnicode(text)
     .replace(/<=/g, "\u2264")
     .replace(/>=/g, "\u2265")
     .replace(/!=/g, "\u2260")
     .replace(/(?<![A-Za-z])([A-Za-z])(\d+)\b/g, (_match, variable, digits) => (
       `${variable}${convertAsciiScriptSequence(digits, SUBSCRIPT_MAP)}`
     ));
+
+  if (/\\[A-Za-z]/.test(unicode)) {
+    const fallback = katexPlainTextFallback(text.trim());
+    if (fallback) {
+      return fallback;
+    }
+  }
+  return unicode;
 }
 
 function replaceLatexWithUnicode(raw: string): string {
   return raw
+    .replace(/\\left\s*\(/g, "(")
+    .replace(/\\right\s*\)/g, ")")
+    .replace(/\\left\s*\[/g, "[")
+    .replace(/\\right\s*\]/g, "]")
+    .replace(/\\left\s*\|\s*/g, "|")
+    .replace(/\\right\s*\|\s*/g, "|")
+    .replace(/\\left\s*\{/g, "{")
+    .replace(/\\right\s*\}/g, "}")
+    .replace(/\\right\./g, ".")
+    .replace(/\\;+/g, " ")
+    .replace(/\\:/g, " ")
+    .replace(/\\,/g, " ")
+    .replace(/\\!/g, "")
+    .replace(/\\quad\b/g, "    ")
+    .replace(/\\qquad\b/g, "        ")
+    .replace(/\\text\s*\{([^{}]*)\}/g, "$1")
+    .replace(/\\mathrm\s*\{([^{}]*)\}/g, "$1")
+    .replace(/\\operatorname\s*\{([^{}]*)\}/g, "$1")
+    .replace(/\\max\b/g, "max")
+    .replace(/\\min\b/g, "min")
+    .replace(/\\sup\b/g, "sup")
+    .replace(/\\inf\b/g, "inf")
+    .replace(/\\argmax\b/g, "argmax")
+    .replace(/\\argmin\b/g, "argmin")
+    .replace(/\\log\b/g, "log")
+    .replace(/\\ln\b/g, "ln")
+    .replace(/\\sin\b/g, "sin")
+    .replace(/\\cos\b/g, "cos")
+    .replace(/\\tan\b/g, "tan")
     .replace(/\\(?:d|t)?frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g, "($1)/($2)")
     .replace(/\\alpha/g, "\u03B1").replace(/\\beta/g, "\u03B2").replace(/\\gamma/g, "\u03B3")
     .replace(/\\delta/g, "\u03B4").replace(/\\epsilon/g, "\u03B5").replace(/\\zeta/g, "\u03B6")
@@ -156,7 +226,7 @@ function replaceLatexWithUnicode(raw: string): string {
     .replace(/\^([A-Za-z0-9+\-=()])/g, (_match, inner) => convertAsciiScriptSequence(inner, SUPERSCRIPT_MAP))
     .replace(/_\{([^{}]+)\}/g, (_match, inner) => convertAsciiScriptSequence(inner, SUBSCRIPT_MAP))
     .replace(/_([A-Za-z0-9+\-=()])/g, (_match, inner) => convertAsciiScriptSequence(inner, SUBSCRIPT_MAP))
-    .replace(/[{}]/g, "")
+    // Do not strip all braces — nested LaTeX and unmatched delimiters become mojibake in PDF.
     .replace(/\\\\/g, "  ");
 }
 
@@ -239,7 +309,18 @@ export function renderTextWithLatexToStaticHtml(text: string): string {
 }
 
 export function renderLatexToPlainText(latex: string): string {
-  return replaceLatexWithUnicode(stripLatexDelimiters(latex).latex);
+  const inner = stripLatexDelimiters(latex).latex;
+  if (!inner) {
+    return "";
+  }
+  const unicode = replaceLatexWithUnicode(inner);
+  if (/\\[A-Za-z]/.test(unicode)) {
+    const fallback = katexPlainTextFallback(inner);
+    if (fallback) {
+      return fallback;
+    }
+  }
+  return unicode;
 }
 
 export function renderTextWithLatexToPlainText(text: string): string {

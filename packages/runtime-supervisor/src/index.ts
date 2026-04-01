@@ -2926,6 +2926,13 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
           } else {
             this.socraticStates.delete(state.taskId);
           }
+
+          // After artifact detection and document rendering, nudge clients to reload study artifacts
+          // (codex.turn.completed fires earlier; this catches rows written after that event).
+          this.emitEvent({
+            type: "task.message",
+            taskId: state.taskId,
+          });
         }
 
         this.turns.delete(params.turn.id);

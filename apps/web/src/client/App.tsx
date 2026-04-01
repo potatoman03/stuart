@@ -1468,6 +1468,9 @@ function App() {
           ...cur,
           [event.taskId]: upsertMessage(cur[event.taskId] ?? [], event.message)
         }));
+        if (event.taskId === selectedTaskId) {
+          void loadStudyArtifacts(event.taskId);
+        }
         return;
 
       case "codex.turn.completed":
@@ -1492,6 +1495,9 @@ function App() {
         if (event.taskId === selectedTaskId) {
           void loadMessages(event.taskId);
           void loadStudyArtifacts(event.taskId);
+          window.setTimeout(() => {
+            void loadStudyArtifacts(event.taskId);
+          }, 600);
         }
         if (event.status === "failed") {
           setError(event.error ?? "Stuart ran into a problem. Try again.");
@@ -2946,6 +2952,9 @@ function App() {
               {selectedStudyArtifacts.length > 0 ? (
                 <div className="tools-section">
                   <span className="tools-section-label">Your study artifacts</span>
+                  <p className="tools-section-subtle">
+                    PDF and Office exports are listed under <strong>PDF</strong> / <strong>DOCX</strong> filters. <strong>Docs</strong> are study notes opened in the editor.
+                  </p>
                   {/* Filter pills */}
                   {(() => {
                     const kindLabels: Record<string, string> = {

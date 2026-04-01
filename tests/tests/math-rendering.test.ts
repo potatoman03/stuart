@@ -18,4 +18,18 @@ describe("math rendering fallback text normalization", () => {
       "Lecture 1 response is due on Sunday."
     );
   });
+
+  it("strips left/right and renders frac without raw LaTeX commands", () => {
+    const out = renderTextWithLatexToPlainText(
+      String.raw`\left( \frac{1}{3}, 0, \frac{11}{3} \right)`
+    );
+    expect(out).not.toMatch(/\\left|\\right|\\frac/);
+    expect(out).toMatch(/\(?1\)?\/\(3\)/);
+  });
+
+  it("falls back to readable plain text for bare LaTeX operators", () => {
+    const out = renderTextWithLatexToPlainText(String.raw`\max \; y_1 + 4y_2 \text{ subject to } y \geq 0`);
+    expect(out).not.toMatch(/\\max|\\text|\\geq/);
+    expect(out.toLowerCase()).toContain("subject");
+  });
 });

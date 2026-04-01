@@ -137,7 +137,7 @@ For compact types like `cheat_sheet`, `reference_card`, `memo`, `resume`, and `i
 | `definition` | Term + meaning pairs | Bold term on left, definition indented. Perfect for vocabulary. |
 | `kv` | Key-value pairs | Two-column layout within one block. Good for properties, parameters, comparisons. |
 | `table` | Structured comparisons | Full table with header row and zebra striping. Use for side-by-side comparisons. |
-| `math` | Formulas, equations | LaTeX-like syntax auto-converted to Unicode math symbols. Set `"display": true` for centered display. Supports: Greek letters (`\alpha`, `\beta`...), operators (`\times`, `\leq`, `\infty`...), superscripts (`^2`, `^n`), subscripts (`_i`, `_0`). |
+| `math` | Formulas, equations | **Preferred for real math:** PDF renders LaTeX via MathJax SVG (crisp formulas). Set `"display": true` for centered display. Use for `\frac`, `\left`/`\right`, optimization problems, and anything beyond short inline symbols. |
 | `svg` | Diagrams, plots, geometric figures | Provide raw `<svg>...</svg>` markup. Optional `caption`. Use when a visual or 2D layout matters more than text. |
 | `code` | Code snippets, pseudocode, syscalls | Monospace on dark background. Keep short — 1-3 lines ideal. |
 | `callout` | Key insights, exam traps, must-know rules | Colored box. Styles: `"info"` (blue), `"tip"` (green), `"warning"` (amber), `"important"` (red). |
@@ -157,7 +157,7 @@ For compact types like `cheat_sheet`, `reference_card`, `memo`, `resume`, and `i
 
 ## Math notation
 
-Use LaTeX-like syntax in `math` paragraphs. The renderer converts these to proper Unicode symbols:
+Use LaTeX-like syntax in `math` paragraphs. The renderer converts these to proper Unicode symbols (with a safe KaTeX-based fallback when fragments remain):
 
 - Greek: `\alpha`, `\beta`, `\gamma`, `\delta`, `\theta`, `\lambda`, `\pi`, `\sigma`, `\phi`, `\omega`, `\Sigma`, `\Delta`, `\Omega`
 - Operators: `\times`, `\div`, `\cdot`, `\pm`, `\leq`, `\geq`, `\neq`, `\approx`, `\equiv`
@@ -166,6 +166,12 @@ Use LaTeX-like syntax in `math` paragraphs. The renderer converts these to prope
 - Arrows: `\rightarrow`, `\Rightarrow`, `\leftrightarrow`
 - Superscripts: `^2`, `^3`, `^n`; Subscripts: `_0`, `_1`, `_2`, `_i`, `_n`
 
+**Critical (PDF output quality):**
+
+- **Never** put raw LaTeX control sequences in `text`, `bullet`, `numbered`, `definition`, `kv`, or `table` cells without wrapping them in `$...$` (or using a `math` paragraph). If the model emits `\left`, `\right`, `\frac`, `\max`, `\text{...}`, etc. as plain text, the PDF can show broken symbols or mojibake.
+- For expressions with `\left`/`\right`, stacked fractions, or optimization notation (`\max`, `\min`, KKT, complementary slackness), prefer **`{ "type": "math", "content": "...", "display": true }`** (or several `math` blocks), not long LaTeX inside `text`.
+- Inside `$...$`, use normal LaTeX; avoid duplicated delimiters like `\left\left(`.
+
 For inline math anywhere inside strings — including `text`, `bullet`, `numbered`, `definition`, `kv`, `table`, and `citation_note` — wrap the math in `$...$`.
 
 Examples:
@@ -173,6 +179,7 @@ Examples:
 - `"Runtime is $O(n^2)$ in the worst case."`
 - `"Constraint 1: $x_1 + 2x_2 \\leq 6$"`
 - `["Variable", "$x_1$"]`
+- Display optimum: `{ "type": "math", "content": "\\left( \\frac{1}{3}, 0, \\frac{11}{3} \\right)", "display": true }`
 
 Do not emit bare forms like `x1 + 2x2 <= 6` when you mean mathematical notation.
 

@@ -3107,6 +3107,18 @@ html[data-theme="dark"] .citation-popover-open {
   color: var(--ink-muted);
 }
 
+.tools-section-subtle {
+  margin: 0 0 4px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink-muted);
+}
+
+.tools-section-subtle strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
 /* ---- Review Section ---- */
 
 .review-section {
