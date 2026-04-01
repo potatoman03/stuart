@@ -1,7 +1,7 @@
 {
   "name": "stuart",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.1",
   "packageManager": "pnpm@10.28.0",
   "scripts": {
     "bootstrap": "node --env-file-if-exists=.env --import tsx scripts/setup.ts",

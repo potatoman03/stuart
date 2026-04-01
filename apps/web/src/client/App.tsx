@@ -338,7 +338,7 @@ function App() {
     isDesktop: Boolean(desktopBridge?.isDesktop),
     isPackaged: Boolean(desktopBridge?.isPackaged),
     platform: desktopBridge?.platform ?? "web",
-    appVersion: desktopBridge?.appVersion ?? "0.1.0",
+    appVersion: desktopBridge?.appVersion ?? "1.0.1",
     apiOrigin:
       window.location.origin !== "null"
         ? window.location.origin

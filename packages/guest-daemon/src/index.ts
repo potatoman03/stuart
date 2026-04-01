@@ -2,7 +2,7 @@
 import { createInterface } from "node:readline";
 import type { JsonRpcRequest, JsonRpcResponse } from "@stuart/shared";
 
-const VERSION = "0.1.0";
+const VERSION = "1.0.1";
 
 function createResponse<TResult>(
   id: string,

@@ -8,7 +8,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const desktopDir = resolve(scriptDir, "..");
 const releaseDir = join(desktopDir, "release");
 const packageJson = JSON.parse(readFileSync(join(desktopDir, "package.json"), "utf8"));
-const version = packageJson.version ?? "0.1.0";
+const version = packageJson.version ?? "1.0.1";
 const mode = process.argv[2] ?? "dir";
 const DEFAULT_NOTARY_KEYCHAIN_PROFILE = "stuart-notary";
 

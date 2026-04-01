@@ -300,7 +300,7 @@ export class CodexAppServerClient {
       clientInfo: {
         name: "stuart-local",
         title: "Stuart",
-        version: "0.1.0"
+        version: "1.0.1"
       },
       capabilities: {
         experimentalApi: true

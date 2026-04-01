@@ -1,7 +1,7 @@
 {
   "name": "@stuart/desktop",
   "productName": "Stuart",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Stuart desktop study companion",
   "author": "Jonathan Chng",
