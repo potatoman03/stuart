@@ -1,0 +1,1 @@
+# Stuart Demo Study Notes\n\nThis is a test study folder for environment verification.\n\n## Key Concepts\n\n- Stuart is a local-first AI study workspace\n- It connects to Codex for generating study materials\n- Supports flashcards, quizzes, mind maps, and more
