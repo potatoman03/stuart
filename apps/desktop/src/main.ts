@@ -1,3 +1,5 @@
+import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { createServer } from "node:net";
 import path from "node:path";
 import { execSync, fork, spawn, type ChildProcess } from "node:child_process";
@@ -32,7 +34,8 @@ type LoadingWindowState = {
   steps: LoadingStepState[];
 };
 
-const uiPort = process.env.STUART_UI_PORT ?? "4173";
+// Must match apps/web/vite.config.ts default (STUART_UI_PORT ?? 5173) or Electron opens the wrong dev URL.
+const uiPort = process.env.STUART_UI_PORT ?? "5173";
 const uiHost = process.env.STUART_UI_HOST ?? "127.0.0.1";
 const defaultUrl = process.env.STUART_UI_URL ?? `http://${uiHost}:${uiPort}`;
 
@@ -129,9 +132,23 @@ function resolveCodexLauncherPath() {
 }
 
 function resolveDesktopDataDir() {
-  return process.env.STUART_DATA_DIR && process.env.STUART_DATA_DIR.trim() !== ""
-    ? path.resolve(process.env.STUART_DATA_DIR)
-    : path.join(app.getPath("userData"), "data");
+  if (process.env.STUART_DATA_DIR && process.env.STUART_DATA_DIR.trim() !== "") {
+    return path.resolve(process.env.STUART_DATA_DIR);
+  }
+  // Default that can be shared with `pnpm dev`: set STUART_DATA_DIR in .env to this absolute path.
+  const sharedLocal = path.join(homedir(), ".stuart", "study-data");
+  const legacyAppSupport = path.join(app.getPath("userData"), "data");
+  try {
+    if (existsSync(legacyAppSupport)) {
+      const entries = readdirSync(legacyAppSupport);
+      if (entries.length > 0) {
+        return legacyAppSupport;
+      }
+    }
+  } catch {
+    // Use sharedLocal
+  }
+  return sharedLocal;
 }
 
 function configureDesktopManagedCodex() {
@@ -603,6 +620,11 @@ async function boot() {
     }
   });
 }
+
+/** Renderer uses this so fetch() targets the same origin as loadURL (dynamic port in production). */
+ipcMain.on("stuart:get-api-origin-sync", (event) => {
+  event.returnValue = apiOrigin;
+});
 
 ipcMain.handle("stuart:pick-folder", async () => {
   const result = await dialog.showOpenDialog({

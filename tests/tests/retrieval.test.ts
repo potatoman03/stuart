@@ -153,4 +153,96 @@ describe("LocalDatabase.searchIngestionChunks", () => {
     expect(results).toHaveLength(1);
     expect(results[0]?.relativePath).toBe("Lecture 02 Greek Religion.md");
   });
+
+  it("scopes search to a source using basename when the citation path is deeper than the indexed relative path", async () => {
+    const db = await createDatabase();
+    seedChunk(db, {
+      documentId: "doc-tut",
+      chunkId: "chunk-tut",
+      relativePath: "Tutorial 1 Solutions.pdf",
+      heading: "Analysis",
+      text: "DFS is not complete in general when search depth is unbounded.",
+    });
+
+    const results = db.searchIngestionChunks("task-1", "complete general DFS unbounded", {
+      taskRunId: "run-1",
+      source: "attachments/abc-123/Tutorial 1 Solutions.pdf",
+      limit: 5,
+    });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]?.relativePath).toBe("Tutorial 1 Solutions.pdf");
+  });
+
+  it("getChunksBySource falls back to the global index when the active run scope has no rows", async () => {
+    const db = await createDatabase();
+    db.upsertIngestionDocument({
+      id: "doc-global-pdf",
+      taskId: "task-1",
+      taskRunId: undefined,
+      sourcePath: "/workspace/Tutorial 1 Solutions.pdf",
+      relativePath: "Tutorial 1 Solutions.pdf",
+      fileType: "pdf",
+      parser: "pdf",
+      chunkCount: 1,
+      size: 120,
+      status: "indexed",
+      indexedAt: new Date().toISOString(),
+    });
+    db.insertIngestionChunk({
+      chunkId: "chunk-global-pdf",
+      documentId: "doc-global-pdf",
+      taskId: "task-1",
+      taskRunId: undefined,
+      sourcePath: "/workspace/Tutorial 1 Solutions.pdf",
+      relativePath: "Tutorial 1 Solutions.pdf",
+      fileType: "pdf",
+      heading: "DFS",
+      text: "Depth-first search may not terminate on infinite state spaces.",
+    });
+
+    const rows = db.getChunksBySource("task-1", "Tutorial 1 Solutions.pdf", {
+      taskRunId: "run-99",
+      limit: 5,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.text).toContain("Depth-first");
+  });
+
+  it("getChunksBySource finds PDF chunks indexed under a different task run (same task id)", async () => {
+    const db = await createDatabase();
+    db.upsertIngestionDocument({
+      id: "doc-other-run",
+      taskId: "task-1",
+      taskRunId: "run-older",
+      sourcePath: "/w/Tutorial 1 Solutions.pdf",
+      relativePath: "Tutorial 1 Solutions.pdf",
+      fileType: "pdf",
+      parser: "pdf",
+      chunkCount: 1,
+      size: 80,
+      status: "indexed",
+      indexedAt: new Date().toISOString(),
+    });
+    db.insertIngestionChunk({
+      chunkId: "chunk-other-run",
+      documentId: "doc-other-run",
+      taskId: "task-1",
+      taskRunId: "run-older",
+      sourcePath: "/w/Tutorial 1 Solutions.pdf",
+      relativePath: "Tutorial 1 Solutions.pdf",
+      fileType: "pdf",
+      heading: "Q2",
+      text: "This PDF was indexed during an earlier run's staging snapshot.",
+    });
+
+    const rows = db.getChunksBySource("task-1", "Tutorial 1 Solutions.pdf", {
+      taskRunId: "run-newer",
+      limit: 5,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.text).toContain("earlier run");
+  });
 });

@@ -195,7 +195,9 @@ export async function collectSystemDiagnostics(
     status: dataDirWritable.ok ? "ok" : "error",
     required: true,
     summary: dataDirWritable.ok
-      ? (surface === "desktop" ? "Stuart can save study history and artifacts locally." : `Using ${dataDir}`)
+      ? (surface === "desktop"
+        ? `Using ${dataDir} for local study history and artifacts.`
+        : `Using ${dataDir}`)
       : `Cannot write to ${dataDir}`,
     detail: dataDirWritable.detail,
     resolution: dataDirWritable.ok

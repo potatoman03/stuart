@@ -124,6 +124,24 @@ async function buildGeneratedWorkspace() {
     ],
   }, workspacePath, "Lecture 02 - Breadth First Search");
 
+  await renderDocument("document_pdf", {
+    metadata: {
+      subject: "Tutorial 1 Solutions",
+      author: "Stuart",
+    },
+    sections: [
+      {
+        heading: "Depth-First Search",
+        level: 1,
+        paragraphs: [
+          { type: "text", content: "Depth-first search expands the deepest node first and uses a stack as the frontier." },
+          { type: "text", content: "Depth-first search is not complete in general when search depth is unbounded." },
+          { type: "text", content: "Its space complexity is O(bm), where b is the branching factor and m is the maximum depth of the search tree." },
+        ],
+      },
+    ],
+  }, workspacePath, "Tutorial 1 Solutions");
+
   await renderDocument("document_pptx", {
     presentation: {
       slides: [
@@ -320,6 +338,32 @@ test("pdf citations resolve excerpts and open a pdf-backed source preview", asyn
   await expect(page.locator(".pdf-preview-shell")).toBeVisible();
   await expect(page.locator(".pdf-preview-status")).toContainText("Page 1 of");
   await expect(page.locator(".pdf-preview-canvas")).toBeVisible();
+});
+
+test("attachment-path citations still resolve excerpts when the indexed file is stored by basename", async ({ page, request }) => {
+  const workspacePath = await buildGeneratedWorkspace();
+  const { task } = await seedStudySession(request, {
+    projectName: "Search Tutorials",
+    taskTitle: "Study: DFS Tutorial",
+    workspacePath,
+  });
+
+  await buildIngestion(request, task.id);
+  seedAssistantMessage(
+    task.id,
+    "Depth-first search is not complete in general when search depth is unbounded [Tutorial 1 Solutions](attachments/abc-123/Tutorial 1 Solutions.pdf).",
+  );
+
+  await page.goto("/");
+  await page.getByRole("button", { name: task.title }).click();
+
+  const citation = page.locator(".citation-pill.clickable", { hasText: "Tutorial 1 Solutions" }).first();
+  await expect(citation).toBeVisible();
+  await citation.click();
+
+  await expect(page.locator(".citation-popover-empty")).toHaveCount(0);
+  await expect(page.locator(".citation-popover-chunk")).toHaveCount(1);
+  await expect(page.locator(".citation-popover-chunk").first()).toContainText("not complete in general");
 });
 
 test("pptx citations open an actual preview route instead of the unsupported placeholder", async ({ page, request }) => {

@@ -32,6 +32,12 @@
     "typescript": "^5.9.3"
   },
   "optionalDependencies": {
+    "@napi-rs/canvas-darwin-arm64": "^0.1.97",
+    "@napi-rs/canvas-darwin-x64": "^0.1.97",
+    "@napi-rs/canvas-linux-arm64-gnu": "^0.1.97",
+    "@napi-rs/canvas-linux-x64-gnu": "^0.1.97",
+    "@napi-rs/canvas-win32-arm64-msvc": "^0.1.97",
+    "@napi-rs/canvas-win32-x64-msvc": "^0.1.97",
     "@esbuild/darwin-arm64": "0.25.12",
     "@esbuild/darwin-x64": "0.25.12",
     "@esbuild/linux-arm64": "0.25.12",

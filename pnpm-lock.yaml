@@ -85,6 +85,24 @@ importers:
       '@esbuild/win32-x64':
         specifier: 0.25.12
         version: 0.25.12
+      '@napi-rs/canvas-darwin-arm64':
+        specifier: ^0.1.97
+        version: 0.1.97
+      '@napi-rs/canvas-darwin-x64':
+        specifier: ^0.1.97
+        version: 0.1.97
+      '@napi-rs/canvas-linux-arm64-gnu':
+        specifier: ^0.1.97
+        version: 0.1.97
+      '@napi-rs/canvas-linux-x64-gnu':
+        specifier: ^0.1.97
+        version: 0.1.97
+      '@napi-rs/canvas-win32-arm64-msvc':
+        specifier: ^0.1.97
+        version: 0.1.97
+      '@napi-rs/canvas-win32-x64-msvc':
+        specifier: ^0.1.97
+        version: 0.1.97
       '@resvg/resvg-js-darwin-arm64':
         specifier: ^2.6.2
         version: 2.6.2
@@ -340,6 +358,9 @@ importers:
       docx:
         specifier: ^9.0.0
         version: 9.6.1
+      dommatrix:
+        specifier: ^1.0.3
+        version: 1.0.3
       fast-xml-parser:
         specifier: ^5.5.1
         version: 5.5.5
@@ -2524,6 +2545,10 @@ packages:
   domexception@1.0.1:
     resolution: {integrity: sha512-raigMkn7CJNNo6Ihro1fzG7wr3fHuYVytzquZKX5n0yizGsTcYgzdIUwj1X9pK0VvjeihV+XiclP+DjwbsSKug==}
     deprecated: Use your platform's native DOMException instead
+
+  dommatrix@1.0.3:
+    resolution: {integrity: sha512-l32Xp/TLgWb8ReqbVJAFIvXmY7go4nTxxlWiAFyhoQw9RKEOHBZNnyGvJWqDVSPmq3Y9HlM4npqF/T6VMOXhww==}
+    deprecated: dommatrix is no longer maintained. Please use @thednp/dommatrix.
 
   dompurify@3.3.3:
     resolution: {integrity: sha512-Oj6pzI2+RqBfFG+qOaOLbFXLQ90ARpcGG6UePL82bJLtdsa6CYJD7nmiU8MW9nQNOtCHV3lZ/Bzq1X0QYbBZCA==}
@@ -7058,6 +7083,8 @@ snapshots:
   domexception@1.0.1:
     dependencies:
       webidl-conversions: 4.0.2
+
+  dommatrix@1.0.3: {}
 
   dompurify@3.3.3:
     optionalDependencies:

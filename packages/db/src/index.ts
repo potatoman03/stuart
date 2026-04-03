@@ -1798,7 +1798,9 @@ export class LocalDatabase {
         bm25(ingestion_chunks) as score
        FROM ingestion_chunks
        WHERE ingestion_chunks MATCH ? AND scope_key = ?${
-         sourceMatch ? " AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ?)" : ""
+         sourceMatch
+           ? " AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)"
+           : ""
        }
        ORDER BY score ASC
        LIMIT ?`
@@ -1813,6 +1815,8 @@ export class LocalDatabase {
             sourceMatch.exact,
             sourceMatch.stripped,
             sourceMatch.suffixLike,
+            sourceMatch.basename,
+            sourceMatch.basenameSuffixLike,
             limit
           )
         : searchStatement.all(queries.strict, scopeKey, limit)
@@ -1830,9 +1834,113 @@ export class LocalDatabase {
               sourceMatch.exact,
               sourceMatch.stripped,
               sourceMatch.suffixLike,
+              sourceMatch.basename,
+              sourceMatch.basenameSuffixLike,
               Math.max(limit * 3, limit)
             )
           : searchStatement.all(queries.broad, scopeKey, Math.max(limit * 3, limit))
+      );
+      for (const result of broadResults) {
+        if (merged.has(result.chunkId)) {
+          continue;
+        }
+        merged.set(result.chunkId, result);
+        if (merged.size >= limit) {
+          break;
+        }
+      }
+    }
+
+    const out = [...merged.values()].slice(0, limit);
+    if (out.length > 0) {
+      return out;
+    }
+    if (options?.taskRunId) {
+      const globalOut = this.searchIngestionChunks(taskId, query, { ...options, taskRunId: undefined });
+      if (globalOut.length > 0) {
+        return globalOut;
+      }
+    }
+    return this.searchIngestionChunksAnyScope(taskId, query, options);
+  }
+
+  /**
+   * When chunks were indexed under a different task run than the active UI scope, run+global both miss.
+   * Match by task_id + path only (any scope_key).
+   */
+  private searchIngestionChunksAnyScope(
+    taskId: string,
+    query: string,
+    options?: {
+      taskRunId?: string;
+      limit?: number;
+      source?: string;
+    }
+  ): IngestionSearchResult[] {
+    const queries = buildFtsQueries(query);
+    if (!queries) {
+      return [];
+    }
+    const limit = options?.limit ?? 8;
+    const sourceFilter = options?.source?.trim();
+    const sourceMatch = sourceFilter ? buildSourcePathMatch(sourceFilter) : null;
+    const searchStatement = this.db.prepare(
+      `SELECT
+        chunk_id as chunkId,
+        document_id as documentId,
+        task_id as taskId,
+        task_run_id as taskRunId,
+        source_path as sourcePath,
+        relative_path as relativePath,
+        file_type as fileType,
+        heading,
+        locator,
+        text,
+        snippet(ingestion_chunks, 10, '', '', ' ... ', 20) as snippet,
+        bm25(ingestion_chunks) as score
+       FROM ingestion_chunks
+       WHERE ingestion_chunks MATCH ? AND task_id = ?${
+         sourceMatch
+           ? " AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)"
+           : ""
+       }
+       ORDER BY score ASC
+       LIMIT ?`
+    );
+
+    const merged = new Map<string, IngestionSearchResult>();
+    const strictResults = asRows<IngestionSearchResult>(
+      sourceMatch
+        ? searchStatement.all(
+            queries.strict,
+            taskId,
+            sourceMatch.exact,
+            sourceMatch.stripped,
+            sourceMatch.suffixLike,
+            sourceMatch.basename,
+            sourceMatch.basenameSuffixLike,
+            limit
+          )
+        : searchStatement.all(queries.strict, taskId, limit)
+    );
+    for (const result of strictResults) {
+      merged.set(result.chunkId, result);
+    }
+
+    if (merged.size < limit && queries.broad !== queries.strict) {
+      const broadResults = asRows<IngestionSearchResult>(
+        sourceMatch
+          ? searchStatement.all(
+              queries.broad,
+              taskId,
+              sourceMatch.exact,
+              sourceMatch.stripped,
+              sourceMatch.suffixLike,
+              sourceMatch.basename,
+              sourceMatch.basenameSuffixLike,
+              Math.max(limit * 3, limit)
+            )
+          : searchStatement.all(queries.broad, taskId, Math.max(limit * 3, limit))
       );
       for (const result of broadResults) {
         if (merged.has(result.chunkId)) {
@@ -1853,9 +1961,26 @@ export class LocalDatabase {
     relativePath: string,
     options?: { taskRunId?: string; limit?: number }
   ): IngestionSearchResult[] {
-    const scopeKey = buildIngestionScopeKey(taskId, options?.taskRunId);
     const limit = options?.limit ?? 5;
     const sourceMatch = buildSourcePathMatch(relativePath);
+    const rows = this.getChunksBySourceScoped(taskId, sourceMatch, options?.taskRunId, limit);
+    if (rows.length > 0) {
+      return rows;
+    }
+    if (options?.taskRunId) {
+      const globalRows = this.getChunksBySourceScoped(taskId, sourceMatch, undefined, limit);
+      if (globalRows.length > 0) {
+        return globalRows;
+      }
+    }
+    return this.getChunksBySourceAnyScope(taskId, sourceMatch, limit);
+  }
+
+  private getChunksBySourceAnyScope(
+    taskId: string,
+    sourceMatch: ReturnType<typeof buildSourcePathMatch>,
+    limit: number
+  ): IngestionSearchResult[] {
     return asRows<IngestionSearchResult>(
       this.db.prepare(
         `SELECT
@@ -1872,10 +1997,62 @@ export class LocalDatabase {
           '' as snippet,
           0 as score
          FROM ingestion_chunks
-         WHERE scope_key = ? AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ?)
+         WHERE task_id = ? AND (
+           relative_path = ? OR relative_path = ? OR relative_path LIKE ?
+           OR relative_path = ? OR relative_path LIKE ?
+         )
+         ORDER BY chunk_id ASC
+         LIMIT ?`
+      ).all(
+        taskId,
+        sourceMatch.exact,
+        sourceMatch.stripped,
+        sourceMatch.suffixLike,
+        sourceMatch.basename,
+        sourceMatch.basenameSuffixLike,
+        limit
+      )
+    );
+  }
+
+  private getChunksBySourceScoped(
+    taskId: string,
+    sourceMatch: ReturnType<typeof buildSourcePathMatch>,
+    taskRunId: string | undefined,
+    limit: number
+  ): IngestionSearchResult[] {
+    const scopeKey = buildIngestionScopeKey(taskId, taskRunId);
+    return asRows<IngestionSearchResult>(
+      this.db.prepare(
+        `SELECT
+          chunk_id as chunkId,
+          document_id as documentId,
+          task_id as taskId,
+          task_run_id as taskRunId,
+          source_path as sourcePath,
+          relative_path as relativePath,
+          file_type as fileType,
+          heading,
+          locator,
+          text,
+          '' as snippet,
+          0 as score
+         FROM ingestion_chunks
+         WHERE scope_key = ? AND (
+           relative_path = ? OR relative_path = ? OR relative_path LIKE ?
+           OR relative_path = ? OR relative_path LIKE ?
+         )
          ORDER BY CAST(REPLACE(REPLACE(locator, 'page ', ''), 'chunk ', '') AS INTEGER) ASC
          LIMIT ?`
-      ).all(scopeKey, sourceMatch.exact, sourceMatch.stripped, sourceMatch.suffixLike, limit)
+      ).all(
+        scopeKey,
+        sourceMatch.exact,
+        sourceMatch.stripped,
+        sourceMatch.suffixLike,
+        sourceMatch.basename,
+        sourceMatch.basenameSuffixLike,
+        limit
+      )
     );
   }
 
@@ -3760,13 +3937,19 @@ function buildSourcePathMatch(value: string): {
   exact: string;
   stripped: string;
   suffixLike: string;
+  basename: string;
+  basenameSuffixLike: string;
 } {
   const exact = value.trim().replace(/\\/g, "/").replace(/[?#].*$/, "").replace(/^file:\/\//, "");
   const stripped = exact.replace(/^\.?\//, "");
+  const slash = stripped.lastIndexOf("/");
+  const basename = slash >= 0 ? stripped.slice(slash + 1) : stripped;
   return {
     exact,
     stripped,
     suffixLike: `%/${stripped}`,
+    basename,
+    basenameSuffixLike: `%/${basename}`,
   };
 }
 
