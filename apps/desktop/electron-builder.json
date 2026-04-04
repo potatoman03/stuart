@@ -9,7 +9,12 @@
     "node_modules/@stuart/runtime-supervisor/dist/skills/**/*",
     "node_modules/@stuart/runtime-supervisor/src/skills/**/*",
     "node_modules/pdfjs-dist/standard_fonts/**/*",
-    "node_modules/pdfjs-dist/legacy/**/*"
+    "node_modules/pdfjs-dist/legacy/**/*",
+    "node_modules/@napi-rs/canvas/**/*",
+    "node_modules/@napi-rs/canvas-*/**/*",
+    "node_modules/.pnpm/**/@napi-rs+canvas@*/**/*",
+    "node_modules/.pnpm/**/@napi-rs+canvas-*@*/**/*",
+    "node_modules/**/*.node"
   ],
   "directories": {
     "output": "release"
@@ -28,6 +33,11 @@
     {
       "from": "codex-vendor",
       "to": "codex-vendor",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "cursor-vendor",
+      "to": "cursor-vendor",
       "filter": ["**/*"]
     }
   ],

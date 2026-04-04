@@ -29,6 +29,7 @@
     "@stuart/db": "workspace:*",
     "@stuart/sandbox-executor": "workspace:*",
     "@stuart/shared": "workspace:*",
+    "dommatrix": "^1.0.3",
     "docx": "^9.0.0",
     "fast-xml-parser": "^5.5.1",
     "jszip": "^3.10.1",

@@ -1,4 +1,4 @@
-import type { IngestionDocumentRecord, WorkspaceFileRecord } from "@stuart/shared";
+import type { IngestionDocumentRecord, IngestionSearchResult, WorkspaceFileRecord } from "@stuart/shared";
 
 export const FILE_REF_MARKER = "\u00ab"; // «
 export const FILE_REF_END = "\u00bb"; // »
@@ -125,6 +125,27 @@ export function normalizeSourcePathReference(value: string): string {
     .replace(/^\.?\//, "");
 }
 
+/**
+ * True when a marker's path looks like a short human label ("Lecture 2"), not a real workspace
+ * relative path. Using those as the `source` filter never matches indexed `relative_path` rows.
+ */
+export function isWeakCitationSourcePath(value: string): boolean {
+  const p = value.trim();
+  if (!p) {
+    return true;
+  }
+  if (p.includes("/") || p.includes("\\")) {
+    return false;
+  }
+  if (/\.[a-zA-Z0-9]{2,8}$/.test(p)) {
+    return false;
+  }
+  if (p.length >= 48) {
+    return false;
+  }
+  return true;
+}
+
 export function findBestCitationDocument(
   sourceName: string,
   docs: IngestionDocumentRecord[],
@@ -141,6 +162,20 @@ export function findBestCitationDocument(
   }
 
   return bestScore >= 20 ? bestDoc : null;
+}
+
+/** Ranked docs for citation retrieval when the primary path list misses (lower floor than findBestCitationDocument). */
+export function listCitationRankedDocuments(
+  sourceName: string,
+  docs: IngestionDocumentRecord[],
+  limit = 25,
+  minScore = 12,
+): IngestionDocumentRecord[] {
+  const scored = docs
+    .map((doc) => ({ doc, score: scoreReferenceCandidate(sourceName, doc.relativePath) }))
+    .filter((row) => row.score >= minScore)
+    .sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map((row) => row.doc);
 }
 
 export function findBestSourcePath(reference: string, candidatePaths: string[]): string | null {
@@ -268,12 +303,109 @@ function findSentenceBoundary(text: string, startIndex: number, direction: -1 | 
   return match ? (match.index ?? text.length) + 1 : text.length;
 }
 
+export type MessageCitationSegment =
+  | { kind: "markdown"; text: string }
+  | {
+      kind: "citation";
+      label: string;
+      ext: string;
+      sourcePath: string | null;
+      queryText: string;
+      key: number;
+      /** Sentence punctuation peeled from the following markdown segment so it stays glued to the pill */
+      trailingInline?: string;
+    };
+
+/**
+ * Split assistant markdown into alternating markdown / citation segments so `extractCitationQueryText`
+ * runs on the full message. ReactMarkdown only passes paragraph fragments to the old pill pipeline,
+ * which produced useless queries (often just the label) and empty FTS results for PDFs.
+ */
+export function splitMessageWithCitations(content: string): MessageCitationSegment[] {
+  const re = new RegExp(`${FILE_REF_MARKER}([^${FILE_REF_END}]+)${FILE_REF_END}`, "gs");
+  const segments: MessageCitationSegment[] = [];
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    if (match.index > last) {
+      segments.push({ kind: "markdown", text: content.slice(last, match.index) });
+    }
+    const parsed = parseFileReferenceMarker(match[1] ?? "");
+    segments.push({
+      kind: "citation",
+      label: parsed.label,
+      ext: parsed.ext,
+      sourcePath: parsed.sourcePath,
+      queryText: extractCitationQueryText(content, match.index, re.lastIndex),
+      key: match.index,
+    });
+    last = re.lastIndex;
+  }
+  if (last < content.length) {
+    segments.push({ kind: "markdown", text: content.slice(last) });
+  }
+  if (segments.length === 0) {
+    segments.push({ kind: "markdown", text: content });
+  }
+  return segments;
+}
+
+/**
+ * Merge trailing `.` / `!` / `?` that ended up in the next markdown segment so the pill is not a
+ * separate flex item before the period (layout regression with split segments).
+ */
+export function mergeCitationTrailingPunctuation(segments: MessageCitationSegment[]): MessageCitationSegment[] {
+  const out: MessageCitationSegment[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const cur = segments[i]!;
+    if (cur.kind !== "citation") {
+      out.push(cur);
+      continue;
+    }
+    const next = segments[i + 1];
+    if (!next || next.kind !== "markdown") {
+      out.push(cur);
+      continue;
+    }
+    const text = next.text;
+    if (/^\s*[\.\!\?…]+\s*$/.test(text)) {
+      out.push({ ...cur, trailingInline: text });
+      i++;
+      continue;
+    }
+    const peel = text.match(/^(\s*)([\.\!\?…]{1,3})(\s+)(?=[A-Za-z\d"''"(\[])/);
+    if (peel) {
+      const leadLen = peel[0].length;
+      const trailing = text.slice(0, leadLen);
+      const rest = text.slice(leadLen);
+      out.push({ ...cur, trailingInline: trailing });
+      if (rest.trim()) {
+        out.push({ kind: "markdown", text: rest });
+      }
+      i++;
+      continue;
+    }
+    out.push(cur);
+  }
+  return out;
+}
+
 export function extractCitationQueryText(
   text: string,
   markerStart: number,
   markerEnd: number,
 ): string {
-  const sentenceStart = findSentenceBoundary(text, markerStart, -1);
+  let sentenceStart = findSentenceBoundary(text, markerStart, -1);
+  // When the citation sits right after end-of-sentence punctuation, the "sentence" would otherwise
+  // be only text after that break (often just the pill + a short tail), which makes FTS useless.
+  const gapBeforeMarker = text.slice(sentenceStart, markerStart).trim();
+  if (gapBeforeMarker.length === 0 && sentenceStart > 0) {
+    let probe = sentenceStart - 1;
+    while (probe >= 0 && /\s/.test(text.charAt(probe))) probe -= 1;
+    if (probe >= 0 && /[.!?]/.test(text.charAt(probe))) {
+      sentenceStart = findSentenceBoundary(text, probe, -1);
+    }
+  }
   const sentenceEnd = findSentenceBoundary(text, markerEnd, 1);
   const sentence = replaceMarkersWithLabels(text.slice(sentenceStart, sentenceEnd))
     .replace(/\s+/g, " ")
@@ -338,4 +470,22 @@ export function cleanFileReferences(text: string): string {
   );
 
   return result;
+}
+
+/** Deduplicate search/chunk rows so the citation popover does not repeat the same excerpt. */
+export function dedupeCitationResults(results: IngestionSearchResult[]): IngestionSearchResult[] {
+  const seen = new Set<string>();
+  return results.filter((result) => {
+    const key = `${result.relativePath}::${result.locator ?? result.chunkId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Citation pills: show excerpt popover for PDFs/docs (including staged); only skip for inline previews. */
+export function citationPillShouldOpenWorkspaceDirectly(file: WorkspaceFileRecord): boolean {
+  return file.previewKind === "image" || file.previewKind === "html" || file.previewKind === "jsx";
 }

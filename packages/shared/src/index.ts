@@ -1,5 +1,5 @@
 export type AttachmentMode = "reference" | "editable" | "output";
-export type RuntimeProvider = "codex" | "gemini" | "minimax";
+export type RuntimeProvider = "codex" | "cursor" | "gemini" | "minimax";
 export type RuntimeAuthMode = "chatgpt" | "api_key" | "oauth";
 export type RuntimeEffort = "low" | "medium" | "high";
 export type WorkspaceStartMode = "guided" | "direct";
@@ -82,6 +82,19 @@ export interface TaskRuntimeProfile {
 export interface WorkspaceStartupPreferences {
   startMode?: WorkspaceStartMode;
 }
+
+/** Public snapshot: whether native LLM keys exist in local DB (never includes secrets). */
+export type NativeProviderCredentialsPublic = {
+  geminiConfigured: boolean;
+  minimaxConfigured: boolean;
+};
+
+/** PATCH body: omit a field to leave unchanged; `null` clears stored value. */
+export type UpdateNativeProviderCredentialsInput = {
+  geminiApiKey?: string | null;
+  minimaxApiKey?: string | null;
+  minimaxAccessToken?: string | null;
+};
 
 export interface ProjectRecord {
   id: string;

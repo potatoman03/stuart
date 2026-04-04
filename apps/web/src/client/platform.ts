@@ -13,6 +13,8 @@ export type StuartDesktopBridge = {
   platform: string;
   appVersion: string;
   apiOrigin: string;
+  /** Synchronous main-process origin (required for correct API URL in packaged Electron). */
+  getApiOriginSync?: () => string;
   pickFolder: () => Promise<string | null>;
   openExternal: (url: string) => Promise<boolean>;
   startCodexLogin: () => Promise<boolean>;
@@ -45,11 +47,50 @@ export function getApiOrigin(): string {
     return "";
   }
 
-  if (window.location.protocol === "http:" || window.location.protocol === "https:") {
-    return window.location.origin.replace(/\/$/, "");
+  const bridge = getDesktopBridge();
+  if (bridge?.getApiOriginSync) {
+    try {
+      const fromMain = bridge.getApiOriginSync();
+      if (typeof fromMain === "string" && /^https?:\/\//i.test(fromMain.trim())) {
+        return fromMain.replace(/\/$/, "");
+      }
+    } catch {
+      // fall through
+    }
   }
 
-  const bridge = getDesktopBridge();
+  const fromLocation =
+    window.location.protocol === "http:" || window.location.protocol === "https:"
+      ? window.location.origin.replace(/\/$/, "")
+      : "";
+
+  /*
+   * Desktop dev loads the UI from Vite (STUART_UI_PORT, e.g. 5173) while the harness runs on
+   * STUART_API_ORIGIN (e.g. 8787). window.location.origin would send /api through Vite's proxy;
+   * that often works in a normal browser but is flaky in Electron (citations, search, SSE).
+   * Call the harness directly; the server enables CORS for local dev.
+   *
+   * Packaged desktop serves UI + API from one origin — ports match, so we still use fromLocation.
+   */
+  if (bridge?.isDesktop && !bridge.isPackaged && bridge.apiOrigin) {
+    const api = bridge.apiOrigin.replace(/\/$/, "");
+    try {
+      if (fromLocation) {
+        const uiUrl = new URL(fromLocation);
+        const apiUrl = new URL(api);
+        if (uiUrl.port !== apiUrl.port || uiUrl.hostname !== apiUrl.hostname) {
+          return api;
+        }
+      }
+    } catch {
+      // fall through to fromLocation / bridge
+    }
+  }
+
+  if (fromLocation) {
+    return fromLocation;
+  }
+
   if (bridge?.apiOrigin) {
     return bridge.apiOrigin.replace(/\/$/, "");
   }

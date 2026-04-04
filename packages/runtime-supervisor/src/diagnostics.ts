@@ -3,6 +3,7 @@ import { copyFile, mkdir, access } from "node:fs/promises";
 import { constants, existsSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { buildCodexCommandArgs, resolveCodexCommandConfig } from "./codex-command.js";
+import { resolveCursorAgentBinPath, resolveCursorAgentPackageCwd } from "./cursor-agent-path.js";
 
 export type SystemDiagnosticStatus = "ok" | "warn" | "error";
 export type SystemDiagnosticsSurface = "developer" | "desktop";
@@ -25,6 +26,13 @@ export interface SystemDiagnostics {
   checks: SystemDiagnosticCheck[];
 }
 
+/** Optional secrets from local DB (never log or return to clients). */
+export type NativeProviderCredentialSnapshot = {
+  geminiApiKey?: string | null;
+  minimaxApiKey?: string | null;
+  minimaxAccessToken?: string | null;
+};
+
 export interface CollectSystemDiagnosticsOptions {
   workspaceRoot?: string;
   dataDir?: string;
@@ -34,6 +42,8 @@ export interface CollectSystemDiagnosticsOptions {
   sandboxAvailable?: boolean | null;
   surface?: SystemDiagnosticsSurface;
   managedCodex?: boolean;
+  /** When set, merged with process.env for native provider checks (DB first, then env). */
+  nativeCredentials?: NativeProviderCredentialSnapshot | null;
 }
 
 type CommandResult = {
@@ -148,32 +158,92 @@ export async function collectSystemDiagnostics(
         : `Run \`${codexCommand.displayCommand} login\` and complete authentication.`),
   });
 
-  const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
+  const cursorBin = resolveCursorAgentBinPath();
+  const cursorCwd = resolveCursorAgentPackageCwd(cursorBin);
+  const cursorVersion = await runCommand(cursorBin, ["--version"], { NO_COLOR: "1", TERM: "dumb" }, cursorCwd);
+  checks.push({
+    id: "cursor-agent-cli",
+    label: surface === "desktop" ? "Cursor Agent CLI" : "Cursor Agent CLI",
+    status: cursorVersion.ok ? "ok" : "warn",
+    required: false,
+    summary: cursorVersion.ok
+      ? (surface === "desktop"
+        ? `Included or on PATH (${firstMeaningfulLine(cursorVersion.stdout, "Cursor Agent available")})`
+        : (cursorVersion.stdout || "Cursor Agent CLI is available"))
+      : "Cursor Agent CLI not found.",
+    detail: cursorVersion.ok ? undefined : cursorVersion.detail || firstMeaningfulLine(cursorVersion.stderr),
+    command: surface === "developer" ? `${cursorBin} --version` : undefined,
+    resolution: cursorVersion.ok
+      ? undefined
+      : (surface === "desktop"
+        ? "Reinstall the desktop build or install the official CLI: https://cursor.com/install"
+        : "Install Cursor Agent (`curl https://cursor.com/install | bash`) or set STUART_CURSOR_AGENT_BIN."),
+  });
+
+  const cursorAuth = cursorVersion.ok
+    ? await runCommand(cursorBin, ["whoami"], { NO_COLOR: "1", TERM: "dumb" }, cursorCwd, 20_000)
+    : { ok: false, stdout: "", stderr: "", detail: "Skipped because Cursor Agent CLI is unavailable." };
+  const cursorAuthSummary = cursorAuth.ok
+    ? firstMeaningfulLine(stripAnsiForDiagnostics(cursorAuth.stdout + cursorAuth.stderr), "Signed in to Cursor.")
+    : undefined;
+  checks.push({
+    id: "cursor-agent-auth",
+    label: "Cursor authentication",
+    status: cursorAuth.ok ? "ok" : "warn",
+    required: false,
+    summary: cursorAuth.ok
+      ? (cursorAuthSummary ?? "Signed in to Cursor.")
+      : "Not signed in to Cursor (optional unless you use the Cursor engine).",
+    detail: cursorAuth.ok ? undefined : cursorAuth.detail || firstMeaningfulLine(stripAnsiForDiagnostics(cursorAuth.stderr)),
+    command: surface === "developer" ? `${cursorBin} whoami` : undefined,
+    resolution: cursorAuth.ok
+      ? undefined
+      : "Run `agent login` (or `cursor-agent login`) in a terminal and complete Cursor authentication.",
+  });
+
+  const snap = options.nativeCredentials;
+  const geminiFromDb = snap?.geminiApiKey?.trim() ?? "";
+  const geminiFromEnv = process.env.GEMINI_API_KEY?.trim() ?? "";
+  const geminiApiKey = geminiFromDb || geminiFromEnv;
+  const geminiFrom = geminiFromDb ? "database" : geminiFromEnv ? "environment" : null;
   checks.push({
     id: "gemini-native",
     label: "Gemini native runtime",
     status: geminiApiKey ? "ok" : "warn",
     required: false,
     summary: geminiApiKey
-      ? "Gemini native startup is configured via GEMINI_API_KEY."
+      ? geminiFrom === "database"
+        ? "Gemini native is configured (API key saved in Stuart's local database)."
+        : "Gemini native startup is configured via GEMINI_API_KEY."
       : "Gemini native startup is not configured.",
-    detail: geminiApiKey ? undefined : "Set GEMINI_API_KEY to enable direct Gemini API startup.",
-    resolution: geminiApiKey ? undefined : "Add GEMINI_API_KEY to your environment or .env before choosing Gemini native in workspace setup.",
+    detail: geminiApiKey ? undefined : "Add a Gemini API key to use the native Gemini profile.",
+    resolution: geminiApiKey
+      ? undefined
+      : "Save a key under System Check → Native API keys, or set GEMINI_API_KEY in your environment or .env file.",
   });
 
-  const minimaxCredential = process.env.MINIMAX_API_KEY?.trim() || process.env.MINIMAX_ACCESS_TOKEN?.trim();
+  const minimaxFromDb =
+    snap?.minimaxApiKey?.trim() || snap?.minimaxAccessToken?.trim() || "";
+  const minimaxFromEnv =
+    process.env.MINIMAX_API_KEY?.trim() || process.env.MINIMAX_ACCESS_TOKEN?.trim() || "";
+  const minimaxCredential = minimaxFromDb || minimaxFromEnv;
+  const minimaxFrom = minimaxFromDb ? "database" : minimaxFromEnv ? "environment" : null;
   checks.push({
     id: "minimax-native",
     label: "MiniMax native runtime",
     status: minimaxCredential ? "ok" : "warn",
     required: false,
     summary: minimaxCredential
-      ? "MiniMax native startup is configured."
+      ? minimaxFrom === "database"
+        ? "MiniMax native is configured (credentials saved in Stuart's local database)."
+        : "MiniMax native startup is configured."
       : "MiniMax native startup is not configured.",
     detail: minimaxCredential
       ? undefined
-      : "Set MINIMAX_API_KEY for direct API access. MiniMax's public docs also show an OAuth setup flow inside OpenClaw, but Stuart does not yet depend on that flow.",
-    resolution: minimaxCredential ? undefined : "Add MINIMAX_API_KEY to your environment or .env before choosing MiniMax native in workspace setup.",
+      : "Set MINIMAX_API_KEY or MINIMAX_ACCESS_TOKEN for direct API access.",
+    resolution: minimaxCredential
+      ? undefined
+      : "Save credentials under System Check → Native API keys, or set MINIMAX_API_KEY / MINIMAX_ACCESS_TOKEN in .env.",
   });
 
   if (surface === "developer") {
@@ -195,7 +265,9 @@ export async function collectSystemDiagnostics(
     status: dataDirWritable.ok ? "ok" : "error",
     required: true,
     summary: dataDirWritable.ok
-      ? (surface === "desktop" ? "Stuart can save study history and artifacts locally." : `Using ${dataDir}`)
+      ? (surface === "desktop"
+        ? `Using ${dataDir} for local study history and artifacts.`
+        : `Using ${dataDir}`)
       : `Cannot write to ${dataDir}`,
     detail: dataDirWritable.detail,
     resolution: dataDirWritable.ok
@@ -377,7 +449,9 @@ function optionalCommandCheck(input: {
 async function runCommand(
   command: string,
   args: string[],
-  extraEnv: NodeJS.ProcessEnv = {}
+  extraEnv: NodeJS.ProcessEnv = {},
+  cwd?: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
 ): Promise<CommandResult> {
   return new Promise((resolveResult) => {
     execFile(
@@ -385,7 +459,8 @@ async function runCommand(
       args,
       {
         encoding: "utf8",
-        timeout: DEFAULT_TIMEOUT_MS,
+        timeout: timeoutMs,
+        cwd,
         env: {
           ...process.env,
           ...extraEnv,
@@ -417,6 +492,10 @@ async function runCommand(
       }
     );
   });
+}
+
+function stripAnsiForDiagnostics(value: string): string {
+  return value.replace(/\x1b\[[\d;?]*[ -/]*[@-~]/g, "").replace(/\r/g, "");
 }
 
 async function ensurePathWritable(path: string): Promise<{ ok: boolean; detail?: string }> {

@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { cp, mkdir, rm, copyFile, access } from "node:fs/promises";
-import { constants } from "node:fs";
+import { cp, mkdir, rm, copyFile, access, writeFile, mkdtemp, chmod } from "node:fs/promises";
+import { constants, existsSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -153,6 +154,92 @@ if (target) {
   }
 } else {
   process.stdout.write(`Warning: No Codex runtime target for ${platform}-${arch}.\n`);
+}
+
+// Cursor Agent CLI: full dist-package (binary + adjacent assets), same layout as the official installer tarball/zip.
+const CURSOR_AGENT_VENDOR_VERSION =
+  process.env.CURSOR_AGENT_VENDOR_VERSION?.trim() || "2026.03.30-a5d3e17";
+const cursorVendorDir = join(desktopDir, "cursor-vendor");
+await rm(cursorVendorDir, { recursive: true, force: true });
+
+const cursorArch = arch === "x64" ? "x64" : "arm64";
+/** @type {{ url: string; zip: boolean } | null} */
+let cursorRemote = null;
+if (platform === "darwin") {
+  cursorRemote = {
+    url: `https://downloads.cursor.com/lab/${CURSOR_AGENT_VENDOR_VERSION}/darwin/${cursorArch}/agent-cli-package.tar.gz`,
+    zip: false,
+  };
+} else if (platform === "linux") {
+  cursorRemote = {
+    url: `https://downloads.cursor.com/lab/${CURSOR_AGENT_VENDOR_VERSION}/linux/${cursorArch}/agent-cli-package.tar.gz`,
+    zip: false,
+  };
+} else if (platform === "win32") {
+  cursorRemote = {
+    url: `https://downloads.cursor.com/lab/${CURSOR_AGENT_VENDOR_VERSION}/windows/${cursorArch}/agent-cli-package.zip`,
+    zip: true,
+  };
+}
+
+if (cursorRemote) {
+  const outKey = `${platform}-${arch}`;
+  const outDir = join(cursorVendorDir, outKey);
+  const agentName = platform === "win32" ? "cursor-agent.exe" : "cursor-agent";
+  const tmpRoot = await mkdtemp(join(tmpdir(), "stuart-cursor-agent-"));
+  const archivePath = join(tmpRoot, cursorRemote.zip ? "agent-cli-package.zip" : "agent-cli-package.tar.gz");
+
+  try {
+    process.stdout.write(`Downloading Cursor Agent CLI (${CURSOR_AGENT_VENDOR_VERSION}) for ${outKey}…\n`);
+    const res = await fetch(cursorRemote.url);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    await writeFile(archivePath, Buffer.from(await res.arrayBuffer()));
+
+    await mkdir(outDir, { recursive: true });
+
+    if (cursorRemote.zip) {
+      if (platform === "win32") {
+        const ap = archivePath.replace(/'/g, "''");
+        const dp = tmpRoot.replace(/'/g, "''");
+        execFileSync(
+          "powershell.exe",
+          ["-NoProfile", "-Command", `Expand-Archive -LiteralPath '${ap}' -DestinationPath '${dp}\\zip-out' -Force`],
+          { stdio: "inherit" }
+        );
+      } else {
+        await mkdir(join(tmpRoot, "zip-out"), { recursive: true });
+        execFileSync("unzip", ["-q", "-o", archivePath, "-d", join(tmpRoot, "zip-out")], { stdio: "inherit" });
+      }
+      const zipOut = join(tmpRoot, "zip-out");
+      const flat = existsSync(join(zipOut, "dist-package")) ? join(zipOut, "dist-package") : zipOut;
+      await cp(flat, outDir, { recursive: true });
+    } else {
+      execFileSync("tar", ["-xzf", archivePath, "-C", outDir, "--strip-components=1"], { stdio: "inherit" });
+    }
+
+    if (platform !== "win32") {
+      try {
+        await chmod(join(outDir, "cursor-agent"), 0o755);
+      } catch {
+        // best effort
+      }
+    }
+
+    if (!existsSync(join(outDir, agentName))) {
+      throw new Error(`Bundled layout missing ${agentName} after extract`);
+    }
+    process.stdout.write(`Bundled Cursor Agent CLI for ${outKey}.\n`);
+  } catch (err) {
+    process.stdout.write(
+      `Warning: Could not bundle Cursor Agent CLI for ${outKey}: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+  } finally {
+    await rm(tmpRoot, { recursive: true, force: true });
+  }
+} else {
+  process.stdout.write(`Warning: No Cursor Agent CLI download target for ${platform}-${arch}.\n`);
 }
 
 process.stdout.write("Synced desktop app assets.\n");

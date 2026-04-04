@@ -36,7 +36,9 @@ import type {
   TaskWorkerRecord,
   UpdateProjectInput,
   UpdateTaskInput,
-  VmStatus
+  VmStatus,
+  NativeProviderCredentialsPublic,
+  UpdateNativeProviderCredentialsInput
 } from "@stuart/shared";
 import type { PreviewKind, WorkspaceEvent, WorkspaceFileRecord } from "@stuart/shared";
 import { CodexAppServerClient } from "./codex-app-server.js";
@@ -59,6 +61,12 @@ import {
   buildWorkerExecutionPlan,
   resolveTaskRuntimeProfile,
 } from "./runtime-planning.js";
+import {
+  geminiGenerateContent,
+  minimaxChatCompletion,
+  type NativeChatMessage
+} from "./native-llm.js";
+import { runCursorAgentStreamJson } from "./cursor-cli.js";
 
 export { renderDocument } from "./document-renderer.js";
 export {
@@ -152,6 +160,27 @@ type SocraticTaskState = {
   exchangeAttempts: number;
   directRequestCount: number;
 };
+
+type StudyTurnInputPart =
+  | { type: "text"; text: string; text_elements: unknown[] }
+  | { type: "image"; url: string };
+
+function flattenStudyInputForNative(input: StudyTurnInputPart[]): {
+  text: string;
+  imageBase64?: string;
+} {
+  const textParts: string[] = [];
+  let imageBase64: string | undefined;
+  for (const item of input) {
+    if (item.type === "text" && item.text) {
+      textParts.push(item.text);
+    } else if (item.type === "image" && item.url) {
+      imageBase64 = item.url;
+      textParts.push("\n\n[The student attached an image with their message.]");
+    }
+  }
+  return { text: textParts.join("\n\n").trim(), imageBase64 };
+}
 
 interface ResolvedWorkspaceFile extends WorkspaceFileRecord {
   absolutePath: string;
@@ -373,7 +402,10 @@ export class StuartRuntime {
 
     // Only check task turns, not workers or memory extraction
     const taskTurns = [...this.turns.values()].filter(
-      (t) => t.kind === "task" && !t.memoryExtraction
+      (t) =>
+        t.kind === "task" &&
+        !t.memoryExtraction &&
+        !t.threadId.startsWith("stuart-cursor-")
     );
     if (taskTurns.length === 0) return;
     const staleTurns = taskTurns.filter((turn) => {
@@ -475,6 +507,7 @@ export class StuartRuntime {
       return this.diagnosticsCache.value;
     }
 
+    const nativeSecrets = this.db.getNativeProviderSecrets();
     const diagnostics = await collectSystemDiagnostics({
       workspaceRoot: this.workspaceRoot,
       dataDir: this.dataDir,
@@ -483,12 +516,43 @@ export class StuartRuntime {
       sandboxAvailable: this.sandboxAvailable,
       surface: process.env.STUART_RUNTIME_MODE === "desktop" || process.env.STUART_RUNTIME_MODE === "standalone" ? "desktop" : "developer",
       managedCodex: process.env.STUART_DESKTOP_MANAGED_CODEX === "1",
+      nativeCredentials: {
+        geminiApiKey: nativeSecrets.geminiApiKey,
+        minimaxApiKey: nativeSecrets.minimaxApiKey,
+        minimaxAccessToken: nativeSecrets.minimaxAccessToken
+      }
     });
     this.diagnosticsCache = {
       expiresAt: Date.now() + 30_000,
       value: diagnostics,
     };
     return diagnostics;
+  }
+
+  getNativeProviderCredentialsPublic(): NativeProviderCredentialsPublic {
+    return this.db.getNativeProviderCredentialsPublic();
+  }
+
+  updateNativeProviderCredentials(input: UpdateNativeProviderCredentialsInput): NativeProviderCredentialsPublic {
+    const result = this.db.updateNativeProviderCredentials(input);
+    this.diagnosticsCache = undefined;
+    return result;
+  }
+
+  getResolvedGeminiApiKey(): string | undefined {
+    const fromDb = this.db.getNativeProviderSecrets().geminiApiKey?.trim();
+    return fromDb || process.env.GEMINI_API_KEY?.trim() || undefined;
+  }
+
+  getResolvedMinimaxCredentials(): { apiKey?: string; accessToken?: string } {
+    const s = this.db.getNativeProviderSecrets();
+    const apiKey = s.minimaxApiKey?.trim() || process.env.MINIMAX_API_KEY?.trim() || undefined;
+    const accessToken =
+      s.minimaxAccessToken?.trim() || process.env.MINIMAX_ACCESS_TOKEN?.trim() || undefined;
+    const out: { apiKey?: string; accessToken?: string } = {};
+    if (apiKey) out.apiKey = apiKey;
+    if (accessToken) out.accessToken = accessToken;
+    return out;
   }
 
   listProjects() {
@@ -1143,6 +1207,124 @@ Assistant response (for confirmation detection only): ${assistantText.slice(0, 5
           ]
         : [])
     ];
+
+    const requestedProfile = executionPlan.requestedProfile;
+    if (
+      requestedProfile.native &&
+      (requestedProfile.provider === "gemini" || requestedProfile.provider === "minimax")
+    ) {
+      const turnId = randomUUID();
+      this.turns.set(turnId, {
+        taskId,
+        threadId,
+        turnId,
+        startedAt: new Date().toISOString(),
+        lastActivityAt: Date.now(),
+        kind: "task",
+        assistantText: "",
+        thinkingLabel: inferThinkingLabel(task, trimmed),
+        startedEmitted: true,
+        stallTimeoutMs: executionPlan.stallTimeoutMs,
+        cwd: context.cwd,
+        triggersReindex: skills.some((skill) => skill.triggersReindex),
+        userMessage: trimmed,
+        retryCount: options.retryCount ?? 0,
+        socratic: socraticContext.turn,
+      });
+
+      if (socraticContext.state) {
+        this.socraticStates.set(taskId, socraticContext.state);
+      } else {
+        this.socraticStates.delete(taskId);
+      }
+
+      this.emitEvent({
+        type: "codex.turn.started",
+        taskId,
+        threadId,
+        turnId,
+        label: inferThinkingLabel(task, trimmed),
+      });
+
+      const nativeInput = input as StudyTurnInputPart[];
+      void this.executeNativeStudyTurn({
+        task,
+        taskId,
+        threadId,
+        turnId,
+        context,
+        input: nativeInput,
+        userMessage,
+        project: project ?? null,
+        provider: requestedProfile.provider,
+        model: requestedProfile.model,
+      }).catch((err) => {
+        process.stderr.write(`[stuart] native study turn: ${String(err)}\n`);
+      });
+
+      return {
+        preparedRun: context.preparedRun,
+        userMessage,
+        startedTurn: true,
+      };
+    }
+
+    if (requestedProfile.provider === "cursor") {
+      const turnId = randomUUID();
+      this.turns.set(turnId, {
+        taskId,
+        threadId,
+        turnId,
+        startedAt: new Date().toISOString(),
+        lastActivityAt: Date.now(),
+        kind: "task",
+        assistantText: "",
+        thinkingLabel: inferThinkingLabel(task, trimmed),
+        startedEmitted: true,
+        stallTimeoutMs: executionPlan.stallTimeoutMs,
+        cwd: context.cwd,
+        triggersReindex: skills.some((skill) => skill.triggersReindex),
+        userMessage: trimmed,
+        retryCount: options.retryCount ?? 0,
+        socratic: socraticContext.turn,
+      });
+
+      if (socraticContext.state) {
+        this.socraticStates.set(taskId, socraticContext.state);
+      } else {
+        this.socraticStates.delete(taskId);
+      }
+
+      this.emitEvent({
+        type: "codex.turn.started",
+        taskId,
+        threadId,
+        turnId,
+        label: inferThinkingLabel(task, trimmed),
+      });
+
+      const cursorInput = input as StudyTurnInputPart[];
+      void this.executeCursorStudyTurn({
+        task,
+        taskId,
+        threadId,
+        turnId,
+        context,
+        input: cursorInput,
+        userMessage,
+        project: project ?? null,
+        model: requestedProfile.model,
+      }).catch((err) => {
+        process.stderr.write(`[stuart] cursor study turn: ${String(err)}\n`);
+      });
+
+      return {
+        preparedRun: context.preparedRun,
+        userMessage,
+        startedTurn: true,
+      };
+    }
+
     const turn = await this.codex.request<{ turn: { id: string } }>("turn/start", {
       threadId,
       cwd: context.cwd,
@@ -2036,6 +2218,15 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
       }
     }
 
+    const runtimeProfile = resolveTaskRuntimeProfile(task);
+    if (runtimeProfile.native && (runtimeProfile.provider === "gemini" || runtimeProfile.provider === "minimax")) {
+      return this.ensureSyntheticNativeThread(task, runtimeProfile.provider);
+    }
+
+    if (runtimeProfile.provider === "cursor") {
+      return this.ensureSyntheticCursorThread(task);
+    }
+
     const persistedThreadId = this.db.getTaskThreadId(task.id);
     if (persistedThreadId) {
       if (!this.loadedThreadIds.has(persistedThreadId)) {
@@ -2063,6 +2254,381 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
     }
 
     return this.startTaskThread(task, cwd);
+  }
+
+  private ensureSyntheticCursorThread(task: TaskSpec): string {
+    const prefix = "stuart-cursor-";
+    const persisted = this.db.getTaskThreadId(task.id);
+    if (persisted?.startsWith(prefix)) {
+      return persisted;
+    }
+    const id = `${prefix}${randomUUID()}`;
+    this.db.setTaskThreadId(task.id, id);
+    this.recordRuntimeMessage(
+      task.id,
+      "Using Cursor Agent for this study session — chat requests go through the Cursor CLI."
+    );
+    return id;
+  }
+
+  private ensureSyntheticNativeThread(task: TaskSpec, provider: "gemini" | "minimax"): string {
+    const prefix = `stuart-native-${provider}-`;
+    const persisted = this.db.getTaskThreadId(task.id);
+    if (persisted?.startsWith(prefix)) {
+      return persisted;
+    }
+    const id = `${prefix}${randomUUID()}`;
+    this.db.setTaskThreadId(task.id, id);
+    this.recordRuntimeMessage(
+      task.id,
+      `Using native ${provider} for this study session — chat requests go to the ${provider} API instead of Codex.`
+    );
+    return id;
+  }
+
+  private buildNativeChatMessages(
+    taskId: string,
+    lastUserMessageId: string,
+    augmentedUserText: string
+  ): NativeChatMessage[] {
+    const rows = this.db
+      .listTaskMessages(taskId)
+      .filter((m) => m.role === "user" || m.role === "assistant");
+    const out: NativeChatMessage[] = [];
+    let replaced = false;
+    for (const m of rows) {
+      if (m.role === "user" && m.id === lastUserMessageId) {
+        out.push({ role: "user", content: augmentedUserText });
+        replaced = true;
+      } else if (m.role === "user") {
+        out.push({ role: "user", content: m.content });
+      } else {
+        out.push({ role: "assistant", content: m.content });
+      }
+    }
+    if (!replaced) {
+      out.push({ role: "user", content: augmentedUserText });
+    }
+    return out;
+  }
+
+  private buildCursorTurnPrompt(
+    taskId: string,
+    lastUserMessageId: string,
+    augmentedUserText: string,
+    systemInstruction: string
+  ): string {
+    const lines = this.buildNativeChatMessages(taskId, lastUserMessageId, augmentedUserText);
+    const transcript = lines
+      .map((m) => (m.role === "user" ? `Student: ${m.content}` : `Tutor: ${m.content}`))
+      .join("\n\n");
+    return `${systemInstruction}\n\n## Conversation so far\n${transcript}`;
+  }
+
+  private async executeNativeStudyTurn(options: {
+    task: TaskSpec;
+    taskId: string;
+    threadId: string;
+    turnId: string;
+    context: TaskExecutionContext;
+    input: StudyTurnInputPart[];
+    userMessage: TaskMessageRecord;
+    project: ProjectRecord | null;
+    provider: "gemini" | "minimax";
+    model: string;
+  }): Promise<void> {
+    const {
+      task,
+      taskId,
+      threadId,
+      turnId,
+      context,
+      input,
+      userMessage,
+      project,
+    provider,
+    model,
+  } = options;
+
+    const state = this.turns.get(turnId);
+    if (!state || state.kind !== "task") {
+      return;
+    }
+
+    try {
+      const { text: augmentedText, imageBase64 } = flattenStudyInputForNative(input);
+      const messages = this.buildNativeChatMessages(taskId, userMessage.id, augmentedText);
+      const teachingProject =
+        project ??
+        ({
+          id: "",
+          name: "Study",
+          rootPath: context.cwd,
+          createdAt: "",
+          updatedAt: "",
+        } satisfies ProjectRecord);
+      const systemInstruction = buildTeachingInstructions(teachingProject, task, this.db);
+
+      let rawText = "";
+      let apiError: string | undefined;
+      if (provider === "gemini") {
+        const apiKey = this.getResolvedGeminiApiKey();
+        if (!apiKey) {
+          apiError =
+            "Gemini API key not configured. Add it in System Check under Native API keys or set GEMINI_API_KEY.";
+        } else {
+          const res = await geminiGenerateContent({
+            apiKey,
+            model,
+            systemInstruction,
+            messages,
+            userImageBase64: imageBase64,
+          });
+          rawText = res.text;
+          apiError = res.error;
+        }
+      } else {
+        const creds = this.getResolvedMinimaxCredentials();
+        const res = await minimaxChatCompletion({
+          ...creds,
+          model,
+          systemInstruction,
+          messages,
+        });
+        rawText = res.text;
+        apiError = res.error;
+      }
+
+      if (apiError || !rawText) {
+        const detail = apiError ?? "The model returned an empty response.";
+        this.db.createTaskMessage({
+          taskId,
+          role: "system",
+          content: `Native ${provider} could not finish this turn.\n\n${detail}`,
+        });
+        this.emitEvent({ type: "task.message", taskId });
+        this.emitEvent({
+          type: "codex.turn.completed",
+          taskId,
+          threadId,
+          turnId,
+          status: "failed",
+          error: detail,
+        });
+        this.turns.delete(turnId);
+        return;
+      }
+
+      const finalAssistantText = sanitizeSocraticCompletion(rawText, state.socratic);
+      state.assistantText = finalAssistantText;
+
+      const assistantMessageId = randomUUID();
+      const message = this.db.upsertTaskMessage({
+        id: assistantMessageId,
+        taskId,
+        role: "assistant",
+        content: finalAssistantText,
+      });
+
+      this.emitEvent({
+        type: "codex.message.completed",
+        taskId,
+        threadId,
+        turnId,
+        message,
+      });
+
+      this.emitEvent({
+        type: "codex.turn.completed",
+        taskId,
+        threadId,
+        turnId,
+        status: "completed",
+      });
+
+      await this.runPostTurnCompletionPipeline(state);
+
+      this.turns.delete(turnId);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[stuart] native study turn failed: ${detail}\n`);
+      this.db.createTaskMessage({
+        taskId,
+        role: "system",
+        content: `Native ${provider} error.\n\n${detail}`,
+      });
+      this.emitEvent({ type: "task.message", taskId });
+      this.emitEvent({
+        type: "codex.turn.completed",
+        taskId,
+        threadId,
+        turnId,
+        status: "failed",
+        error: detail,
+      });
+      this.turns.delete(turnId);
+    }
+  }
+
+  private async executeCursorStudyTurn(options: {
+    task: TaskSpec;
+    taskId: string;
+    threadId: string;
+    turnId: string;
+    context: TaskExecutionContext;
+    input: StudyTurnInputPart[];
+    userMessage: TaskMessageRecord;
+    project: ProjectRecord | null;
+    model: string;
+  }): Promise<void> {
+    const { task, taskId, threadId, turnId, context, input, userMessage, project, model } = options;
+
+    const state = this.turns.get(turnId);
+    if (!state || state.kind !== "task") {
+      return;
+    }
+
+    try {
+      const { text: augmentedText } = flattenStudyInputForNative(input);
+      const teachingProject =
+        project ??
+        ({
+          id: "",
+          name: "Study",
+          rootPath: context.cwd,
+          createdAt: "",
+          updatedAt: "",
+        } satisfies ProjectRecord);
+      const systemInstruction = buildTeachingInstructions(teachingProject, task, this.db);
+
+      const streamItemId = randomUUID();
+      const streamCursorDelta = (delta: string) => {
+        if (!delta) {
+          return;
+        }
+        state.lastActivityAt = Date.now();
+        if (state.kind === "task" && !shouldSuppressSocraticStreaming(state.socratic)) {
+          this.emitEvent({
+            type: "codex.message.delta",
+            taskId,
+            threadId,
+            turnId,
+            itemId: streamItemId,
+            delta,
+          });
+        }
+      };
+
+      const storedSessionId = this.db.getCursorAgentSessionId(taskId);
+      let prompt: string;
+      let resumeSessionId: string | undefined;
+      if (storedSessionId) {
+        prompt = augmentedText;
+        resumeSessionId = storedSessionId;
+      } else {
+        prompt = this.buildCursorTurnPrompt(taskId, userMessage.id, augmentedText, systemInstruction);
+      }
+
+      let { text: rawText, error, sessionId } = await runCursorAgentStreamJson({
+        workspaceRoot: context.cwd,
+        model,
+        prompt,
+        resumeSessionId,
+        callbacks: { onAssistantDelta: streamCursorDelta },
+      });
+
+      if ((error || !rawText) && resumeSessionId) {
+        process.stderr.write(
+          `[stuart] cursor session resume failed (${error ?? "empty response"}); re-seeding from Stuart history.\n`
+        );
+        this.db.setCursorAgentSessionId(taskId, null);
+        const fullPrompt = this.buildCursorTurnPrompt(taskId, userMessage.id, augmentedText, systemInstruction);
+        const retry = await runCursorAgentStreamJson({
+          workspaceRoot: context.cwd,
+          model,
+          prompt: fullPrompt,
+          callbacks: { onAssistantDelta: streamCursorDelta },
+        });
+        rawText = retry.text;
+        error = retry.error;
+        sessionId = retry.sessionId;
+      }
+
+      if (error || !rawText) {
+        const detail = error ?? "Cursor Agent returned an empty response.";
+        this.db.setCursorAgentSessionId(taskId, null);
+        this.db.createTaskMessage({
+          taskId,
+          role: "system",
+          content: `Cursor Agent could not finish this turn.\n\n${detail}`,
+        });
+        this.emitEvent({ type: "task.message", taskId });
+        this.emitEvent({
+          type: "codex.turn.completed",
+          taskId,
+          threadId,
+          turnId,
+          status: "failed",
+          error: detail,
+        });
+        this.turns.delete(turnId);
+        return;
+      }
+
+      if (sessionId) {
+        this.db.setCursorAgentSessionId(taskId, sessionId);
+      }
+
+      const finalAssistantText = sanitizeSocraticCompletion(rawText, state.socratic);
+      state.assistantText = finalAssistantText;
+
+      const assistantMessageId = randomUUID();
+      const message = this.db.upsertTaskMessage({
+        id: assistantMessageId,
+        taskId,
+        role: "assistant",
+        content: finalAssistantText,
+      });
+
+      this.emitEvent({
+        type: "codex.message.completed",
+        taskId,
+        threadId,
+        turnId,
+        message,
+      });
+
+      this.emitEvent({
+        type: "codex.turn.completed",
+        taskId,
+        threadId,
+        turnId,
+        status: "completed",
+      });
+
+      await this.runPostTurnCompletionPipeline(state);
+
+      this.turns.delete(turnId);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[stuart] cursor study turn failed: ${detail}\n`);
+      this.db.setCursorAgentSessionId(taskId, null);
+      this.db.createTaskMessage({
+        taskId,
+        role: "system",
+        content: `Cursor Agent error.\n\n${detail}`,
+      });
+      this.emitEvent({ type: "task.message", taskId });
+      this.emitEvent({
+        type: "codex.turn.completed",
+        taskId,
+        threadId,
+        turnId,
+        status: "failed",
+        error: detail,
+      });
+      this.turns.delete(turnId);
+    }
   }
 
   private async startTaskThread(task: TaskSpec, cwd: string): Promise<string> {
@@ -2139,6 +2705,304 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
     this.db.setTaskWorkerThreadId(worker.id, started.thread.id);
     this.loadedThreadIds.add(started.thread.id);
     return started.thread.id;
+  }
+
+  private async runPostTurnCompletionPipeline(state: ActiveTurnState): Promise<void> {
+    // Resolve cwd if missing (can happen on resumed threads)
+    if (!state.cwd) {
+      const latestRun = this.db.listTaskRuns(state.taskId)[0];
+      if (latestRun) {
+        state.cwd = latestRun.stagingPath;
+      }
+    }
+
+    // Artifact detection: try to parse any assistant response that contains JSON or script artifacts
+    try {
+      const assistantText = state.assistantText.trim();
+      if (assistantText) {
+        const parsed = tryParseArtifactJson(assistantText, state.cwd);
+        if (parsed) {
+          const validation = validateArtifactDraft(parsed.kind, parsed.data);
+          if (!validation.ok) {
+            this.recordRuntimeMessage(
+              state.taskId,
+              `Skipped storing the ${parsed.kind} artifact because validation failed: ${validation.errors.join("; ")}`
+            );
+          } else {
+            if (validation.warnings.length > 0) {
+              this.recordRuntimeMessage(
+                state.taskId,
+                `Artifact quality check for ${parsed.kind}: ${validation.warnings.join("; ")}`
+              );
+            }
+            const artifact = this.db.createStudyArtifact({
+              taskId: state.taskId,
+              kind: parsed.kind,
+              title: parsed.title,
+              payload: JSON.stringify(parsed.data),
+              payloadVersion: parsed.kind.startsWith("document_") ? 2 : 1,
+              renderStatus: parsed.kind.startsWith("document_") ? "pending" : undefined,
+              previewStatus: parsed.kind.startsWith("document_") ? "pending" : undefined,
+            });
+            this.recordRuntimeMessage(
+              state.taskId,
+              `Detected and stored a ${parsed.kind} study artifact: "${parsed.title}".`
+            );
+
+            // Validate quiz questions with a checking agent
+            if (parsed.kind === "quiz") {
+              void this.validateQuizArtifact(artifact.id, state.taskId).catch(() => {});
+            }
+
+            // Render document kinds to binary files
+            if (parsed.kind.startsWith("document_")) {
+              try {
+                const prepared = await this.ensureDocumentAssets(artifact.id);
+                const ext = parsed.kind.replace("document_", "").toUpperCase();
+                this.recordRuntimeMessage(
+                  state.taskId,
+                  `Generated ${ext} document: "${parsed.title}"${prepared?.previewPath ? " with a ready preview." : "."}`
+                );
+              } catch (renderErr) {
+                // Rendering is non-fatal — artifact JSON is still stored
+                this.recordRuntimeMessage(
+                  state.taskId,
+                  `Note: document rendering failed but the artifact data was saved. Error: ${String(renderErr)}`
+                );
+              }
+            }
+          }
+        } else if (this.sandboxAvailable) {
+          // No JSON artifact found — try script-based execution path
+          const script = tryExtractScript(assistantText);
+          if (script) {
+            const ext = script.outputFilename.split(".").pop() ?? "";
+            const kindMap: Record<string, string> = {
+              pdf: "document_pdf",
+              docx: "document_docx",
+              xlsx: "document_xlsx",
+              pptx: "document_pptx",
+            };
+            const kind = kindMap[ext] ?? `document_${ext}`;
+
+            // Store the artifact with script payload
+            const artifact = this.db.createStudyArtifact({
+              taskId: state.taskId,
+              kind,
+              title: script.title,
+              payload: JSON.stringify({
+                script: script.script,
+                language: script.language,
+                outputFilename: script.outputFilename,
+              }),
+              payloadVersion: 1,
+              renderStatus: "pending",
+              previewStatus: "pending",
+            });
+            this.recordRuntimeMessage(
+              state.taskId,
+              `Detected scripted ${ext.toUpperCase()} artifact: "${script.title}". Executing in sandbox...`
+            );
+
+            this.emitEvent({
+              type: "sandbox.execution.started",
+              taskId: state.taskId,
+              language: script.language,
+              outputFilename: script.outputFilename,
+            });
+
+            try {
+              const docOutputDir = this.resolveDocumentOutputDir(state.taskId);
+              const result = await this.sandbox.executeScript({
+                language: script.language,
+                script: script.script,
+                outputFilename: script.outputFilename,
+                taskId: state.taskId,
+                outputDir: docOutputDir,
+                sourcesDir: state.cwd,
+              });
+
+              this.emitEvent({
+                type: "sandbox.execution.completed",
+                taskId: state.taskId,
+                success: result.success,
+                outputFilename: script.outputFilename,
+                durationMs: result.durationMs,
+                error: result.success ? undefined : result.stderr,
+              });
+
+              if (result.success && result.outputPath) {
+                if (kind === "document_docx" || kind === "document_xlsx" || kind === "document_pptx") {
+                  await validateOfficePackage(result.outputPath, kind);
+                }
+                this.db.updateStudyArtifactLifecycle(artifact.id, {
+                  filePath: result.outputPath,
+                  previewPath: kind === "document_pdf" ? result.outputPath : null,
+                  renderStatus: "ready",
+                  previewStatus: kind === "document_pdf" ? "ready" : "failed",
+                  renderError: null,
+                  previewError: kind === "document_pdf" ? null : "Legacy scripted Office documents do not have a persisted preview asset.",
+                });
+                this.recordRuntimeMessage(
+                  state.taskId,
+                  `Generated ${ext.toUpperCase()} document via sandbox: "${script.title}" (${result.durationMs}ms).`
+                );
+              } else {
+                this.db.updateStudyArtifactLifecycle(artifact.id, {
+                  renderStatus: "failed",
+                  previewStatus: "failed",
+                  renderError: `Sandbox execution failed (exit ${result.exitCode}).`,
+                  previewError: "Preview unavailable because document rendering failed.",
+                });
+                this.recordRuntimeMessage(
+                  state.taskId,
+                  `Sandbox execution failed (exit ${result.exitCode}): ${truncateForLog(result.stderr || result.stdout, 300)}`
+                );
+              }
+            } catch (sandboxErr) {
+              this.db.updateStudyArtifactLifecycle(artifact.id, {
+                renderStatus: "failed",
+                previewStatus: "failed",
+                renderError: sandboxErr instanceof Error ? sandboxErr.message : String(sandboxErr),
+                previewError: "Preview unavailable because document rendering failed.",
+              });
+              this.emitEvent({
+                type: "sandbox.execution.completed",
+                taskId: state.taskId,
+                success: false,
+                outputFilename: script.outputFilename,
+                durationMs: 0,
+                error: String(sandboxErr),
+              });
+              this.recordRuntimeMessage(
+                state.taskId,
+                `Sandbox execution error: ${String(sandboxErr)}`
+              );
+            }
+          }
+        }
+      }
+    } catch {
+      // Artifact detection is best-effort; don't block the turn.
+    }
+
+    // Fallback: if no artifact was detected but Codex wrote HTML files to the workspace,
+    // create interactive artifacts from them automatically.
+    if (state.cwd) {
+      try {
+        const turnStartedAt = state.startedAt ? new Date(state.startedAt) : new Date(0);
+        const htmlArtifacts = discoverInteractiveHtmlFiles(state.cwd, turnStartedAt);
+        const referencedArtifacts = state.assistantText
+          ? discoverReferencedInteractiveHtmlFiles(state.cwd, state.assistantText)
+          : [];
+        const candidates = new Map<string, (typeof htmlArtifacts)[number]>();
+        for (const file of [...referencedArtifacts, ...htmlArtifacts]) {
+          candidates.set(file.relativePath, file);
+        }
+        process.stdout.write(
+          `[stuart] HTML file scan in ${state.cwd}: found ${htmlArtifacts.length} recent interactive HTML artifact candidate(s) and ${referencedArtifacts.length} assistant-referenced candidate(s): ${[...candidates.values()].map((file) => file.relativePath).join(", ") || "(none)"}\n`
+        );
+        for (const file of candidates.values()) {
+          const existing = this.db.listStudyArtifacts(state.taskId).some(
+            (artifact) =>
+              artifact.kind === "interactive" &&
+              (artifact.payload.includes(file.relativePath) || artifact.payload.includes(file.title))
+          );
+          if (existing) {
+            process.stdout.write(`[stuart] HTML scan: skipping ${file.relativePath} — already has artifact\n`);
+            continue;
+          }
+
+          this.db.createStudyArtifact({
+            taskId: state.taskId,
+            kind: "interactive",
+            title: file.title,
+            payload: JSON.stringify({
+              kind: "interactive",
+              title: file.title,
+              html: file.html,
+              sourcePath: file.relativePath
+            })
+          });
+          this.recordRuntimeMessage(
+            state.taskId,
+            `Detected interactive artifact from workspace file: "${file.title}".`
+          );
+        }
+      } catch { /* workspace scan is best-effort */ }
+    }
+
+    // If this turn wrote new research files (sources/, curriculum.md),
+    // copy them from staging to the project root so the user can see them.
+    const shouldSyncFiles = state.triggersReindex
+      || /\bsources\//i.test(state.assistantText)
+      || /\bcurriculum\.md\b/i.test(state.assistantText)
+      || /(?:created|wrote|saved)\s+\d+\s+(?:files?|documents?|sources?)/i.test(state.assistantText);
+    if (shouldSyncFiles && state.cwd) {
+      try {
+        const projectRoot = this.resolveProjectRoot(state.taskId);
+        if (projectRoot && projectRoot !== state.cwd) {
+          // Copy sources/ directory
+          const stagingSources = join(state.cwd, "sources");
+          if (existsSync(stagingSources)) {
+            const destSources = join(projectRoot, "sources");
+            await cp(stagingSources, destSources, { recursive: true, force: true });
+          }
+          // Copy curriculum files
+          for (const currFile of ["curriculum.md", "curriculum.json"]) {
+            const stagingPath = join(state.cwd, currFile);
+            if (existsSync(stagingPath)) {
+              await cp(stagingPath, join(projectRoot, currFile), { force: true });
+            }
+          }
+          this.recordRuntimeMessage(
+            state.taskId,
+            `Synced research files to your project folder.`
+          );
+        }
+      } catch {
+        // Non-critical — files still available in staging
+      }
+
+      // Re-index workspace with new files
+      try {
+        await this.buildTaskIngestionIndex(state.taskId, { force: true });
+        this.recordRuntimeMessage(
+          state.taskId,
+          "Re-indexed workspace — new materials are now available for study."
+        );
+      } catch {
+        // Non-critical — indexing will happen lazily on next retrieval
+      }
+    }
+
+    // Extract student memories from this turn (fire-and-forget)
+    if (state.userMessage) {
+      void this.extractStudentMemories(
+        state.taskId,
+        state.userMessage,
+        state.assistantText
+      ).catch(() => {});
+    }
+
+    if (state.socratic?.active) {
+      if (state.socratic.directOverride || state.socratic.hintLevel >= 4) {
+        this.socraticStates.set(state.taskId, {
+          hintLevel: 0,
+          exchangeAttempts: 0,
+          directRequestCount: 0,
+        });
+      }
+    } else {
+      this.socraticStates.delete(state.taskId);
+    }
+
+    // After artifact detection and document rendering, nudge clients to reload study artifacts
+    // (codex.turn.completed fires earlier; this catches rows written after that event).
+    this.emitEvent({
+      type: "task.message",
+      taskId: state.taskId,
+    });
   }
 
   private async handleCodexNotification(notification: {
@@ -2638,301 +3502,7 @@ ${JSON.stringify(questionsForReview, null, 2)}`;
             status: "completed"
           });
 
-          // Resolve cwd if missing (can happen on resumed threads)
-          if (!state.cwd) {
-            const latestRun = this.db.listTaskRuns(state.taskId)[0];
-            if (latestRun) {
-              state.cwd = latestRun.stagingPath;
-            }
-          }
-
-          // Artifact detection: try to parse any assistant response that contains JSON or script artifacts
-          try {
-            const assistantText = state.assistantText.trim();
-            if (assistantText) {
-              const parsed = tryParseArtifactJson(assistantText, state.cwd);
-              if (parsed) {
-                const validation = validateArtifactDraft(parsed.kind, parsed.data);
-                if (!validation.ok) {
-                  this.recordRuntimeMessage(
-                    state.taskId,
-                    `Skipped storing the ${parsed.kind} artifact because validation failed: ${validation.errors.join("; ")}`
-                  );
-                } else {
-                  if (validation.warnings.length > 0) {
-                    this.recordRuntimeMessage(
-                      state.taskId,
-                      `Artifact quality check for ${parsed.kind}: ${validation.warnings.join("; ")}`
-                    );
-                  }
-                const artifact = this.db.createStudyArtifact({
-                  taskId: state.taskId,
-                  kind: parsed.kind,
-                  title: parsed.title,
-                  payload: JSON.stringify(parsed.data),
-                  payloadVersion: parsed.kind.startsWith("document_") ? 2 : 1,
-                  renderStatus: parsed.kind.startsWith("document_") ? "pending" : undefined,
-                  previewStatus: parsed.kind.startsWith("document_") ? "pending" : undefined,
-                });
-                this.recordRuntimeMessage(
-                  state.taskId,
-                  `Detected and stored a ${parsed.kind} study artifact: "${parsed.title}".`
-                );
-
-                // Validate quiz questions with a checking agent
-                if (parsed.kind === "quiz") {
-                  void this.validateQuizArtifact(artifact.id, state.taskId).catch(() => {});
-                }
-
-                // Render document kinds to binary files
-                if (parsed.kind.startsWith("document_")) {
-                  try {
-                    const prepared = await this.ensureDocumentAssets(artifact.id);
-                    const ext = parsed.kind.replace("document_", "").toUpperCase();
-                    this.recordRuntimeMessage(
-                      state.taskId,
-                      `Generated ${ext} document: "${parsed.title}"${prepared?.previewPath ? " with a ready preview." : "."}`
-                    );
-                  } catch (renderErr) {
-                    // Rendering is non-fatal — artifact JSON is still stored
-                    this.recordRuntimeMessage(
-                      state.taskId,
-                      `Note: document rendering failed but the artifact data was saved. Error: ${String(renderErr)}`
-                    );
-                  }
-                }
-                }
-              } else if (this.sandboxAvailable) {
-                // No JSON artifact found — try script-based execution path
-                const script = tryExtractScript(assistantText);
-                if (script) {
-                  const ext = script.outputFilename.split(".").pop() ?? "";
-                  const kindMap: Record<string, string> = {
-                    pdf: "document_pdf",
-                    docx: "document_docx",
-                    xlsx: "document_xlsx",
-                    pptx: "document_pptx",
-                  };
-                  const kind = kindMap[ext] ?? `document_${ext}`;
-
-                  // Store the artifact with script payload
-                  const artifact = this.db.createStudyArtifact({
-                    taskId: state.taskId,
-                    kind,
-                    title: script.title,
-                    payload: JSON.stringify({
-                      script: script.script,
-                      language: script.language,
-                      outputFilename: script.outputFilename,
-                    }),
-                    payloadVersion: 1,
-                    renderStatus: "pending",
-                    previewStatus: "pending",
-                  });
-                  this.recordRuntimeMessage(
-                    state.taskId,
-                    `Detected scripted ${ext.toUpperCase()} artifact: "${script.title}". Executing in sandbox...`
-                  );
-
-                  this.emitEvent({
-                    type: "sandbox.execution.started",
-                    taskId: state.taskId,
-                    language: script.language,
-                    outputFilename: script.outputFilename,
-                  });
-
-                  try {
-                    const docOutputDir = this.resolveDocumentOutputDir(state.taskId);
-                    const result = await this.sandbox.executeScript({
-                      language: script.language,
-                      script: script.script,
-                      outputFilename: script.outputFilename,
-                      taskId: state.taskId,
-                      outputDir: docOutputDir,
-                      sourcesDir: state.cwd,
-                    });
-
-                    this.emitEvent({
-                      type: "sandbox.execution.completed",
-                      taskId: state.taskId,
-                      success: result.success,
-                      outputFilename: script.outputFilename,
-                      durationMs: result.durationMs,
-                      error: result.success ? undefined : result.stderr,
-                    });
-
-                    if (result.success && result.outputPath) {
-                      if (kind === "document_docx" || kind === "document_xlsx" || kind === "document_pptx") {
-                        await validateOfficePackage(result.outputPath, kind);
-                      }
-                      this.db.updateStudyArtifactLifecycle(artifact.id, {
-                        filePath: result.outputPath,
-                        previewPath: kind === "document_pdf" ? result.outputPath : null,
-                        renderStatus: "ready",
-                        previewStatus: kind === "document_pdf" ? "ready" : "failed",
-                        renderError: null,
-                        previewError: kind === "document_pdf" ? null : "Legacy scripted Office documents do not have a persisted preview asset.",
-                      });
-                      this.recordRuntimeMessage(
-                        state.taskId,
-                        `Generated ${ext.toUpperCase()} document via sandbox: "${script.title}" (${result.durationMs}ms).`
-                      );
-                    } else {
-                      this.db.updateStudyArtifactLifecycle(artifact.id, {
-                        renderStatus: "failed",
-                        previewStatus: "failed",
-                        renderError: `Sandbox execution failed (exit ${result.exitCode}).`,
-                        previewError: "Preview unavailable because document rendering failed.",
-                      });
-                      this.recordRuntimeMessage(
-                        state.taskId,
-                        `Sandbox execution failed (exit ${result.exitCode}): ${truncateForLog(result.stderr || result.stdout, 300)}`
-                      );
-                    }
-                  } catch (sandboxErr) {
-                    this.db.updateStudyArtifactLifecycle(artifact.id, {
-                      renderStatus: "failed",
-                      previewStatus: "failed",
-                      renderError: sandboxErr instanceof Error ? sandboxErr.message : String(sandboxErr),
-                      previewError: "Preview unavailable because document rendering failed.",
-                    });
-                    this.emitEvent({
-                      type: "sandbox.execution.completed",
-                      taskId: state.taskId,
-                      success: false,
-                      outputFilename: script.outputFilename,
-                      durationMs: 0,
-                      error: String(sandboxErr),
-                    });
-                    this.recordRuntimeMessage(
-                      state.taskId,
-                      `Sandbox execution error: ${String(sandboxErr)}`
-                    );
-                  }
-                }
-              }
-            }
-          } catch {
-            // Artifact detection is best-effort; don't block the turn.
-          }
-
-          // Fallback: if no artifact was detected but Codex wrote HTML files to the workspace,
-          // create interactive artifacts from them automatically.
-          if (state.cwd) {
-            try {
-              const turnStartedAt = state.startedAt ? new Date(state.startedAt) : new Date(0);
-              const htmlArtifacts = discoverInteractiveHtmlFiles(state.cwd, turnStartedAt);
-              const referencedArtifacts = state.assistantText
-                ? discoverReferencedInteractiveHtmlFiles(state.cwd, state.assistantText)
-                : [];
-              const candidates = new Map<string, (typeof htmlArtifacts)[number]>();
-              for (const file of [...referencedArtifacts, ...htmlArtifacts]) {
-                candidates.set(file.relativePath, file);
-              }
-              process.stdout.write(
-                `[stuart] HTML file scan in ${state.cwd}: found ${htmlArtifacts.length} recent interactive HTML artifact candidate(s) and ${referencedArtifacts.length} assistant-referenced candidate(s): ${[...candidates.values()].map((file) => file.relativePath).join(", ") || "(none)"}\n`
-              );
-              for (const file of candidates.values()) {
-                const existing = this.db.listStudyArtifacts(state.taskId).some(
-                  (artifact) =>
-                    artifact.kind === "interactive" &&
-                    (artifact.payload.includes(file.relativePath) || artifact.payload.includes(file.title))
-                );
-                if (existing) {
-                  process.stdout.write(`[stuart] HTML scan: skipping ${file.relativePath} — already has artifact\n`);
-                  continue;
-                }
-
-                this.db.createStudyArtifact({
-                  taskId: state.taskId,
-                  kind: "interactive",
-                  title: file.title,
-                  payload: JSON.stringify({
-                    kind: "interactive",
-                    title: file.title,
-                    html: file.html,
-                    sourcePath: file.relativePath
-                  })
-                });
-                this.recordRuntimeMessage(
-                  state.taskId,
-                  `Detected interactive artifact from workspace file: "${file.title}".`
-                );
-              }
-            } catch { /* workspace scan is best-effort */ }
-          }
-
-          // If this turn wrote new research files (sources/, curriculum.md),
-          // copy them from staging to the project root so the user can see them.
-          const shouldSyncFiles = state.triggersReindex
-            || /\bsources\//i.test(state.assistantText)
-            || /\bcurriculum\.md\b/i.test(state.assistantText)
-            || /(?:created|wrote|saved)\s+\d+\s+(?:files?|documents?|sources?)/i.test(state.assistantText);
-          if (shouldSyncFiles && state.cwd) {
-            try {
-              const projectRoot = this.resolveProjectRoot(state.taskId);
-              if (projectRoot && projectRoot !== state.cwd) {
-                // Copy sources/ directory
-                const stagingSources = join(state.cwd, "sources");
-                if (existsSync(stagingSources)) {
-                  const destSources = join(projectRoot, "sources");
-                  await cp(stagingSources, destSources, { recursive: true, force: true });
-                }
-                // Copy curriculum files
-                for (const currFile of ["curriculum.md", "curriculum.json"]) {
-                  const stagingPath = join(state.cwd, currFile);
-                  if (existsSync(stagingPath)) {
-                    await cp(stagingPath, join(projectRoot, currFile), { force: true });
-                  }
-                }
-                this.recordRuntimeMessage(
-                  state.taskId,
-                  `Synced research files to your project folder.`
-                );
-              }
-            } catch {
-              // Non-critical — files still available in staging
-            }
-
-            // Re-index workspace with new files
-            try {
-              await this.buildTaskIngestionIndex(state.taskId, { force: true });
-              this.recordRuntimeMessage(
-                state.taskId,
-                "Re-indexed workspace — new materials are now available for study."
-              );
-            } catch {
-              // Non-critical — indexing will happen lazily on next retrieval
-            }
-          }
-
-          // Extract student memories from this turn (fire-and-forget)
-          if (state.userMessage) {
-            void this.extractStudentMemories(
-              state.taskId,
-              state.userMessage,
-              state.assistantText
-            ).catch(() => {});
-          }
-
-          if (state.socratic?.active) {
-            if (state.socratic.directOverride || state.socratic.hintLevel >= 4) {
-              this.socraticStates.set(state.taskId, {
-                hintLevel: 0,
-                exchangeAttempts: 0,
-                directRequestCount: 0,
-              });
-            }
-          } else {
-            this.socraticStates.delete(state.taskId);
-          }
-
-          // After artifact detection and document rendering, nudge clients to reload study artifacts
-          // (codex.turn.completed fires earlier; this catches rows written after that event).
-          this.emitEvent({
-            type: "task.message",
-            taskId: state.taskId,
-          });
+          await this.runPostTurnCompletionPipeline(state);
         }
 
         this.turns.delete(params.turn.id);
@@ -3956,16 +4526,22 @@ function sanitizeSocraticCompletion(
 }
 
 function formatRuntimeProfile(profile: { provider: string; authMode: string; model: string; native: boolean }): string {
-  const providerLabel = profile.provider === "codex"
-    ? "Codex"
-    : profile.provider === "gemini"
-      ? "Gemini"
-      : "MiniMax";
-  const authLabel = profile.authMode === "chatgpt"
-    ? "ChatGPT sign-in"
-    : profile.authMode === "oauth"
-      ? "OAuth"
-      : "API key";
+  const providerLabel =
+    profile.provider === "codex"
+      ? "Codex"
+      : profile.provider === "cursor"
+        ? "Cursor"
+        : profile.provider === "gemini"
+          ? "Gemini"
+          : "MiniMax";
+  const authLabel =
+    profile.authMode === "chatgpt"
+      ? "ChatGPT sign-in"
+      : profile.authMode === "oauth"
+        ? profile.provider === "cursor"
+          ? "Cursor sign-in"
+          : "OAuth"
+        : "API key";
   return `${providerLabel} ${profile.native ? "native" : "managed"} / ${profile.model} / ${authLabel}`;
 }
 

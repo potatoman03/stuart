@@ -34,15 +34,16 @@ export function resolveTaskRuntimeProfile(task: Pick<TaskSpec, "runtimeProfile" 
     provider,
     authMode: task.runtimeProfile?.authMode ?? task.authMode ?? fallbackAuthMode(provider),
     model: task.runtimeProfile?.model ?? defaultModelForProvider(provider),
-    native: task.runtimeProfile?.native ?? provider !== "codex",
+    native: task.runtimeProfile?.native ?? (provider !== "codex" && provider !== "cursor"),
   };
 }
 
 export function buildTurnExecutionPlan(input: BuildTurnExecutionPlanInput): TurnExecutionPlan {
   const requestedProfile = resolveTaskRuntimeProfile(input.task);
-  const threadModel = requestedProfile.provider === "codex"
-    ? requestedProfile.model
-    : DEFAULT_TASK_RUNTIME_PROFILE.model;
+  const threadModel =
+    requestedProfile.provider === "codex" || requestedProfile.provider === "cursor"
+      ? requestedProfile.model
+      : DEFAULT_TASK_RUNTIME_PROFILE.model;
   const isResearch = input.skills.some((skill) => skill.id === "research");
   const isCodeGen = input.skills.some((skill) => skill.id === "interactive");
   const isArtifactTurn = input.skills.some((skill) => skill.id !== "research");
@@ -52,7 +53,8 @@ export function buildTurnExecutionPlan(input: BuildTurnExecutionPlanInput): Turn
 
   const turnModel = needsFlagship
     ? "gpt-5.4"
-    : requestedProfile.provider === "codex" && requestedProfile.model !== threadModel
+    : (requestedProfile.provider === "codex" || requestedProfile.provider === "cursor") &&
+        requestedProfile.model !== threadModel
       ? requestedProfile.model
       : undefined;
   const effort = needsFlagship ? "high"
@@ -88,9 +90,10 @@ export function buildWorkerExecutionPlan(
 ): WorkerExecutionPlan {
   const requestedProfile = resolveTaskRuntimeProfile(task);
   return {
-    threadModel: requestedProfile.provider === "codex"
-      ? (requestedModel ?? requestedProfile.model)
-      : DEFAULT_TASK_RUNTIME_PROFILE.model,
+    threadModel:
+      requestedProfile.provider === "codex"
+        ? (requestedModel ?? requestedProfile.model)
+        : DEFAULT_TASK_RUNTIME_PROFILE.model,
     effort:
       requestedModel === "gpt-5.4" || requestedProfile.model === "gpt-5.4"
         ? "high"
@@ -102,6 +105,9 @@ function fallbackAuthMode(provider: TaskRuntimeProfile["provider"]): TaskRuntime
   if (provider === "codex") {
     return "chatgpt";
   }
+  if (provider === "cursor") {
+    return "oauth";
+  }
   return "api_key";
 }
 
@@ -111,6 +117,9 @@ function defaultModelForProvider(provider: TaskRuntimeProfile["provider"]): stri
   }
   if (provider === "minimax") {
     return "MiniMax-M2.7";
+  }
+  if (provider === "cursor") {
+    return "composer-2-fast";
   }
   return DEFAULT_TASK_RUNTIME_PROFILE.model;
 }

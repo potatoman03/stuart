@@ -159,27 +159,68 @@ async function ensurePdfjsNodePolyfills(): Promise<void> {
   if (_pdfjsPolyfillsReady) {
     return;
   }
-  _pdfjsPolyfillsReady = true;
 
   if (
     typeof globalThis.DOMMatrix !== "undefined" &&
     typeof globalThis.ImageData !== "undefined" &&
     typeof globalThis.Path2D !== "undefined"
   ) {
+    _pdfjsPolyfillsReady = true;
     return;
   }
 
-  const canvas = await import("@napi-rs/canvas");
-  if (typeof globalThis.DOMMatrix === "undefined" && canvas.DOMMatrix) {
-    // pdfjs expects browser globals even when only extracting text in Node.
-    (globalThis as any).DOMMatrix = canvas.DOMMatrix;
+  try {
+    const canvas = await import("@napi-rs/canvas");
+    if (typeof globalThis.DOMMatrix === "undefined" && canvas.DOMMatrix) {
+      // pdfjs expects browser globals even when only extracting text in Node.
+      (globalThis as any).DOMMatrix = canvas.DOMMatrix;
+    }
+    if (typeof globalThis.ImageData === "undefined" && canvas.ImageData) {
+      (globalThis as any).ImageData = canvas.ImageData;
+    }
+    if (typeof globalThis.Path2D === "undefined" && canvas.Path2D) {
+      (globalThis as any).Path2D = canvas.Path2D;
+    }
+  } catch {
+    // Packaged Electron often cannot dlopen @napi-rs/canvas from app.asar; pure-JS fallback for text extraction.
+    const dommatrix = await import("dommatrix");
+    const DOMMatrixCtor = (dommatrix as { default?: unknown }).default ?? dommatrix;
+    if (typeof globalThis.DOMMatrix === "undefined" && DOMMatrixCtor) {
+      (globalThis as any).DOMMatrix = DOMMatrixCtor;
+    }
+    if (typeof globalThis.ImageData === "undefined") {
+      (globalThis as any).ImageData = class ImageDataPolyfill {
+        data: Uint8ClampedArray;
+        width: number;
+        height: number;
+        constructor(sw: number | Uint8ClampedArray, sh?: number, h?: number) {
+          if (sw instanceof Uint8ClampedArray) {
+            this.data = sw;
+            this.width = sh ?? 0;
+            this.height = h ?? 0;
+          } else {
+            this.width = sw;
+            this.height = sh ?? 0;
+            this.data = new Uint8ClampedArray(this.width * this.height * 4);
+          }
+        }
+      };
+    }
+    if (typeof globalThis.Path2D === "undefined") {
+      (globalThis as any).Path2D = class Path2DPolyfill {
+        addPath() {}
+        closePath() {}
+        moveTo() {}
+        lineTo() {}
+        bezierCurveTo() {}
+        quadraticCurveTo() {}
+        arc() {}
+        rect() {}
+      };
+    }
   }
-  if (typeof globalThis.ImageData === "undefined" && canvas.ImageData) {
-    (globalThis as any).ImageData = canvas.ImageData;
-  }
-  if (typeof globalThis.Path2D === "undefined" && canvas.Path2D) {
-    (globalThis as any).Path2D = canvas.Path2D;
-  }
+
+  _pdfjsPolyfillsReady = true;
 }
 
 // ---------------------------------------------------------------------------

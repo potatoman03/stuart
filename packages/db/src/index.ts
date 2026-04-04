@@ -36,7 +36,9 @@ import type {
   TaskWorkerRecord,
   TopicPerformanceRecord,
   UpdateTaskInput,
-  WorkspaceConfig
+  WorkspaceConfig,
+  NativeProviderCredentialsPublic,
+  UpdateNativeProviderCredentialsInput
 } from "@stuart/shared";
 import {
   DEFAULT_TASK_RUNTIME_PROFILE,
@@ -356,6 +358,11 @@ export class LocalDatabase {
     } catch {
       // Column already exists — safe to ignore
     }
+    try {
+      this.db.exec("ALTER TABLE task_threads ADD COLUMN cursor_agent_session_id TEXT");
+    } catch {
+      // Column already exists — safe to ignore
+    }
 
     // Student memory table for cross-session structured memory
     this.db.exec(`
@@ -462,6 +469,14 @@ export class LocalDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(course_mapping_id, canvas_module_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS native_provider_credentials (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        gemini_api_key TEXT,
+        minimax_api_key TEXT,
+        minimax_access_token TEXT,
+        updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS codex_usage_snapshots (
@@ -1093,6 +1108,97 @@ export class LocalDatabase {
     };
   }
 
+  private ensureNativeProviderCredentialsRow(): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO native_provider_credentials (id, gemini_api_key, minimax_api_key, minimax_access_token, updated_at)
+         VALUES (1, NULL, NULL, NULL, @updatedAt)`
+      )
+      .run(asSqlParams({ updatedAt: now }));
+  }
+
+  /**
+   * Raw secrets for server-side use only. Keys are stored in plaintext in local SQLite
+   * (same class of data as Canvas tokens); do not expose via HTTP GET.
+   */
+  getNativeProviderSecrets(): {
+    geminiApiKey: string | null;
+    minimaxApiKey: string | null;
+    minimaxAccessToken: string | null;
+  } {
+    this.ensureNativeProviderCredentialsRow();
+    const row = this.db
+      .prepare(
+        `SELECT gemini_api_key as geminiApiKey, minimax_api_key as minimaxApiKey, minimax_access_token as minimaxAccessToken
+         FROM native_provider_credentials WHERE id = 1`
+      )
+      .get() as
+      | {
+          geminiApiKey: string | null;
+          minimaxApiKey: string | null;
+          minimaxAccessToken: string | null;
+        }
+      | undefined;
+    return {
+      geminiApiKey: row?.geminiApiKey ?? null,
+      minimaxApiKey: row?.minimaxApiKey ?? null,
+      minimaxAccessToken: row?.minimaxAccessToken ?? null
+    };
+  }
+
+  getNativeProviderCredentialsPublic(): NativeProviderCredentialsPublic {
+    const s = this.getNativeProviderSecrets();
+    return {
+      geminiConfigured: Boolean(s.geminiApiKey?.trim()),
+      minimaxConfigured: Boolean(s.minimaxApiKey?.trim() || s.minimaxAccessToken?.trim())
+    };
+  }
+
+  updateNativeProviderCredentials(input: UpdateNativeProviderCredentialsInput): NativeProviderCredentialsPublic {
+    this.ensureNativeProviderCredentialsRow();
+    const cur = this.getNativeProviderSecrets();
+    const nextGemini =
+      input.geminiApiKey !== undefined
+        ? input.geminiApiKey && String(input.geminiApiKey).trim()
+          ? String(input.geminiApiKey).trim()
+          : null
+        : cur.geminiApiKey;
+    const nextMinimaxKey =
+      input.minimaxApiKey !== undefined
+        ? input.minimaxApiKey && String(input.minimaxApiKey).trim()
+          ? String(input.minimaxApiKey).trim()
+          : null
+        : cur.minimaxApiKey;
+    const nextMinimaxToken =
+      input.minimaxAccessToken !== undefined
+        ? input.minimaxAccessToken && String(input.minimaxAccessToken).trim()
+          ? String(input.minimaxAccessToken).trim()
+          : null
+        : cur.minimaxAccessToken;
+
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE native_provider_credentials
+         SET gemini_api_key = @gemini,
+             minimax_api_key = @minimaxKey,
+             minimax_access_token = @minimaxToken,
+             updated_at = @updatedAt
+         WHERE id = 1`
+      )
+      .run(
+        asSqlParams({
+          gemini: nextGemini,
+          minimaxKey: nextMinimaxKey,
+          minimaxToken: nextMinimaxToken,
+          updatedAt: now
+        })
+      );
+
+    return this.getNativeProviderCredentialsPublic();
+  }
+
   listTaskMessages(taskId: string): TaskMessageRecord[] {
     return asRows<TaskMessageRecord>(
       this.db
@@ -1325,16 +1431,22 @@ export class LocalDatabase {
           task_id,
           thread_id,
           created_at,
-          updated_at
+          updated_at,
+          cursor_agent_session_id
         ) VALUES (
           @taskId,
           @threadId,
           @createdAt,
-          @updatedAt
+          @updatedAt,
+          NULL
         )
         ON CONFLICT(task_id) DO UPDATE SET
           thread_id = excluded.thread_id,
-          updated_at = excluded.updated_at`
+          updated_at = excluded.updated_at,
+          cursor_agent_session_id = CASE
+            WHEN task_threads.thread_id = excluded.thread_id THEN task_threads.cursor_agent_session_id
+            ELSE NULL
+          END`
       )
       .run(asSqlParams({
         taskId,
@@ -1342,6 +1454,37 @@ export class LocalDatabase {
         createdAt: now,
         updatedAt: now
       }));
+  }
+
+  getCursorAgentSessionId(taskId: string): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT cursor_agent_session_id as cursorAgentSessionId
+         FROM task_threads
+         WHERE task_id = ?`
+      )
+      .get(taskId) as { cursorAgentSessionId: string | null } | undefined;
+
+    const id = row?.cursorAgentSessionId?.trim();
+    return id || undefined;
+  }
+
+  setCursorAgentSessionId(taskId: string, sessionId: string | null): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE task_threads
+         SET cursor_agent_session_id = @sessionId,
+             updated_at = @updatedAt
+         WHERE task_id = @taskId`
+      )
+      .run(
+        asSqlParams({
+          taskId,
+          sessionId: sessionId?.trim() || null,
+          updatedAt: now
+        })
+      );
   }
 
   clearTaskThreadId(taskId: string): void {
@@ -1798,7 +1941,9 @@ export class LocalDatabase {
         bm25(ingestion_chunks) as score
        FROM ingestion_chunks
        WHERE ingestion_chunks MATCH ? AND scope_key = ?${
-         sourceMatch ? " AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ?)" : ""
+         sourceMatch
+           ? " AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)"
+           : ""
        }
        ORDER BY score ASC
        LIMIT ?`
@@ -1813,6 +1958,8 @@ export class LocalDatabase {
             sourceMatch.exact,
             sourceMatch.stripped,
             sourceMatch.suffixLike,
+            sourceMatch.basename,
+            sourceMatch.basenameSuffixLike,
             limit
           )
         : searchStatement.all(queries.strict, scopeKey, limit)
@@ -1830,9 +1977,113 @@ export class LocalDatabase {
               sourceMatch.exact,
               sourceMatch.stripped,
               sourceMatch.suffixLike,
+              sourceMatch.basename,
+              sourceMatch.basenameSuffixLike,
               Math.max(limit * 3, limit)
             )
           : searchStatement.all(queries.broad, scopeKey, Math.max(limit * 3, limit))
+      );
+      for (const result of broadResults) {
+        if (merged.has(result.chunkId)) {
+          continue;
+        }
+        merged.set(result.chunkId, result);
+        if (merged.size >= limit) {
+          break;
+        }
+      }
+    }
+
+    const out = [...merged.values()].slice(0, limit);
+    if (out.length > 0) {
+      return out;
+    }
+    if (options?.taskRunId) {
+      const globalOut = this.searchIngestionChunks(taskId, query, { ...options, taskRunId: undefined });
+      if (globalOut.length > 0) {
+        return globalOut;
+      }
+    }
+    return this.searchIngestionChunksAnyScope(taskId, query, options);
+  }
+
+  /**
+   * When chunks were indexed under a different task run than the active UI scope, run+global both miss.
+   * Match by task_id + path only (any scope_key).
+   */
+  private searchIngestionChunksAnyScope(
+    taskId: string,
+    query: string,
+    options?: {
+      taskRunId?: string;
+      limit?: number;
+      source?: string;
+    }
+  ): IngestionSearchResult[] {
+    const queries = buildFtsQueries(query);
+    if (!queries) {
+      return [];
+    }
+    const limit = options?.limit ?? 8;
+    const sourceFilter = options?.source?.trim();
+    const sourceMatch = sourceFilter ? buildSourcePathMatch(sourceFilter) : null;
+    const searchStatement = this.db.prepare(
+      `SELECT
+        chunk_id as chunkId,
+        document_id as documentId,
+        task_id as taskId,
+        task_run_id as taskRunId,
+        source_path as sourcePath,
+        relative_path as relativePath,
+        file_type as fileType,
+        heading,
+        locator,
+        text,
+        snippet(ingestion_chunks, 10, '', '', ' ... ', 20) as snippet,
+        bm25(ingestion_chunks) as score
+       FROM ingestion_chunks
+       WHERE ingestion_chunks MATCH ? AND task_id = ?${
+         sourceMatch
+           ? " AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)"
+           : ""
+       }
+       ORDER BY score ASC
+       LIMIT ?`
+    );
+
+    const merged = new Map<string, IngestionSearchResult>();
+    const strictResults = asRows<IngestionSearchResult>(
+      sourceMatch
+        ? searchStatement.all(
+            queries.strict,
+            taskId,
+            sourceMatch.exact,
+            sourceMatch.stripped,
+            sourceMatch.suffixLike,
+            sourceMatch.basename,
+            sourceMatch.basenameSuffixLike,
+            limit
+          )
+        : searchStatement.all(queries.strict, taskId, limit)
+    );
+    for (const result of strictResults) {
+      merged.set(result.chunkId, result);
+    }
+
+    if (merged.size < limit && queries.broad !== queries.strict) {
+      const broadResults = asRows<IngestionSearchResult>(
+        sourceMatch
+          ? searchStatement.all(
+              queries.broad,
+              taskId,
+              sourceMatch.exact,
+              sourceMatch.stripped,
+              sourceMatch.suffixLike,
+              sourceMatch.basename,
+              sourceMatch.basenameSuffixLike,
+              Math.max(limit * 3, limit)
+            )
+          : searchStatement.all(queries.broad, taskId, Math.max(limit * 3, limit))
       );
       for (const result of broadResults) {
         if (merged.has(result.chunkId)) {
@@ -1853,9 +2104,26 @@ export class LocalDatabase {
     relativePath: string,
     options?: { taskRunId?: string; limit?: number }
   ): IngestionSearchResult[] {
-    const scopeKey = buildIngestionScopeKey(taskId, options?.taskRunId);
     const limit = options?.limit ?? 5;
     const sourceMatch = buildSourcePathMatch(relativePath);
+    const rows = this.getChunksBySourceScoped(taskId, sourceMatch, options?.taskRunId, limit);
+    if (rows.length > 0) {
+      return rows;
+    }
+    if (options?.taskRunId) {
+      const globalRows = this.getChunksBySourceScoped(taskId, sourceMatch, undefined, limit);
+      if (globalRows.length > 0) {
+        return globalRows;
+      }
+    }
+    return this.getChunksBySourceAnyScope(taskId, sourceMatch, limit);
+  }
+
+  private getChunksBySourceAnyScope(
+    taskId: string,
+    sourceMatch: ReturnType<typeof buildSourcePathMatch>,
+    limit: number
+  ): IngestionSearchResult[] {
     return asRows<IngestionSearchResult>(
       this.db.prepare(
         `SELECT
@@ -1872,10 +2140,62 @@ export class LocalDatabase {
           '' as snippet,
           0 as score
          FROM ingestion_chunks
-         WHERE scope_key = ? AND (relative_path = ? OR relative_path = ? OR relative_path LIKE ?)
+         WHERE task_id = ? AND (
+           relative_path = ? OR relative_path = ? OR relative_path LIKE ?
+           OR relative_path = ? OR relative_path LIKE ?
+         )
+         ORDER BY chunk_id ASC
+         LIMIT ?`
+      ).all(
+        taskId,
+        sourceMatch.exact,
+        sourceMatch.stripped,
+        sourceMatch.suffixLike,
+        sourceMatch.basename,
+        sourceMatch.basenameSuffixLike,
+        limit
+      )
+    );
+  }
+
+  private getChunksBySourceScoped(
+    taskId: string,
+    sourceMatch: ReturnType<typeof buildSourcePathMatch>,
+    taskRunId: string | undefined,
+    limit: number
+  ): IngestionSearchResult[] {
+    const scopeKey = buildIngestionScopeKey(taskId, taskRunId);
+    return asRows<IngestionSearchResult>(
+      this.db.prepare(
+        `SELECT
+          chunk_id as chunkId,
+          document_id as documentId,
+          task_id as taskId,
+          task_run_id as taskRunId,
+          source_path as sourcePath,
+          relative_path as relativePath,
+          file_type as fileType,
+          heading,
+          locator,
+          text,
+          '' as snippet,
+          0 as score
+         FROM ingestion_chunks
+         WHERE scope_key = ? AND (
+           relative_path = ? OR relative_path = ? OR relative_path LIKE ?
+           OR relative_path = ? OR relative_path LIKE ?
+         )
          ORDER BY CAST(REPLACE(REPLACE(locator, 'page ', ''), 'chunk ', '') AS INTEGER) ASC
          LIMIT ?`
-      ).all(scopeKey, sourceMatch.exact, sourceMatch.stripped, sourceMatch.suffixLike, limit)
+      ).all(
+        scopeKey,
+        sourceMatch.exact,
+        sourceMatch.stripped,
+        sourceMatch.suffixLike,
+        sourceMatch.basename,
+        sourceMatch.basenameSuffixLike,
+        limit
+      )
     );
   }
 
@@ -3691,12 +4011,14 @@ function normalizeTaskRuntimeProfile(
 ): TaskSpec["runtimeProfile"] {
   const base = DEFAULT_TASK_RUNTIME_PROFILE;
   const provider = value?.provider ?? base.provider;
-  const native = value?.native ?? (provider !== "codex");
+  const native = value?.native ?? (provider !== "codex" && provider !== "cursor");
   const fallbackAuthMode = provider === "codex"
     ? "chatgpt"
-    : provider === "minimax" && authMode === "oauth"
+    : provider === "cursor"
       ? "oauth"
-      : "api_key";
+      : provider === "minimax" && authMode === "oauth"
+        ? "oauth"
+        : "api_key";
   return {
     provider,
     authMode: value?.authMode ?? authMode ?? fallbackAuthMode,
@@ -3711,6 +4033,9 @@ function defaultModelForProvider(provider: TaskSpec["runtimeProfile"]["provider"
   }
   if (provider === "minimax") {
     return "MiniMax-M2.7";
+  }
+  if (provider === "cursor") {
+    return "composer-2-fast";
   }
   return DEFAULT_TASK_RUNTIME_PROFILE.model;
 }
@@ -3760,13 +4085,19 @@ function buildSourcePathMatch(value: string): {
   exact: string;
   stripped: string;
   suffixLike: string;
+  basename: string;
+  basenameSuffixLike: string;
 } {
   const exact = value.trim().replace(/\\/g, "/").replace(/[?#].*$/, "").replace(/^file:\/\//, "");
   const stripped = exact.replace(/^\.?\//, "");
+  const slash = stripped.lastIndexOf("/");
+  const basename = slash >= 0 ? stripped.slice(slash + 1) : stripped;
   return {
     exact,
     stripped,
     suffixLike: `%/${stripped}`,
+    basename,
+    basenameSuffixLike: `%/${basename}`,
   };
 }
 

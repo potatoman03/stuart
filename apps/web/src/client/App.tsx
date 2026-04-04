@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback, type CSSProperties } from "react";
+import React, { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -34,7 +35,8 @@ import type {
   WorkspaceEvent,
   WorkspaceFileRecord,
   WorkspaceStartMode,
-  IngestionSearchResult
+  IngestionSearchResult,
+  NativeProviderCredentialsPublic
 } from "@stuart/shared";
 import ArtifactCanvas from "./ArtifactCanvas";
 import { ALL_DEMOS } from "./DemoArtifacts";
@@ -42,17 +44,19 @@ import type { DesktopCodexLoginState } from "./platform";
 import { apiUrl, getDesktopBridge, openExternalUrl } from "./platform";
 import PdfPreview from "./PdfPreview";
 import {
+  citationPillShouldOpenWorkspaceDirectly,
   cleanFileReferences,
   cleanSourceName,
-  extractCitationQueryText,
-  FILE_REF_END,
-  FILE_REF_MARKER,
+  dedupeCitationResults,
   fileExtension,
   findBestCitationDocument,
   findBestSourcePath,
   findBestWorkspaceFile,
+  isWeakCitationSourcePath,
+  listCitationRankedDocuments,
+  mergeCitationTrailingPunctuation,
   normalizeSourcePathReference,
-  parseFileReferenceMarker,
+  splitMessageWithCitations,
 } from "./citation-utils";
 
 /* ---- Types ---- */
@@ -231,29 +235,26 @@ const WorkspaceFileOpenContext = createContext<WorkspaceFileOpenFn | null>(null)
 
 /* ---- Helpers ---- */
 
+/** Prefer `primary` entries; add paths only from `secondary` when missing (e.g. merge run-scoped + global index). */
+function mergeByRelativePath<T extends { relativePath: string }>(primary: T[], secondary: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const item of primary) {
+    map.set(item.relativePath, item);
+  }
+  for (const item of secondary) {
+    if (!map.has(item.relativePath)) {
+      map.set(item.relativePath, item);
+    }
+  }
+  return [...map.values()];
+}
+
 function buildWorkspaceSetupSteps(activeId: string, completedIds: string[] = []): WorkspaceSetupStep[] {
   const completed = new Set(completedIds);
   return WORKSPACE_SETUP_STEP_ORDER.map((step) => ({
     ...step,
     status: completed.has(step.id) ? "done" : step.id === activeId ? "active" : "pending",
   }));
-}
-
-function dedupeCitationResults(results: IngestionSearchResult[]): IngestionSearchResult[] {
-  const seen = new Set<string>();
-  return results.filter((result) => {
-    const key = `${result.relativePath}::${result.locator ?? result.chunkId}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-/** Citation pills: show excerpt popover for PDFs/docs (including staged); only skip for inline previews. */
-function citationPillShouldOpenWorkspaceDirectly(file: WorkspaceFileRecord): boolean {
-  return file.previewKind === "image"
-    || file.previewKind === "html"
-    || file.previewKind === "jsx";
 }
 
 function iconForFileExtension(ext: string): string {
@@ -792,6 +793,20 @@ function App() {
         workspaceFiles = await request<WorkspaceFileRecord[]>(path);
       }
 
+      // PDFs / materials are often indexed under taskId:global while the UI lists only the active run.
+      // Merge global ingestion + workspace listings so findBestSourcePath sees the real relativePath.
+      if (selectedRunId) {
+        const [globalIngestion, globalWorkspaceFiles] = await Promise.all([
+          request<IngestionOverview>(`/api/tasks/${selectedTaskId}/ingestion`),
+          request<WorkspaceFileRecord[]>(`/api/tasks/${selectedTaskId}/workspace-files`),
+        ]);
+        docs = mergeByRelativePath(docs, globalIngestion?.documents ?? []);
+        workspaceFiles = mergeByRelativePath(
+          workspaceFiles,
+          Array.isArray(globalWorkspaceFiles) ? globalWorkspaceFiles : [],
+        );
+      }
+
       const normalizedSourcePath = sourcePath ? normalizeSourcePathReference(sourcePath) : "";
       const normalizedQueryText = queryText?.replace(/\s+/g, " ").trim() ?? "";
       const matchedWorkspaceFile = findBestWorkspaceFile(
@@ -808,31 +823,58 @@ function App() {
             }) ?? null
           : null)
         ?? findBestCitationDocument(sourceName, docs);
-      const candidateSourcePaths = [...new Set([
-        normalizedSourcePath || null,
-        bestDoc?.relativePath ?? null,
-        matchedWorkspaceFile?.relativePath ?? null,
-        findBestSourcePath(sourceName, docs.map((doc) => doc.relativePath)),
-        findBestSourcePath(sourceName, workspaceFiles.map((file) => file.relativePath)),
-      ].filter((value): value is string => Boolean(value)))];
+      const allKnownPaths = [
+        ...new Set([
+          ...docs.map((doc) => doc.relativePath),
+          ...workspaceFiles.map((file) => file.relativePath),
+        ]),
+      ];
+      const bestCombinedPath = findBestSourcePath(sourceName, allKnownPaths);
+      const pathFromDocs = findBestSourcePath(sourceName, docs.map((doc) => doc.relativePath));
+      const pathFromWorkspace = findBestSourcePath(
+        sourceName,
+        workspaceFiles.map((file) => file.relativePath),
+      );
+      const candidateSourcePaths: string[] = [];
+      const addCandidate = (value: string | null | undefined) => {
+        if (!value) {
+          return;
+        }
+        if (!candidateSourcePaths.includes(value)) {
+          candidateSourcePaths.push(value);
+        }
+      };
+      addCandidate(matchedWorkspaceFile?.relativePath);
+      addCandidate(bestDoc?.relativePath);
+      addCandidate(bestCombinedPath);
+      addCandidate(pathFromDocs);
+      addCandidate(pathFromWorkspace);
+      if (normalizedSourcePath && !isWeakCitationSourcePath(normalizedSourcePath)) {
+        addCandidate(normalizedSourcePath);
+      }
+      if (normalizedSourcePath && isWeakCitationSourcePath(normalizedSourcePath)) {
+        addCandidate(normalizedSourcePath);
+      }
 
       const requestScopedSearch = async (source: string, q: string) => {
         const searchParams = new URLSearchParams(scopeParams);
         searchParams.set("q", q);
         searchParams.set("source", source);
         searchParams.set("limit", "8");
-        return dedupeCitationResults(await request<IngestionSearchResult[]>(
+        const raw = await request<IngestionSearchResult[]>(
           `/api/tasks/${selectedTaskId}/ingestion/search?${searchParams.toString()}`
-        ));
+        );
+        return dedupeCitationResults(Array.isArray(raw) ? raw : []);
       };
 
       const requestSourceChunks = async (source: string) => {
         const chunkParams = new URLSearchParams(scopeParams);
         chunkParams.set("source", source);
         chunkParams.set("limit", "5");
-        return dedupeCitationResults(await request<IngestionSearchResult[]>(
+        const raw = await request<IngestionSearchResult[]>(
           `/api/tasks/${selectedTaskId}/ingestion/chunks?${chunkParams.toString()}`
-        ));
+        );
+        return dedupeCitationResults(Array.isArray(raw) ? raw : []);
       };
 
       for (const source of candidateSourcePaths) {
@@ -849,13 +891,33 @@ function App() {
         }
       }
 
+      const rankedDocs = listCitationRankedDocuments(sourceName, docs, 30);
+      const triedPaths = new Set(candidateSourcePaths);
+      for (const doc of rankedDocs) {
+        if (triedPaths.has(doc.relativePath)) {
+          continue;
+        }
+        triedPaths.add(doc.relativePath);
+        if (normalizedQueryText) {
+          const rankedSearch = await requestScopedSearch(doc.relativePath, normalizedQueryText);
+          if (rankedSearch.length > 0) {
+            return rankedSearch.slice(0, 3);
+          }
+        }
+        const rankedChunks = await requestSourceChunks(doc.relativePath);
+        if (rankedChunks.length > 0) {
+          return rankedChunks.slice(0, 3);
+        }
+      }
+
       if (normalizedQueryText) {
         const searchParams = new URLSearchParams(scopeParams);
         searchParams.set("q", normalizedQueryText);
         searchParams.set("limit", "8");
-        const queryResults = dedupeCitationResults(await request<IngestionSearchResult[]>(
+        const queryRaw = await request<IngestionSearchResult[]>(
           `/api/tasks/${selectedTaskId}/ingestion/search?${searchParams.toString()}`
-        ));
+        );
+        const queryResults = dedupeCitationResults(Array.isArray(queryRaw) ? queryRaw : []);
         const bestPath = findBestSourcePath(
           sourceName,
           [...new Set(queryResults.map((result) => result.relativePath))],
@@ -875,22 +937,13 @@ function App() {
         }
       }
 
-      if (candidateSourcePaths.length > 0) {
-        for (const source of candidateSourcePaths) {
-          const chunks = await requestSourceChunks(source);
-          if (chunks.length > 0) {
-            return chunks.slice(0, 3);
-          }
-        }
-        return [];
-      }
-
       const searchParams = new URLSearchParams(scopeParams);
       searchParams.set("q", normalizedQueryText || sourceName);
       searchParams.set("limit", "8");
-      const results = dedupeCitationResults(await request<IngestionSearchResult[]>(
+      const resultsRaw = await request<IngestionSearchResult[]>(
         `/api/tasks/${selectedTaskId}/ingestion/search?${searchParams.toString()}`
-      ));
+      );
+      const results = dedupeCitationResults(Array.isArray(resultsRaw) ? resultsRaw : []);
       const bestPath = findBestSourcePath(
         sourceName,
         [...new Set(results.map((result) => result.relativePath))],
@@ -2263,6 +2316,7 @@ function App() {
                   compact
                   surface={desktopState.isDesktop ? "desktop" : "developer"}
                   onDismiss={dismissDiagnostics}
+                  onNativeCredentialsChanged={() => void refreshDashboard()}
                 />
               )
             ) : null}
@@ -2502,6 +2556,7 @@ function App() {
                           diagnostics={diagnostics}
                           surface={desktopState.isDesktop ? "desktop" : "developer"}
                           onDismiss={dismissDiagnostics}
+                          onNativeCredentialsChanged={() => void refreshDashboard()}
                         />
                       )
                     ) : null}
@@ -3340,6 +3395,28 @@ function getProviderSetupState(
     return { ready: false, tone: "warn", summary: "Auth needed", detail: auth?.resolution ?? auth?.detail ?? auth?.summary ?? "Connect ChatGPT before starting with Codex." };
   }
 
+  if (provider === "cursor") {
+    const cli = getDiagnosticCheck(diagnostics, "cursor-agent-cli");
+    const auth = getDiagnosticCheck(diagnostics, "cursor-agent-auth");
+    if (cli?.status === "ok" && auth?.status === "ok") {
+      return { ready: true, tone: "ok", summary: "Ready", detail: "Cursor Agent CLI is available and you are signed in." };
+    }
+    if (cli?.status !== "ok") {
+      return {
+        ready: false,
+        tone: "error",
+        summary: "CLI missing",
+        detail: cli?.resolution ?? cli?.detail ?? cli?.summary ?? "Install Cursor Agent or use a desktop build that bundles it.",
+      };
+    }
+    return {
+      ready: false,
+      tone: "warn",
+      summary: "Sign in needed",
+      detail: auth?.resolution ?? auth?.detail ?? auth?.summary ?? "Sign in to Cursor (run `agent login` in a terminal).",
+    };
+  }
+
   const checkId = provider === "gemini" ? "gemini-native" : "minimax-native";
   const check = getDiagnosticCheck(diagnostics, checkId);
   return {
@@ -3371,6 +3448,8 @@ const START_MODES: Array<{
 const PROVIDER_OPTIONS: Array<{
   id: RuntimeProvider;
   label: string;
+  railLabel: string;
+  icon: string;
   native: boolean;
   authMode: TaskRuntimeProfile["authMode"];
   description: string;
@@ -3380,37 +3459,58 @@ const PROVIDER_OPTIONS: Array<{
   {
     id: "codex",
     label: "Codex",
+    railLabel: "Codex",
+    icon: "integration_instructions",
     native: false,
     authMode: "chatgpt",
-    description: "Best integrated path for Stuart today. Strong tooling, web access, and workspace continuity.",
+    description: "Recommended: ChatGPT-backed runtime with full workspace tools and web search.",
     note: "Uses Stuart's managed Codex runtime.",
     models: [
-      { id: "gpt-5.4-mini", label: "Balanced", detail: "Fast default for normal study turns." },
-      { id: "gpt-5.4", label: "Deep reasoning", detail: "Use when you want heavier planning and harder artifact turns." },
+      { id: "gpt-5.4-mini", label: "Balanced", detail: "Default for everyday study turns." },
+      { id: "gpt-5.4", label: "Deep", detail: "Heavier reasoning and richer artifacts when you need it." },
+    ],
+  },
+  {
+    id: "cursor",
+    label: "Cursor",
+    railLabel: "Cursor",
+    icon: "terminal",
+    native: false,
+    authMode: "oauth",
+    description:
+      "Cursor Agent CLI with your Cursor account — workspace tools and models from Cursor. The desktop app bundles the CLI on macOS.",
+    note: "Sign in with `agent login` if System Check shows Cursor auth as missing.",
+    models: [
+      { id: "composer-2-fast", label: "Balanced", detail: "Default Cursor Composer model for most study turns." },
+      { id: "composer-2", label: "Capable", detail: "Stronger Composer model when you want richer answers." },
     ],
   },
   {
     id: "gemini",
-    label: "Gemini Native",
+    label: "Gemini",
+    railLabel: "Gemini",
+    icon: "auto_awesome",
     native: true,
     authMode: "api_key",
-    description: "Direct Gemini API profile for lower-friction native integration work.",
-    note: "Configured via API key. Stuart stores this profile while native transport hardening continues.",
+    description: "Call Google's Gemini API directly from Stuart. Good for experiments and API-only setups.",
+    note: "Save a key in System Check (Native API keys) or set GEMINI_API_KEY in .env.",
     models: [
-      { id: "gemini-2.5-flash", label: "Flash", detail: "Best price-performance for high-volume study flows." },
-      { id: "gemini-2.5-pro", label: "Pro", detail: "Stronger for complex reasoning and longer synthesis turns." },
+      { id: "gemini-2.5-flash", label: "Flash", detail: "Fast and economical for most sessions." },
+      { id: "gemini-2.5-pro", label: "Pro", detail: "Stronger for long or difficult synthesis." },
     ],
   },
   {
     id: "minimax",
-    label: "MiniMax Native",
+    label: "MiniMax",
+    railLabel: "MiniMax",
+    icon: "bolt",
     native: true,
     authMode: "api_key",
-    description: "Direct MiniMax API profile aimed at lightweight native model routing.",
-    note: "Public docs clearly expose API-key auth; the OAuth flow I found is currently documented through OpenClaw setup.",
+    description: "Call MiniMax's API directly. Optional path alongside Codex.",
+    note: "Save credentials in System Check (Native API keys) or set MINIMAX_* in .env.",
     models: [
-      { id: "MiniMax-M2.7", label: "M2.7", detail: "Current general-purpose flagship listed in MiniMax docs." },
-      { id: "MiniMax-M2.5", label: "M2.5", detail: "Conservative fallback profile for existing integrations." },
+      { id: "MiniMax-M2.7", label: "M2.7", detail: "Latest general model in Stuart's profile list." },
+      { id: "MiniMax-M2.5", label: "M2.5", detail: "Fallback if your account targets an older tier." },
     ],
   },
 ];
@@ -3451,6 +3551,15 @@ function WorkspaceOnboarding({
   const [selectedModel, setSelectedModel] = useState(initialRuntimeProfile.model);
   const [startMode, setStartMode] = useState<WorkspaceStartMode>(resolveWorkspaceStartMode(initialConfig));
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const setup = getProviderSetupState(provider, diagnostics);
+    if (getProviderOption(provider).native && !setup.ready) {
+      const fallback = getProviderOption("codex");
+      setProvider("codex");
+      setSelectedModel(fallback.models[0]?.id ?? DEFAULT_TASK_RUNTIME_PROFILE.model);
+    }
+  }, [provider, diagnostics]);
 
   const effectiveStyle = teachingStyle === "Custom" ? customStyle : teachingStyle;
   const effectiveGoal = goal === "Custom" ? customGoal : goal;
@@ -3493,96 +3602,128 @@ function WorkspaceOnboarding({
     <div className="onboarding-card">
       <div className="onboarding-header">
         <div>
-          <h2>Set up your workspace</h2>
-          <p className="onboarding-subtitle">Pick the runtime target, how the first session should begin, and how Stuart should teach. You can change this later.</p>
+          <h2>Workspace setup</h2>
+          <p className="onboarding-subtitle">
+            Choose how Stuart runs, then optional teaching preferences. You can change this anytime.
+          </p>
         </div>
-        <div className="onboarding-runtime-pill">Workspace runtime</div>
       </div>
 
-      <div className="onboarding-section">
-        <div className="onboarding-section-head">
-          <strong>Runtime target</strong>
-          <span>{providerOption.note}</span>
+      <section className="onboarding-section onboarding-section-engine" aria-labelledby="onboarding-engine-heading">
+        <div className="onboarding-section-head onboarding-section-head-inline">
+          <strong id="onboarding-engine-heading">AI engine</strong>
+          <span>Provider and model for this workspace</span>
         </div>
-        <div className="onboarding-provider-grid">
-          {PROVIDER_OPTIONS.map((option) => {
-            const setup = getProviderSetupState(option.id, diagnostics);
-            return (
-              <button
-                key={option.id}
-                type="button"
-                className={`onboarding-provider${provider === option.id ? " selected" : ""}`}
-                onClick={() => {
-                  setProvider(option.id);
-                  setSelectedModel(option.models[0]?.id ?? DEFAULT_TASK_RUNTIME_PROFILE.model);
-                }}
+
+        <div className="onboarding-engine-split">
+          <div className="onboarding-provider-rail" role="tablist" aria-label="AI provider">
+            {PROVIDER_OPTIONS.map((option) => {
+              const setup = getProviderSetupState(option.id, diagnostics);
+              const unavailable = option.native && !setup.ready;
+              const selected = provider === option.id;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  aria-disabled={unavailable}
+                  disabled={unavailable}
+                  title={unavailable ? "Add a key in System Check → Native API keys or in .env." : undefined}
+                  className={`onboarding-provider-row${selected ? " selected" : ""}${unavailable ? " unavailable" : ""}`}
+                  onClick={() => {
+                    if (unavailable) return;
+                    setProvider(option.id);
+                    setSelectedModel(option.models[0]?.id ?? DEFAULT_TASK_RUNTIME_PROFILE.model);
+                  }}
+                >
+                  <span className="onboarding-provider-row-icon material-symbols-outlined" aria-hidden>
+                    {option.icon}
+                  </span>
+                  <span className="onboarding-provider-row-text">
+                    <span className="onboarding-provider-row-name">{option.railLabel}</span>
+                    <span className={`onboarding-provider-row-status ${setup.tone}`} title={setup.summary}>
+                      {setup.summary}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="onboarding-engine-panel">
+            <p className="onboarding-engine-lead">{providerOption.description}</p>
+            {!providerSetup.ready && providerOption.native ? (
+              <p className="onboarding-engine-setup-hint">{providerSetup.detail ?? providerOption.note}</p>
+            ) : null}
+
+            <div className="onboarding-model-wrap">
+              <span className="onboarding-model-label" id="onboarding-model-label">
+                Model
+              </span>
+              <div
+                className="onboarding-model-segments"
+                role="radiogroup"
+                aria-labelledby="onboarding-model-label"
               >
-                <div className="onboarding-provider-topline">
-                  <strong>{option.label}</strong>
-                  <span className={`onboarding-status-badge ${setup.tone}`}>{setup.summary}</span>
-                </div>
-                <p>{option.description}</p>
-                <span className="onboarding-provider-note">{setup.detail ?? option.note}</span>
-              </button>
-            );
-          })}
+                {providerOption.models.map((model) => (
+                  <button
+                    key={model.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={selectedModel === model.id}
+                    disabled={!providerSetup.ready}
+                    className={`onboarding-model-seg${selectedModel === model.id ? " selected" : ""}`}
+                    onClick={() => setSelectedModel(model.id)}
+                  >
+                    <span className="onboarding-model-seg-title">{model.label}</span>
+                    <span className="onboarding-model-seg-detail">{model.detail}</span>
+                    <code className="onboarding-model-seg-id">{model.id}</code>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
+      </section>
 
-      <div className="onboarding-section">
-        <div className="onboarding-section-head">
-          <strong>Model selection</strong>
-          <span>Keep this simple: balanced for normal study, deeper model for heavier synthesis.</span>
+      <section className="onboarding-section" aria-labelledby="onboarding-start-heading">
+        <div className="onboarding-section-head onboarding-section-head-inline">
+          <strong id="onboarding-start-heading">First session</strong>
+          <span>How much onboarding you want before you ask questions</span>
         </div>
-        <div className="onboarding-model-grid">
-          {providerOption.models.map((model) => (
-            <button
-              key={model.id}
-              type="button"
-              className={`onboarding-model${selectedModel === model.id ? " selected" : ""}`}
-              onClick={() => setSelectedModel(model.id)}
-            >
-              <strong>{model.label}</strong>
-              <span>{model.id}</span>
-              <p>{model.detail}</p>
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="onboarding-section">
-        <div className="onboarding-section-head">
-          <strong>How Stuart should start</strong>
-          <span>This changes the first reply and the amount of onboarding friction.</span>
-        </div>
-        <div className="onboarding-start-grid">
+        <div className="onboarding-start-segments" role="radiogroup" aria-labelledby="onboarding-start-heading">
           {START_MODES.map((mode) => (
             <button
               key={mode.id}
               type="button"
-              className={`onboarding-start-option${startMode === mode.id ? " selected" : ""}`}
+              role="radio"
+              aria-checked={startMode === mode.id}
+              className={`onboarding-start-seg${startMode === mode.id ? " selected" : ""}`}
               onClick={() => setStartMode(mode.id)}
             >
-              <strong>{mode.label}</strong>
-              <p>{mode.description}</p>
+              <span className="onboarding-start-seg-title">{mode.label}</span>
+              <span className="onboarding-start-seg-detail">{mode.description}</span>
             </button>
           ))}
         </div>
-      </div>
+      </section>
 
-      <div className="onboarding-field">
-        <label>Subject</label>
-        <input
-          type="text"
-          placeholder="e.g., Operating Systems, Constitutional Law"
-          value={subject}
-          onChange={(e) => setSubject(e.target.value)}
-        />
-      </div>
+      <div className="onboarding-prefs-block">
+        <div className="onboarding-prefs-kicker">Optional</div>
+        <div className="onboarding-field">
+          <label>Subject</label>
+          <input
+            type="text"
+            placeholder="e.g., Operating Systems, Constitutional Law"
+            value={subject}
+            onChange={(e) => setSubject(e.target.value)}
+          />
+        </div>
 
-      <div className="onboarding-field">
-        <label>Teaching style</label>
-        <div className="onboarding-chips">
+        <div className="onboarding-field">
+          <label>Teaching style</label>
+          <div className="onboarding-chips">
           {TEACHING_STYLES.map((s) => (
             <button
               key={s}
@@ -3596,21 +3737,21 @@ function WorkspaceOnboarding({
             className={`onboarding-chip${teachingStyle === "Custom" ? " selected" : ""}`}
             onClick={() => setTeachingStyle(teachingStyle === "Custom" ? "" : "Custom")}
           >Custom</button>
+          </div>
+          {teachingStyle === "Custom" && (
+            <input
+              type="text"
+              placeholder="Describe your preferred style"
+              value={customStyle}
+              onChange={(e) => setCustomStyle(e.target.value)}
+              style={{ marginTop: 8 }}
+            />
+          )}
         </div>
-        {teachingStyle === "Custom" && (
-          <input
-            type="text"
-            placeholder="Describe your preferred style"
-            value={customStyle}
-            onChange={(e) => setCustomStyle(e.target.value)}
-            style={{ marginTop: 8 }}
-          />
-        )}
-      </div>
 
-      <div className="onboarding-field">
-        <label>Goal</label>
-        <div className="onboarding-chips">
+        <div className="onboarding-field">
+          <label>Goal</label>
+          <div className="onboarding-chips">
           {GOALS.map((g) => (
             <button
               key={g}
@@ -3624,26 +3765,27 @@ function WorkspaceOnboarding({
             className={`onboarding-chip${goal === "Custom" ? " selected" : ""}`}
             onClick={() => setGoal(goal === "Custom" ? "" : "Custom")}
           >Custom</button>
+          </div>
+          {goal === "Custom" && (
+            <input
+              type="text"
+              placeholder="Describe your goal"
+              value={customGoal}
+              onChange={(e) => setCustomGoal(e.target.value)}
+              style={{ marginTop: 8 }}
+            />
+          )}
         </div>
-        {goal === "Custom" && (
-          <input
-            type="text"
-            placeholder="Describe your goal"
-            value={customGoal}
-            onChange={(e) => setCustomGoal(e.target.value)}
-            style={{ marginTop: 8 }}
-          />
-        )}
-      </div>
 
-      <div className="onboarding-field">
-        <label>Additional notes <span style={{ fontWeight: 400, color: "var(--ink-muted)" }}>(optional)</span></label>
-        <textarea
-          placeholder="Anything else Stuart should know — e.g., exam date, areas of difficulty, preferred examples..."
-          value={additionalNotes}
-          onChange={(e) => setAdditionalNotes(e.target.value)}
-          rows={3}
-        />
+        <div className="onboarding-field">
+          <label>Additional notes <span style={{ fontWeight: 400, color: "var(--ink-muted)" }}>(optional)</span></label>
+          <textarea
+            placeholder="Anything else Stuart should know — e.g., exam date, areas of difficulty, preferred examples..."
+            value={additionalNotes}
+            onChange={(e) => setAdditionalNotes(e.target.value)}
+            rows={3}
+          />
+        </div>
       </div>
 
       {!providerSetup.ready ? (
@@ -3675,16 +3817,178 @@ function WorkspaceOnboarding({
   );
 }
 
+function NativeProviderCredentialsPanel({
+  compact = false,
+  onCredentialsChanged,
+}: {
+  compact?: boolean;
+  onCredentialsChanged: () => void | Promise<void>;
+}) {
+  const [status, setStatus] = useState<NativeProviderCredentialsPublic | null>(null);
+  const [geminiKey, setGeminiKey] = useState("");
+  const [minimaxKey, setMinimaxKey] = useState("");
+  const [minimaxToken, setMinimaxToken] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const s = await request<NativeProviderCredentialsPublic>("/api/settings/native-credentials");
+      setStatus(s);
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function runPatch(body: Record<string, string | null | undefined>) {
+    setBusy("patch");
+    setError(null);
+    try {
+      const payload = Object.fromEntries(
+        Object.entries(body).filter(([, v]) => v !== undefined)
+      ) as Record<string, string | null>;
+      await request<NativeProviderCredentialsPublic>("/api/settings/native-credentials", {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      setGeminiKey("");
+      setMinimaxKey("");
+      setMinimaxToken("");
+      await load();
+      await onCredentialsChanged();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Request failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className={`diagnostics-native-keys${compact ? " compact" : ""}`}>
+      <div className="diagnostics-native-keys-head">
+        <strong>Native API keys</strong>
+        <span>Stored in your local Stuart SQLite database. Saved keys take precedence over .env for native Gemini and MiniMax.</span>
+      </div>
+      {status ? (
+        <p className="diagnostics-native-keys-status">
+          Gemini: {status.geminiConfigured ? "saved locally" : "not saved"}
+          {" · "}
+          MiniMax: {status.minimaxConfigured ? "saved locally" : "not saved"}
+        </p>
+      ) : null}
+      {error ? <p className="diagnostics-native-keys-error">{error}</p> : null}
+
+      <div className="diagnostics-native-keys-block">
+        <span className="diagnostics-native-keys-label">Google Gemini</span>
+        <input
+          type="password"
+          className="diagnostics-native-keys-input"
+          autoComplete="off"
+          placeholder="Paste API key to save"
+          value={geminiKey}
+          onChange={(e) => setGeminiKey(e.target.value)}
+        />
+        <div className="diagnostics-native-keys-actions">
+          <button
+            type="button"
+            className="accent-button compact"
+            disabled={busy !== null || !geminiKey.trim()}
+            onClick={() => void runPatch({ geminiApiKey: geminiKey.trim() })}
+          >
+            {busy === "patch" ? "Saving…" : "Save"}
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.geminiConfigured}
+            onClick={() => void runPatch({ geminiApiKey: null })}
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+
+      <div className="diagnostics-native-keys-block">
+        <span className="diagnostics-native-keys-label">MiniMax</span>
+        <input
+          type="password"
+          className="diagnostics-native-keys-input"
+          autoComplete="off"
+          placeholder="API key (optional)"
+          value={minimaxKey}
+          onChange={(e) => setMinimaxKey(e.target.value)}
+        />
+        <input
+          type="password"
+          className="diagnostics-native-keys-input"
+          autoComplete="off"
+          placeholder="Access token (optional)"
+          value={minimaxToken}
+          onChange={(e) => setMinimaxToken(e.target.value)}
+        />
+        <div className="diagnostics-native-keys-actions diagnostics-native-keys-actions-wrap">
+          <button
+            type="button"
+            className="accent-button compact"
+            disabled={busy !== null || !minimaxKey.trim()}
+            onClick={() => void runPatch({ minimaxApiKey: minimaxKey.trim() })}
+          >
+            Save API key
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.minimaxConfigured}
+            onClick={() => void runPatch({ minimaxApiKey: null })}
+          >
+            Clear API key
+          </button>
+          <button
+            type="button"
+            className="accent-button compact"
+            disabled={busy !== null || !minimaxToken.trim()}
+            onClick={() => void runPatch({ minimaxAccessToken: minimaxToken.trim() })}
+          >
+            Save token
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.minimaxConfigured}
+            onClick={() => void runPatch({ minimaxAccessToken: null })}
+          >
+            Clear token
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.minimaxConfigured}
+            onClick={() => void runPatch({ minimaxApiKey: null, minimaxAccessToken: null })}
+          >
+            Remove both
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DiagnosticsCard({
   diagnostics,
   surface = "developer",
   compact = false,
   onDismiss,
+  onNativeCredentialsChanged,
 }: {
   diagnostics: SystemDiagnostics;
   surface?: "developer" | "desktop";
   compact?: boolean;
   onDismiss?: () => void;
+  onNativeCredentialsChanged?: () => void | Promise<void>;
 }) {
   const { requiredErrors, optionalWarnings } = summarizeDiagnostics(diagnostics.checks);
   const visibleChecks = compact ? diagnostics.checks.filter((check) => check.status !== "ok").slice(0, 4) : diagnostics.checks;
@@ -3741,6 +4045,9 @@ function DiagnosticsCard({
           </div>
         ))}
       </div>
+      {onNativeCredentialsChanged ? (
+        <NativeProviderCredentialsPanel compact={compact} onCredentialsChanged={onNativeCredentialsChanged} />
+      ) : null}
       {surface === "developer" && (requiredErrors > 0 || optionalWarnings > 0) ? (
         <div className="diagnostics-footer">
           <code>pnpm preflight</code>
@@ -5784,16 +6091,59 @@ function InlineMermaid({ code }: { code: string }) {
   return <div className="mermaid-inline" dangerouslySetInnerHTML={{ __html: svg }} />;
 }
 
+const CITATION_POPOVER_GAP = 8;
+const CITATION_POPOVER_PAD = 12;
+const CITATION_POPOVER_MAX_H = 320;
+const CITATION_POPOVER_WIDTH = 380;
+
+function computeCitationPopoverStyle(pillEl: HTMLElement): CSSProperties {
+  const rect = pillEl.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const w = Math.min(CITATION_POPOVER_WIDTH, vw - 2 * CITATION_POPOVER_PAD);
+  let left = rect.left;
+  if (left + w > vw - CITATION_POPOVER_PAD) {
+    left = Math.max(CITATION_POPOVER_PAD, vw - w - CITATION_POPOVER_PAD);
+  }
+  if (left < CITATION_POPOVER_PAD) left = CITATION_POPOVER_PAD;
+
+  let top = rect.bottom + CITATION_POPOVER_GAP;
+  let maxH = Math.min(CITATION_POPOVER_MAX_H, vh - top - CITATION_POPOVER_PAD);
+  let useBottom = false;
+
+  if (maxH < 120) {
+    const aboveMax = Math.min(CITATION_POPOVER_MAX_H, rect.top - CITATION_POPOVER_GAP - CITATION_POPOVER_PAD);
+    if (aboveMax > maxH) {
+      useBottom = true;
+      maxH = aboveMax;
+    }
+  }
+
+  const base: CSSProperties = {
+    position: "fixed",
+    left,
+    width: w,
+    zIndex: 10050,
+    maxHeight: maxH,
+  };
+  if (useBottom) {
+    return { ...base, bottom: vh - rect.top + CITATION_POPOVER_GAP, top: "auto" };
+  }
+  return { ...base, top, bottom: "auto" };
+}
+
 function CitationPillClickable({
   label,
   icon,
   sourcePath,
   queryText,
+  trailingInline,
 }: {
   label: string;
   icon: string;
   sourcePath?: string | null;
   queryText?: string | null;
+  trailingInline?: string;
 }) {
   const searchCitation = useContext(CitationContext);
   const openCitationSource = useContext(CitationOpenContext);
@@ -5802,7 +6152,15 @@ function CitationPillClickable({
   const [open, setOpen] = useState(false);
   const [results, setResults] = useState<IngestionSearchResult[] | null>(null);
   const [loading, setLoading] = useState(false);
-  const pillRef = useRef<HTMLSpanElement>(null);
+  const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
+  const pillMeasureRef = useRef<HTMLSpanElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  const updatePopoverPosition = useCallback(() => {
+    const el = pillMeasureRef.current;
+    if (!el) return;
+    setPopoverStyle(computeCitationPopoverStyle(el));
+  }, []);
 
   const handleClick = useCallback(async () => {
     if (open) { setOpen(false); return; }
@@ -5829,55 +6187,97 @@ function CitationPillClickable({
   }, [label, open, openWorkspaceFile, queryText, resolveWorkspaceFile, searchCitation, sourcePath]);
 
   useEffect(() => {
+    if (!open) setPopoverStyle({});
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+  }, [open, loading, results, updatePopoverPosition]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onReposition = () => {
+      updatePopoverPosition();
+    };
+    window.addEventListener("resize", onReposition);
+    document.addEventListener("scroll", onReposition, true);
+    return () => {
+      window.removeEventListener("resize", onReposition);
+      document.removeEventListener("scroll", onReposition, true);
+    };
+  }, [open, updatePopoverPosition]);
+
+  useEffect(() => {
     if (!open) return;
     const handleClickOutside = (e: MouseEvent) => {
-      if (pillRef.current && !pillRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (pillMeasureRef.current?.contains(t)) return;
+      if (popoverRef.current?.contains(t)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [open]);
 
-  return (
-    <span ref={pillRef} className={`citation-pill clickable${open ? " active" : ""}`} onClick={handleClick}>
-      <span className="material-symbols-outlined" style={{ fontSize: 11, flexShrink: 0 }}>{icon}</span>
-      <span className="citation-pill-label">{label}</span>
-      {open && (
-        <div className="citation-popover" onClick={(e) => e.stopPropagation()}>
-          <div className="citation-popover-header">
-            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>{icon}</span>
-            <strong>{label}</strong>
-          </div>
-          {loading ? (
-            <p className="citation-popover-loading">Searching sources...</p>
-          ) : results && results.length > 0 ? (
-            <div className="citation-popover-results">
-              {results.map((r, i) => (
-                <div key={r.chunkId ?? i} className="citation-popover-chunk">
-                  <div className="citation-popover-chunk-meta">
-                    {r.locator ? <span className="citation-popover-locator">{r.locator}</span> : null}
-                    {openCitationSource ? (
-                      <button
-                        type="button"
-                        className="citation-popover-open"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openCitationSource(r.relativePath, r.locator);
-                        }}
-                      >
-                        Open source
-                      </button>
-                    ) : null}
-                  </div>
-                  <p>{r.snippet || r.text.slice(0, 300)}{r.text.length > 300 ? "..." : ""}</p>
-                  <span className="citation-popover-source">{cleanSourceName(r.relativePath)}</span>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="citation-popover-empty">No matching excerpts found.</p>
-          )}
+  const popoverContent =
+    open ? (
+      <div
+        ref={popoverRef}
+        className="citation-popover citation-popover-portal"
+        style={popoverStyle}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="citation-popover-header">
+          <span className="material-symbols-outlined" style={{ fontSize: 14 }}>{icon}</span>
+          <strong>{label}</strong>
         </div>
-      )}
+        {loading ? (
+          <p className="citation-popover-loading">Searching sources...</p>
+        ) : results && results.length > 0 ? (
+          <div className="citation-popover-results">
+            {results.map((r, i) => (
+              <div key={r.chunkId ?? i} className="citation-popover-chunk">
+                <div className="citation-popover-chunk-meta">
+                  {r.locator ? <span className="citation-popover-locator">{r.locator}</span> : null}
+                  {openCitationSource ? (
+                    <button
+                      type="button"
+                      className="citation-popover-open"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openCitationSource(r.relativePath, r.locator);
+                      }}
+                    >
+                      Open source
+                    </button>
+                  ) : null}
+                </div>
+                <p>{r.snippet || r.text.slice(0, 300)}{r.text.length > 300 ? "..." : ""}</p>
+                <span className="citation-popover-source">{cleanSourceName(r.relativePath)}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="citation-popover-empty">No matching excerpts found.</p>
+        )}
+      </div>
+    ) : null;
+
+  return (
+    <span className="citation-pill-host">
+      <span
+        ref={pillMeasureRef}
+        className={`citation-pill clickable${open ? " active" : ""}`}
+        onClick={handleClick}
+      >
+        <span className="material-symbols-outlined" style={{ fontSize: 11, flexShrink: 0 }}>{icon}</span>
+        <span className="citation-pill-label">{label}</span>
+      </span>
+      {trailingInline ? <span className="citation-inline-suffix">{trailingInline}</span> : null}
+      {typeof document !== "undefined" && open && Object.keys(popoverStyle).length > 0 && popoverContent
+        ? createPortal(popoverContent, document.body)
+        : null}
     </span>
   );
 }
@@ -5908,101 +6308,79 @@ function MarkdownFileLink({
 }
 
 function MarkdownMessage({ content }: { content: string }) {
-  const cleanedContent = cleanFileReferences(wrapBareLatex(content));
+  const cleanedContent = useMemo(() => cleanFileReferences(wrapBareLatex(content)), [content]);
+  const segments = useMemo(
+    () => mergeCitationTrailingPunctuation(splitMessageWithCitations(cleanedContent)),
+    [cleanedContent],
+  );
 
-  // Process children to replace «label::EXT» markers with styled pills
-  function processFileMarkers(node: React.ReactNode): React.ReactNode {
-    if (typeof node === "string") {
-      const re = new RegExp(`${FILE_REF_MARKER}([^${FILE_REF_END}]+)${FILE_REF_END}`, "g");
-      if (!re.test(node)) return node;
-      re.lastIndex = 0;
-      const parts: React.ReactNode[] = [];
-      let lastIdx = 0;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(node)) !== null) {
-        if (match.index > lastIdx) parts.push(node.slice(lastIdx, match.index));
-        const { label, ext, sourcePath } = parseFileReferenceMarker(match[1] ?? "");
-        const queryText = extractCitationQueryText(node, match.index, re.lastIndex);
-        const icon = iconForFileExtension(ext);
-        parts.push(
-          <CitationPillClickable
-            key={match.index}
-            label={label}
-            icon={icon}
-            sourcePath={sourcePath}
-            queryText={queryText}
-          />
-        );
-        lastIdx = re.lastIndex;
-      }
-      if (lastIdx < node.length) parts.push(node.slice(lastIdx));
-      return parts.length === 1 ? parts[0] : <>{parts}</>;
-    }
-    if (Array.isArray(node)) return node.map((c, i) => <React.Fragment key={i}>{processFileMarkers(c)}</React.Fragment>);
-    if (node && typeof node === "object" && "props" in (node as any)) {
-      const el = node as React.ReactElement<{ children?: React.ReactNode }>;
-      if (el.props.children) {
-        return React.cloneElement(el, {}, processFileMarkers(el.props.children));
-      }
-    }
-    return node;
-  }
-
-  // Wrapper that applies file marker processing to any element's children
-  function withFileMarkers(Tag: string) {
-    return ({ children, ...props }: any) => {
-      const processed = processFileMarkers(children);
-      return React.createElement(Tag, props, processed);
-    };
-  }
+  const segmentMarkdownComponents = useMemo(
+    () => ({
+      a: ({ children, href }: { children?: React.ReactNode; href?: string }) => {
+        const normalizedHref = href?.trim() ?? "";
+        if (!normalizedHref) return <span>{children}</span>;
+        if (isExternalLink(normalizedHref)) {
+          return (
+            <a href={normalizedHref} target="_blank" rel="noreferrer" className="message-link external">
+              {children}
+            </a>
+          );
+        }
+        return <MarkdownFileLink href={normalizedHref}>{children}</MarkdownFileLink>;
+      },
+      p: ({ children }: { children?: React.ReactNode }) => (
+        <span className="message-inline-md-root">{children}</span>
+      ),
+      td: ({ children }: { children?: React.ReactNode }) => <td>{children}</td>,
+      th: ({ children }: { children?: React.ReactNode }) => <th>{children}</th>,
+      li: ({ children }: { children?: React.ReactNode }) => <li>{children}</li>,
+      strong: ({ children }: { children?: React.ReactNode }) => <strong>{children}</strong>,
+      em: ({ children }: { children?: React.ReactNode }) => <em>{children}</em>,
+      code: ({ children, className }: { children?: React.ReactNode; className?: string }) => {
+        if (className === "language-mermaid") {
+          const text = String(children).replace(/\n$/, "");
+          return <InlineMermaid code={text} />;
+        }
+        return className ? <code className={className}>{children}</code> : <code>{children}</code>;
+      },
+      pre: ({ children }: { children?: React.ReactNode }) => {
+        const child = React.Children.toArray(children)[0];
+        if (child && typeof child === "object" && "type" in (child as any) && (child as any).type === InlineMermaid) {
+          return <>{children}</>;
+        }
+        return <pre>{children}</pre>;
+      },
+      h1: ({ children }: { children?: React.ReactNode }) => <h1>{children}</h1>,
+      h2: ({ children }: { children?: React.ReactNode }) => <h2>{children}</h2>,
+      h3: ({ children }: { children?: React.ReactNode }) => <h3>{children}</h3>,
+      blockquote: ({ children }: { children?: React.ReactNode }) => <blockquote>{children}</blockquote>,
+    }),
+    [],
+  );
 
   return (
-    <div className="markdown-message">
-      <ReactMarkdown
-        remarkPlugins={[remarkMath, remarkGfm]}
-        rehypePlugins={[rehypeKatex]}
-        components={{
-          a: ({ children, href }) => {
-            const normalizedHref = href?.trim() ?? "";
-            if (!normalizedHref) return <span>{children}</span>;
-            if (isExternalLink(normalizedHref)) {
-              return (
-                <a href={normalizedHref} target="_blank" rel="noreferrer" className="message-link external">
-                  {children}
-                </a>
-              );
-            }
-            return <MarkdownFileLink href={normalizedHref}>{children}</MarkdownFileLink>;
-          },
-          p: withFileMarkers("p"),
-          td: withFileMarkers("td"),
-          th: withFileMarkers("th"),
-          li: withFileMarkers("li"),
-          strong: withFileMarkers("strong"),
-          em: withFileMarkers("em"),
-          code: ({ children, className }) => {
-            if (className === "language-mermaid") {
-              const text = String(children).replace(/\n$/, "");
-              return <InlineMermaid code={text} />;
-            }
-            return className ? <code className={className}>{children}</code> : <code>{children}</code>;
-          },
-          pre: ({ children }) => {
-            // If the child is an InlineMermaid, don't wrap in <pre>
-            const child = React.Children.toArray(children)[0];
-            if (child && typeof child === "object" && "type" in (child as any) && (child as any).type === InlineMermaid) {
-              return <>{children}</>;
-            }
-            return <pre>{children}</pre>;
-          },
-          h1: withFileMarkers("h1"),
-          h2: withFileMarkers("h2"),
-          h3: withFileMarkers("h3"),
-          blockquote: withFileMarkers("blockquote"),
-        }}
-      >
-        {cleanedContent}
-      </ReactMarkdown>
+    <div className="markdown-message markdown-message-with-citations">
+      {segments.map((seg, index) =>
+        seg.kind === "markdown" ? (
+          <ReactMarkdown
+            key={`md-${index}`}
+            remarkPlugins={[remarkMath, remarkGfm]}
+            rehypePlugins={[rehypeKatex]}
+            components={segmentMarkdownComponents}
+          >
+            {seg.text}
+          </ReactMarkdown>
+        ) : (
+          <CitationPillClickable
+            key={`cite-${seg.key}`}
+            label={seg.label}
+            icon={iconForFileExtension(seg.ext)}
+            sourcePath={seg.sourcePath}
+            queryText={seg.queryText}
+            trailingInline={seg.trailingInline}
+          />
+        ),
+      )}
     </div>
   );
 }
