@@ -24,7 +24,8 @@ import type {
   TopicPerformanceRecord,
   UpdateTaskInput,
   VmStatus,
-  WorkspaceEvent
+  WorkspaceEvent,
+  UpdateNativeProviderCredentialsInput
 } from "@stuart/shared";
 import { extractTopic } from "@stuart/shared";
 
@@ -204,6 +205,23 @@ export function createStuartApiRouter(options: StuartApiRouterOptions): express.
   router.get("/system/diagnostics", asyncRoute(async (_request, response) => {
     response.json(await safeSystemDiagnostics(runtime));
   }));
+
+  router.get("/settings/native-credentials", (_request, response) => {
+    try {
+      response.json(runtime.getNativeProviderCredentialsPublic());
+    } catch (err) {
+      response.status(500).send((err as Error).message);
+    }
+  });
+
+  router.patch("/settings/native-credentials", (request, response) => {
+    try {
+      const body = (request.body ?? {}) as UpdateNativeProviderCredentialsInput;
+      response.json(runtime.updateNativeProviderCredentials(body));
+    } catch (err) {
+      response.status(400).send((err as Error).message);
+    }
+  });
 
   router.get("/projects", (_request, response) => {
     response.json(runtime.listProjects());

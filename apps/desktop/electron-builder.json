@@ -34,6 +34,11 @@
       "from": "codex-vendor",
       "to": "codex-vendor",
       "filter": ["**/*"]
+    },
+    {
+      "from": "cursor-vendor",
+      "to": "cursor-vendor",
+      "filter": ["**/*"]
     }
   ],
   "mac": {

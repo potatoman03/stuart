@@ -35,7 +35,8 @@ import type {
   WorkspaceEvent,
   WorkspaceFileRecord,
   WorkspaceStartMode,
-  IngestionSearchResult
+  IngestionSearchResult,
+  NativeProviderCredentialsPublic
 } from "@stuart/shared";
 import ArtifactCanvas from "./ArtifactCanvas";
 import { ALL_DEMOS } from "./DemoArtifacts";
@@ -2315,6 +2316,7 @@ function App() {
                   compact
                   surface={desktopState.isDesktop ? "desktop" : "developer"}
                   onDismiss={dismissDiagnostics}
+                  onNativeCredentialsChanged={() => void refreshDashboard()}
                 />
               )
             ) : null}
@@ -2554,6 +2556,7 @@ function App() {
                           diagnostics={diagnostics}
                           surface={desktopState.isDesktop ? "desktop" : "developer"}
                           onDismiss={dismissDiagnostics}
+                          onNativeCredentialsChanged={() => void refreshDashboard()}
                         />
                       )
                     ) : null}
@@ -3392,6 +3395,28 @@ function getProviderSetupState(
     return { ready: false, tone: "warn", summary: "Auth needed", detail: auth?.resolution ?? auth?.detail ?? auth?.summary ?? "Connect ChatGPT before starting with Codex." };
   }
 
+  if (provider === "cursor") {
+    const cli = getDiagnosticCheck(diagnostics, "cursor-agent-cli");
+    const auth = getDiagnosticCheck(diagnostics, "cursor-agent-auth");
+    if (cli?.status === "ok" && auth?.status === "ok") {
+      return { ready: true, tone: "ok", summary: "Ready", detail: "Cursor Agent CLI is available and you are signed in." };
+    }
+    if (cli?.status !== "ok") {
+      return {
+        ready: false,
+        tone: "error",
+        summary: "CLI missing",
+        detail: cli?.resolution ?? cli?.detail ?? cli?.summary ?? "Install Cursor Agent or use a desktop build that bundles it.",
+      };
+    }
+    return {
+      ready: false,
+      tone: "warn",
+      summary: "Sign in needed",
+      detail: auth?.resolution ?? auth?.detail ?? auth?.summary ?? "Sign in to Cursor (run `agent login` in a terminal).",
+    };
+  }
+
   const checkId = provider === "gemini" ? "gemini-native" : "minimax-native";
   const check = getDiagnosticCheck(diagnostics, checkId);
   return {
@@ -3446,6 +3471,21 @@ const PROVIDER_OPTIONS: Array<{
     ],
   },
   {
+    id: "cursor",
+    label: "Cursor",
+    railLabel: "Cursor",
+    icon: "terminal",
+    native: false,
+    authMode: "oauth",
+    description:
+      "Cursor Agent CLI with your Cursor account — workspace tools and models from Cursor. The desktop app bundles the CLI on macOS.",
+    note: "Sign in with `agent login` if System Check shows Cursor auth as missing.",
+    models: [
+      { id: "composer-2-fast", label: "Balanced", detail: "Default Cursor Composer model for most study turns." },
+      { id: "composer-2", label: "Capable", detail: "Stronger Composer model when you want richer answers." },
+    ],
+  },
+  {
     id: "gemini",
     label: "Gemini",
     railLabel: "Gemini",
@@ -3453,7 +3493,7 @@ const PROVIDER_OPTIONS: Array<{
     native: true,
     authMode: "api_key",
     description: "Call Google's Gemini API directly from Stuart. Good for experiments and API-only setups.",
-    note: "Set GEMINI_API_KEY in your environment or .env file.",
+    note: "Save a key in System Check (Native API keys) or set GEMINI_API_KEY in .env.",
     models: [
       { id: "gemini-2.5-flash", label: "Flash", detail: "Fast and economical for most sessions." },
       { id: "gemini-2.5-pro", label: "Pro", detail: "Stronger for long or difficult synthesis." },
@@ -3467,7 +3507,7 @@ const PROVIDER_OPTIONS: Array<{
     native: true,
     authMode: "api_key",
     description: "Call MiniMax's API directly. Optional path alongside Codex.",
-    note: "Set MINIMAX_API_KEY or MINIMAX_ACCESS_TOKEN in your environment or .env file.",
+    note: "Save credentials in System Check (Native API keys) or set MINIMAX_* in .env.",
     models: [
       { id: "MiniMax-M2.7", label: "M2.7", detail: "Latest general model in Stuart's profile list." },
       { id: "MiniMax-M2.5", label: "M2.5", detail: "Fallback if your account targets an older tier." },
@@ -3589,7 +3629,7 @@ function WorkspaceOnboarding({
                   aria-selected={selected}
                   aria-disabled={unavailable}
                   disabled={unavailable}
-                  title={unavailable ? "Add the API key in .env to enable this provider." : undefined}
+                  title={unavailable ? "Add a key in System Check → Native API keys or in .env." : undefined}
                   className={`onboarding-provider-row${selected ? " selected" : ""}${unavailable ? " unavailable" : ""}`}
                   onClick={() => {
                     if (unavailable) return;
@@ -3777,16 +3817,178 @@ function WorkspaceOnboarding({
   );
 }
 
+function NativeProviderCredentialsPanel({
+  compact = false,
+  onCredentialsChanged,
+}: {
+  compact?: boolean;
+  onCredentialsChanged: () => void | Promise<void>;
+}) {
+  const [status, setStatus] = useState<NativeProviderCredentialsPublic | null>(null);
+  const [geminiKey, setGeminiKey] = useState("");
+  const [minimaxKey, setMinimaxKey] = useState("");
+  const [minimaxToken, setMinimaxToken] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const s = await request<NativeProviderCredentialsPublic>("/api/settings/native-credentials");
+      setStatus(s);
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function runPatch(body: Record<string, string | null | undefined>) {
+    setBusy("patch");
+    setError(null);
+    try {
+      const payload = Object.fromEntries(
+        Object.entries(body).filter(([, v]) => v !== undefined)
+      ) as Record<string, string | null>;
+      await request<NativeProviderCredentialsPublic>("/api/settings/native-credentials", {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      setGeminiKey("");
+      setMinimaxKey("");
+      setMinimaxToken("");
+      await load();
+      await onCredentialsChanged();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Request failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className={`diagnostics-native-keys${compact ? " compact" : ""}`}>
+      <div className="diagnostics-native-keys-head">
+        <strong>Native API keys</strong>
+        <span>Stored in your local Stuart SQLite database. Saved keys take precedence over .env for native Gemini and MiniMax.</span>
+      </div>
+      {status ? (
+        <p className="diagnostics-native-keys-status">
+          Gemini: {status.geminiConfigured ? "saved locally" : "not saved"}
+          {" · "}
+          MiniMax: {status.minimaxConfigured ? "saved locally" : "not saved"}
+        </p>
+      ) : null}
+      {error ? <p className="diagnostics-native-keys-error">{error}</p> : null}
+
+      <div className="diagnostics-native-keys-block">
+        <span className="diagnostics-native-keys-label">Google Gemini</span>
+        <input
+          type="password"
+          className="diagnostics-native-keys-input"
+          autoComplete="off"
+          placeholder="Paste API key to save"
+          value={geminiKey}
+          onChange={(e) => setGeminiKey(e.target.value)}
+        />
+        <div className="diagnostics-native-keys-actions">
+          <button
+            type="button"
+            className="accent-button compact"
+            disabled={busy !== null || !geminiKey.trim()}
+            onClick={() => void runPatch({ geminiApiKey: geminiKey.trim() })}
+          >
+            {busy === "patch" ? "Saving…" : "Save"}
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.geminiConfigured}
+            onClick={() => void runPatch({ geminiApiKey: null })}
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+
+      <div className="diagnostics-native-keys-block">
+        <span className="diagnostics-native-keys-label">MiniMax</span>
+        <input
+          type="password"
+          className="diagnostics-native-keys-input"
+          autoComplete="off"
+          placeholder="API key (optional)"
+          value={minimaxKey}
+          onChange={(e) => setMinimaxKey(e.target.value)}
+        />
+        <input
+          type="password"
+          className="diagnostics-native-keys-input"
+          autoComplete="off"
+          placeholder="Access token (optional)"
+          value={minimaxToken}
+          onChange={(e) => setMinimaxToken(e.target.value)}
+        />
+        <div className="diagnostics-native-keys-actions diagnostics-native-keys-actions-wrap">
+          <button
+            type="button"
+            className="accent-button compact"
+            disabled={busy !== null || !minimaxKey.trim()}
+            onClick={() => void runPatch({ minimaxApiKey: minimaxKey.trim() })}
+          >
+            Save API key
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.minimaxConfigured}
+            onClick={() => void runPatch({ minimaxApiKey: null })}
+          >
+            Clear API key
+          </button>
+          <button
+            type="button"
+            className="accent-button compact"
+            disabled={busy !== null || !minimaxToken.trim()}
+            onClick={() => void runPatch({ minimaxAccessToken: minimaxToken.trim() })}
+          >
+            Save token
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.minimaxConfigured}
+            onClick={() => void runPatch({ minimaxAccessToken: null })}
+          >
+            Clear token
+          </button>
+          <button
+            type="button"
+            className="ghost-button compact"
+            disabled={busy !== null || !status?.minimaxConfigured}
+            onClick={() => void runPatch({ minimaxApiKey: null, minimaxAccessToken: null })}
+          >
+            Remove both
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DiagnosticsCard({
   diagnostics,
   surface = "developer",
   compact = false,
   onDismiss,
+  onNativeCredentialsChanged,
 }: {
   diagnostics: SystemDiagnostics;
   surface?: "developer" | "desktop";
   compact?: boolean;
   onDismiss?: () => void;
+  onNativeCredentialsChanged?: () => void | Promise<void>;
 }) {
   const { requiredErrors, optionalWarnings } = summarizeDiagnostics(diagnostics.checks);
   const visibleChecks = compact ? diagnostics.checks.filter((check) => check.status !== "ok").slice(0, 4) : diagnostics.checks;
@@ -3843,6 +4045,9 @@ function DiagnosticsCard({
           </div>
         ))}
       </div>
+      {onNativeCredentialsChanged ? (
+        <NativeProviderCredentialsPanel compact={compact} onCredentialsChanged={onNativeCredentialsChanged} />
+      ) : null}
       {surface === "developer" && (requiredErrors > 0 || optionalWarnings > 0) ? (
         <div className="diagnostics-footer">
           <code>pnpm preflight</code>
